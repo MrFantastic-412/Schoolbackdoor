@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#F5EFE3" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Schoolbackdoor" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" href="/assets/aistudio/cbl_1989ed48.png" />
+    <link rel="apple-touch-icon" href="/assets/aistudio/cbl_1989ed48.png" />
+    <title>Schoolbackdoor — Independent Student Social Network</title>
+    <meta name="description" content="An independent student social networking platform — share everyday updates, humour, discussions, photos, and communities." />
+    <meta property="og:title" content="Schoolbackdoor — Independent Student Social Network" />
+    <meta property="og:description" content="An independent student social networking platform — share everyday updates, humour, discussions, photos, and communities." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      (function () {
+        try {
+          var pref = localStorage.getItem('sb_theme');
+          if (pref !== 'light' && pref !== 'dark' && pref !== 'system') pref = 'system';
+          var isDark = pref === 'dark' || (pref === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var root = document.documentElement;
+          root.classList.toggle('dark', isDark);
+          root.style.colorScheme = isDark ? 'dark' : 'light';
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute('content', isDark ? '#0F0E0C' : '#F5EFE3');
+        } catch (e) {}
+      })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
+    <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400..700;1,6..72,400..700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" media="print" onload="this.media='all'" />
+    <noscript><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" /></noscript>
+  </head>
+  <body class="bg-[#F5EFE3] dark:bg-[#0F0E0C] text-[#171613] dark:text-[#F5EFE3] antialiased selection:bg-[#D98BA5]/30 selection:text-[#171613] dark:selection:text-[#F5EFE3]">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

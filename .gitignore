@@ -1,0 +1,16 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+data/.backup-key
+data/tmp/
+data/cache/
+data/logs/
+data/backups/*.enc
+data/backups/*.db
+data/schoolbackdoor.db*
+

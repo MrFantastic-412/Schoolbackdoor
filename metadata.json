@@ -1,0 +1,7 @@
+{
+  "name": "Schoolbackdoor",
+  "description": "BACKDOOR APP FOR STUDENTS WITH FREEDOM TO CONNECT AND SHARE INFORMATION (not owned, operated, endorsed, or officially affiliated with THE UNIVERSITY).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

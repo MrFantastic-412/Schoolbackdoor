@@ -1,0 +1,20 @@
+{
+  "name": "Schoolbackdoor",
+  "short_name": "Schoolbackdoor",
+  "description": "Independent student social networking platform for campus updates, communities, and ephemeral conversations.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#F5EFE3",
+  "theme_color": "#171613",
+  "icons": [
+    {
+      "src": "/assets/aistudio/cbl_1989ed48.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["social", "education"]
+}
