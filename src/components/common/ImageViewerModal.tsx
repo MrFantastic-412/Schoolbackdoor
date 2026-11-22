@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { ChevronLeft, ChevronRight, Download, Maximize2, Minimize2, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Download, ImageOff, Maximize2, Minimize2, X } from 'lucide-react';
 import { getThumbnailUrl, resolveMediaUrl } from '../../utils/mediaUrl';
 import { triggerHaptic } from '../../utils/haptics';
 
@@ -20,11 +20,17 @@ export const ImageViewerModal: React.FC<ImageViewerModalProps> = ({
 }) => {
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const [isZoomed, setIsZoomed] = useState(false);
+  const [hasError, setHasError] = useState(false);
 
   useEffect(() => {
     setCurrentIndex(initialIndex);
     setIsZoomed(false);
+    setHasError(false);
   }, [initialIndex, isOpen]);
+
+  useEffect(() => {
+    setHasError(false);
+  }, [currentIndex]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -67,7 +73,7 @@ export const ImageViewerModal: React.FC<ImageViewerModalProps> = ({
     triggerHaptic('tap');
     const link = document.createElement('a');
     link.href = resolvedCurrentImage;
-    link.download = `futa-dispatch-photo-${Date.now()}.jpg`;
+    link.download = `schoolbackdoor-photo-${Date.now()}.jpg`;
     link.click();
   };
 
@@ -151,20 +157,28 @@ export const ImageViewerModal: React.FC<ImageViewerModalProps> = ({
         onClick={(e) => e.stopPropagation()}
         className="max-w-5xl max-h-[85vh] flex items-center justify-center overflow-auto"
       >
-        <img
-          src={resolvedCurrentImage}
-          alt={title || `Campus photo ${currentIndex + 1}`}
-          decoding="async"
-          className={`rounded-2xl shadow-2xl transition-transform duration-200 object-contain ${
-            isZoomed
-              ? 'max-h-none max-w-none scale-125 cursor-zoom-out'
-              : 'max-h-[80vh] max-w-full cursor-zoom-in'
-          }`}
-          onClick={() => {
-            triggerHaptic('tap');
-            setIsZoomed(!isZoomed);
-          }}
-        />
+        {hasError || !resolvedCurrentImage ? (
+          <div className="px-8 py-12 rounded-2xl glass-dark text-[#F5EFE3]/80 flex flex-col items-center gap-2 text-center">
+            <ImageOff className="w-7 h-7 opacity-75" />
+            <span className="text-xs font-medium">Unable to display image</span>
+          </div>
+        ) : (
+          <img
+            src={resolvedCurrentImage}
+            alt={title || `Photo ${currentIndex + 1}`}
+            decoding="async"
+            onError={() => setHasError(true)}
+            className={`rounded-2xl shadow-2xl transition-transform duration-200 object-contain ${
+              isZoomed
+                ? 'max-h-none max-w-none scale-125 cursor-zoom-out'
+                : 'max-h-[80vh] max-w-full cursor-zoom-in'
+            }`}
+            onClick={() => {
+              triggerHaptic('tap');
+              setIsZoomed(!isZoomed);
+            }}
+          />
+        )}
       </div>
 
       {images.length > 1 && (

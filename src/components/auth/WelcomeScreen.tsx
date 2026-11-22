@@ -15,10 +15,6 @@ import { GlassButton, GlassCard } from '../glass';
 import { SchoolbackdoorLogo } from '../glass/SchoolbackdoorLogo';
 import { ThemePreference, useTheme } from '../../utils/useTheme';
 import { triggerHaptic } from '../../utils/haptics';
-import welcomeHeroImg from '../../assets/images/welcome_campus_hero_1794596917862.jpg';
-import onboardConnectImg from '../../assets/images/onboard_connect_1794596918191.jpg';
-import onboardCommunitiesImg from '../../assets/images/onboard_communities_1794596918478.jpg';
-import profileCoverImg from '../../assets/images/profile_cover_campus_1794596918998.jpg';
 
 interface WelcomeScreenProps {
   onGetStarted: () => void;
@@ -34,8 +30,7 @@ const ONBOARDING_SLIDES = [
     title: 'Everyday updates, humour, discussions & campus life',
     description:
       'Share personal moments, memes, photos, hot takes, or school questions across a relaxed social feed built for students.',
-    image: onboardConnectImg,
-    imageAlt: 'University students socializing and sharing ideas around a sunlit courtyard table',
+    highlight: 'Posts, replies, polls & photo grids',
     icon: Sparkles,
   },
   {
@@ -44,8 +39,7 @@ const ONBOARDING_SLIDES = [
     title: 'Find friends, join groups & follow interests',
     description:
       'Connect by @username, join social circles, tech guilds, and hostel chats, or post anonymously when you want honest feedback.',
-    image: onboardCommunitiesImg,
-    imageAlt: 'Community terrace with warm sunlit arches where students gather',
+    highlight: 'Groups, mentions & anonymous wall',
     icon: Users,
   },
   {
@@ -53,9 +47,8 @@ const ONBOARDING_SLIDES = [
     eyebrow: '03 · Real-Time Chats & Spots',
     title: 'Instant private DMs & interactive spot sharing',
     description:
-      'Message friends one-on-one or in group rooms with photo attachments and Akure spot pins — 100% free with zero ads.',
-    image: profileCoverImg,
-    imageAlt: 'Sunlit courtyard walkway at golden hour',
+      'Message friends one-on-one or in group rooms with photo attachments and saved spot pins — 100% free with zero ads.',
+    highlight: 'Direct messages & saved locations',
     icon: MessageSquare,
   },
 ];
@@ -116,20 +109,23 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
 
         {step === 'welcome' ? (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-7 items-center">
-            {/* Signature Liquid-Wave Campus Showcase Card */}
-            <div className="lg:col-span-6 relative rounded-2xl overflow-hidden shadow-[0_28px_70px_-20px_rgba(23,22,19,0.42)] dark:shadow-[0_28px_70px_-20px_rgba(0,0,0,0.75)] border border-[#FFFCF7]/80 dark:border-white/12 min-h-[460px] sm:min-h-[580px] lg:min-h-[620px] flex flex-col justify-between bg-[#F5EFE3] dark:bg-[#181714]">
-              <img
-                src={welcomeHeroImg}
-                alt="Sunlit student community courtyard at golden hour"
-                className="absolute inset-0 w-full h-[70%] object-cover object-center"
+            {/* Signature Liquid-Wave Showcase Card */}
+            <div className="lg:col-span-6 relative rounded-2xl overflow-hidden shadow-[0_28px_70px_-20px_rgba(23,22,19,0.42)] dark:shadow-[0_28px_70px_-20px_rgba(0,0,0,0.75)] border border-[#FFFCF7]/80 dark:border-white/12 min-h-[460px] sm:min-h-[580px] lg:min-h-[620px] flex flex-col justify-between bg-gradient-to-b from-[#FFFCF7] via-[#F5EFE3] to-[#EDD5DF]/70 dark:from-[#1B1915] dark:via-[#151411] dark:to-[#24191D]">
+              <div
+                className="absolute inset-x-0 top-0 h-[64%] pointer-events-none"
+                style={{
+                  background:
+                    'radial-gradient(ellipse 72% 58% at 50% 24%, rgba(217,139,165,0.22) 0%, rgba(246,226,230,0.10) 50%, transparent 78%)',
+                }}
+                aria-hidden="true"
               />
               <div
-                className="absolute inset-x-0 top-0 h-[52%] bg-gradient-to-b from-[#FFFCF7]/95 via-[#F5EFE3]/82 to-transparent dark:from-[#141310]/95 dark:via-[#181714]/82 dark:to-transparent"
+                className="absolute inset-x-8 top-6 bottom-[46%] rounded-2xl border border-[#171613]/6 dark:border-[#F5EFE3]/8 pointer-events-none"
                 aria-hidden="true"
               />
 
               {/* Centered Brand Masthead in Top Glow */}
-              <div className="relative z-10 pt-8 sm:pt-10 px-6 flex flex-col items-center text-center text-[#171613] dark:text-[#F5EFE3]">
+              <div className="relative z-10 pt-10 sm:pt-12 px-6 flex flex-col items-center text-center text-[#171613] dark:text-[#F5EFE3]">
                 <SchoolbackdoorLogo variant="dark" size="xl" />
                 <h1 className="font-serif text-3xl sm:text-4xl font-bold tracking-tight text-[#171613] dark:text-[#F5EFE3] mt-2">
                   Schoolbackdoor
@@ -294,14 +290,13 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
           /* Interactive Onboarding Carousel */
           <div className="w-full max-w-4xl mx-auto animate-sb-in">
             <GlassCard tone="strong" padding="none" className="overflow-hidden grid grid-cols-1 md:grid-cols-12">
-              <div className="md:col-span-6 relative min-h-[260px] md:min-h-[440px] bg-[#171613]">
-                <img
-                  src={activeSlide.image}
-                  alt={activeSlide.imageAlt}
-                  className="absolute inset-0 w-full h-full object-cover"
-                />
+              <div className="md:col-span-6 relative min-h-[240px] md:min-h-[440px] bg-gradient-to-br from-[#F6E2E6]/75 via-[#F5EFE3] to-[#E8DDCC]/75 dark:from-[#261A1E] dark:via-[#181714] dark:to-[#12110E] flex flex-col justify-between border-b md:border-b-0 md:border-r border-[#171613]/10 dark:border-white/10">
                 <div
-                  className="absolute inset-0 bg-gradient-to-t from-[#171613]/75 via-transparent to-[#171613]/25"
+                  className="absolute inset-0 pointer-events-none"
+                  style={{
+                    background:
+                      'radial-gradient(circle at 25% 22%, rgba(217,139,165,0.22), transparent 58%), radial-gradient(circle at 80% 82%, rgba(217,139,165,0.16), transparent 55%)',
+                  }}
                   aria-hidden="true"
                 />
                 <div className="relative z-10 p-5 flex items-center justify-between">
@@ -326,6 +321,18 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
                   >
                     Skip tour
                   </button>
+                </div>
+
+                <div className="relative z-10 flex-1 flex flex-col items-center justify-center px-6 pb-8 pt-2 text-center">
+                  <div className="w-16 h-16 rounded-2xl glass-strong flex items-center justify-center shadow-lg border border-[#D98BA5]/30">
+                    <SlideIcon className="w-7 h-7 text-[#C4718E] dark:text-[#E5A4BA]" />
+                  </div>
+                  <div className="mt-4 font-mono text-[11px] uppercase tracking-[0.2em] text-[#82796F] dark:text-[#A89F95] tabular-nums">
+                    Step 0{slideIndex + 1} / 0{ONBOARDING_SLIDES.length}
+                  </div>
+                  <div className="mt-1.5 text-xs font-medium text-[#171613]/85 dark:text-[#F5EFE3]/85">
+                    {activeSlide.highlight}
+                  </div>
                 </div>
               </div>
 

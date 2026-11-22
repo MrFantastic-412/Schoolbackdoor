@@ -1,4 +1,5 @@
-import React, { memo } from 'react';
+import React, { memo, useState } from 'react';
+import { ImageOff } from 'lucide-react';
 import { getThumbnailUrl, resolveMediaUrl } from '../../utils/mediaUrl';
 
 interface PostImageGridProps {
@@ -7,11 +8,42 @@ interface PostImageGridProps {
   className?: string;
 }
 
-const handleThumbError = (rawUrl: string) => (e: React.SyntheticEvent<HTMLImageElement>) => {
-  const img = e.currentTarget;
-  if (img.dataset.fallbackApplied === '1') return;
-  img.dataset.fallbackApplied = '1';
-  img.src = resolveMediaUrl(rawUrl);
+const GridImage: React.FC<{
+  rawUrl: string;
+  alt: string;
+  className?: string;
+}> = ({ rawUrl, alt, className = '' }) => {
+  const [src, setSrc] = useState(() => getThumbnailUrl(rawUrl));
+  const [triedFull, setTriedFull] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  if (failed || !src) {
+    return (
+      <div className="w-full h-full min-h-36 flex flex-col items-center justify-center gap-1.5 text-[#82796F] dark:text-[#A89F95] bg-[#E8DDCC]/55 dark:bg-[#23211C]/80 px-3 text-center">
+        <ImageOff className="w-5 h-5 opacity-70" />
+        <span className="text-[11px] font-medium">Image unavailable</span>
+      </div>
+    );
+  }
+
+  return (
+    <img
+      src={src}
+      onError={() => {
+        const fullUrl = resolveMediaUrl(rawUrl);
+        if (!triedFull && fullUrl && src !== fullUrl) {
+          setTriedFull(true);
+          setSrc(fullUrl);
+        } else {
+          setFailed(true);
+        }
+      }}
+      alt={alt}
+      loading="lazy"
+      decoding="async"
+      className={className}
+    />
+  );
 };
 
 export const PostImageGrid: React.FC<PostImageGridProps> = memo(({
@@ -29,12 +61,9 @@ export const PostImageGrid: React.FC<PostImageGridProps> = memo(({
         className={`mt-3 rounded-xl overflow-hidden border border-[#171613]/10 dark:border-[#F5EFE3]/12 cursor-pointer bg-[#E8DDCC]/45 dark:bg-[#23211C]/70 group relative ${className}`}
         onClick={() => onImageClick(0)}
       >
-        <img
-          src={getThumbnailUrl(images[0])}
-          onError={handleThumbError(images[0])}
-          alt="Dispatch attachment"
-          loading="lazy"
-          decoding="async"
+        <GridImage
+          rawUrl={images[0]}
+          alt="Post attachment"
           className="w-full max-h-80 object-cover transition-transform duration-200 group-hover:scale-[1.01]"
         />
       </div>
@@ -50,12 +79,9 @@ export const PostImageGrid: React.FC<PostImageGridProps> = memo(({
             className="h-44 sm:h-52 rounded-lg overflow-hidden border border-[#171613]/10 dark:border-[#F5EFE3]/12 cursor-pointer bg-[#E8DDCC]/45 dark:bg-[#23211C]/70 group relative"
             onClick={() => onImageClick(idx)}
           >
-            <img
-              src={getThumbnailUrl(img)}
-              onError={handleThumbError(img)}
+            <GridImage
+              rawUrl={img}
               alt={`Attachment ${idx + 1}`}
-              loading="lazy"
-              decoding="async"
               className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-[1.02]"
             />
           </div>
@@ -71,12 +97,9 @@ export const PostImageGrid: React.FC<PostImageGridProps> = memo(({
           className="h-full rounded-lg overflow-hidden border border-[#171613]/10 dark:border-[#F5EFE3]/12 cursor-pointer bg-[#E8DDCC]/45 dark:bg-[#23211C]/70 group relative"
           onClick={() => onImageClick(0)}
         >
-          <img
-            src={getThumbnailUrl(images[0])}
-            onError={handleThumbError(images[0])}
+          <GridImage
+            rawUrl={images[0]}
             alt="Attachment 1"
-            loading="lazy"
-            decoding="async"
             className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-[1.02]"
           />
         </div>
@@ -87,12 +110,9 @@ export const PostImageGrid: React.FC<PostImageGridProps> = memo(({
               className="h-full rounded-lg overflow-hidden border border-[#171613]/10 dark:border-[#F5EFE3]/12 cursor-pointer bg-[#E8DDCC]/45 dark:bg-[#23211C]/70 group relative"
               onClick={() => onImageClick(idx + 1)}
             >
-              <img
-                src={getThumbnailUrl(img)}
-                onError={handleThumbError(img)}
+              <GridImage
+                rawUrl={img}
                 alt={`Attachment ${idx + 2}`}
-                loading="lazy"
-                decoding="async"
                 className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-[1.02]"
               />
             </div>
@@ -111,12 +131,9 @@ export const PostImageGrid: React.FC<PostImageGridProps> = memo(({
           className="h-36 sm:h-44 rounded-lg overflow-hidden border border-[#171613]/10 dark:border-[#F5EFE3]/12 cursor-pointer bg-[#E8DDCC]/45 dark:bg-[#23211C]/70 group relative"
           onClick={() => onImageClick(idx)}
         >
-          <img
-            src={getThumbnailUrl(img)}
-            onError={handleThumbError(img)}
+          <GridImage
+            rawUrl={img}
             alt={`Attachment ${idx + 1}`}
-            loading="lazy"
-            decoding="async"
             className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-[1.02]"
           />
         </div>

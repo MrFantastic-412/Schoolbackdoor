@@ -826,6 +826,7 @@ export function initDatabase() {
       `UPDATE platform_features SET description = 'Community notices, student digests, and campus spots.' WHERE key = 'updates' AND description LIKE '%FUTA%'`,
       `UPDATE announcements SET full_body = 'Disclaimer: Schoolbackdoor is an independent student social network and is not affiliated with university administration. Please verify official exam timetables directly with your department noticeboard. Students report quiet reading sessions active at ETF 3 and Ilemobade Library.' WHERE id = 'notice-1' AND full_body LIKE '%not affiliated with FUTA%'`,
       `UPDATE user_profiles SET bio = 'Platform safety oversight, moderation management, and community integrity for Schoolbackdoor (independent student platform).' WHERE id = 'p-admin' AND bio LIKE '%FUTA%'`,
+      `UPDATE posts SET images_json = '["https://images.unsplash.com/photo-1574629810360-7efbbe195018?auto=format&fit=crop&w=800&q=80"]' WHERE id = 'post-3' AND images_json LIKE '%photo-1508098682722-e99c43a406b2%'`,
     ];
     for (const sql of copyCleanups) {
       try {

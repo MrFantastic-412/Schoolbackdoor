@@ -22,7 +22,6 @@ import { GlassButton, GlassCard, GlassTab } from '../components/glass';
 import { MentionText } from '../components/common/MentionText';
 import { UserAvatar } from '../components/common/UserAvatar';
 import { triggerHaptic } from '../utils/haptics';
-import profileCoverImg from '../assets/images/profile_cover_campus_1794596918998.jpg';
 
 const LocationViewModal = lazy(() =>
   import('../components/map/LocationViewModal').then((m) => ({ default: m.LocationViewModal }))
@@ -116,17 +115,15 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
   return (
     <div className="w-full flex justify-center px-4 py-6 md:py-8">
       <div className="w-full max-w-3xl flex flex-col gap-6">
-        {/* Student Dossier Hero Card with Generated Campus Banner */}
+        {/* Student Profile Hero Card */}
         <GlassCard tone="cream" padding="none" className="overflow-hidden">
-          <div className="relative h-36 sm:h-44 w-full bg-[#171613]">
-            <img
-              src={profileCoverImg}
-              alt="Campus library walkway"
-              decoding="async"
-              className="w-full h-full object-cover"
-            />
+          <div className="relative h-32 sm:h-40 w-full bg-gradient-to-br from-[#171613] via-[#241C20] to-[#36222B] dark:from-[#0F0E0C] dark:via-[#1C1619] dark:to-[#2D1C23]">
             <div
-              className="absolute inset-0 bg-gradient-to-t from-[#171613]/75 via-[#171613]/20 to-transparent"
+              className="absolute inset-0 pointer-events-none"
+              style={{
+                background:
+                  'radial-gradient(ellipse 70% 80% at 85% 20%, rgba(217,139,165,0.28), transparent 65%), radial-gradient(circle at 18% 85%, rgba(245,239,227,0.08), transparent 55%)',
+              }}
               aria-hidden="true"
             />
             <div className="absolute top-3.5 left-4 right-4 flex items-center justify-between gap-2">
