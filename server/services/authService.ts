@@ -280,36 +280,24 @@ export const authService = {
 
     const usernameValidation = this.validateUsername(input.username);
     if (!usernameValidation.valid) {
-      const err = new Error(usernameValidation.error || 'Invalid username.');
-      (err as any).status = 400;
-      (err as any).code = 'INVALID_USERNAME';
-      throw err;
+      throw new Error(usernameValidation.error || 'Invalid username.');
     }
     const normalizedUsername = usernameValidation.normalized;
 
     const gmailValidation = this.validateGmail(rawEmailInput);
     if (!gmailValidation.valid) {
-      const err = new Error(gmailValidation.error || 'Please provide a valid Gmail address (e.g. yourname@gmail.com).');
-      (err as any).status = 400;
-      (err as any).code = 'INVALID_EMAIL';
-      throw err;
+      throw new Error(gmailValidation.error || 'Please provide a valid Gmail address (e.g. yourname@gmail.com).');
     }
     const email = gmailValidation.normalized;
 
     const pwdCheck = validateStrongPassword(password, [normalizedUsername, email.split('@')[0]]);
     if (!pwdCheck.valid) {
-      const err = new Error(pwdCheck.error || 'Password does not meet security requirements.');
-      (err as any).status = 400;
-      (err as any).code = 'WEAK_PASSWORD';
-      throw err;
+      throw new Error(pwdCheck.error || 'Password does not meet security requirements.');
     }
 
     const existingEmail = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)').get(email);
     if (existingEmail) {
-      const err = new Error('An account with this Gmail address already exists.');
-      (err as any).status = 409;
-      (err as any).code = 'DUPLICATE_EMAIL';
-      throw err;
+      throw new Error('An account with this Gmail address already exists.');
     }
 
     const existingHandle = db
@@ -319,10 +307,7 @@ export const authService = {
       .prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)')
       .get(normalizedUsername);
     if (existingHandle || existingUserHandle) {
-      const err = new Error('This username is already taken. Please choose another.');
-      (err as any).status = 409;
-      (err as any).code = 'DUPLICATE_USERNAME';
-      throw err;
+      throw new Error('This username is already taken. Please choose another.');
     }
 
     if (!bypassRegistrationLock) {
@@ -461,10 +446,7 @@ export const authService = {
    */
   login(identifier: string, password: string, ipAddress?: string, userAgent?: string, mfaCode?: string) {
     if (!identifier || !password) {
-      const err = new Error('Please provide your username or Gmail address and password.');
-      (err as any).status = 400;
-      (err as any).code = 'MISSING_CREDENTIALS';
-      throw err;
+      throw new Error('Please provide your username or Gmail address and password.');
     }
 
     const trimmedId = identifier.trim().slice(0, 254);
@@ -488,10 +470,7 @@ export const authService = {
 
     if (typeof password !== 'string' || password.length > 128) {
       this.recordLoginAttempt(trimmedId, false, ipAddress);
-      const err = new Error('Invalid email/username or password.');
-      (err as any).status = 401;
-      (err as any).code = 'INVALID_CREDENTIALS';
-      throw err;
+      throw new Error('Invalid email/username or password.');
     }
 
     const userRow: any = db.prepare(`
@@ -513,10 +492,7 @@ export const authService = {
         // ignore
       }
       this.recordLoginAttempt(trimmedId, false, ipAddress);
-      const err = new Error('Invalid email/username or password.');
-      (err as any).status = 401;
-      (err as any).code = 'INVALID_CREDENTIALS';
-      throw err;
+      throw new Error('Invalid email/username or password.');
     }
 
     if (!verifyPassword(password, userRow.password_hash)) {
@@ -538,17 +514,11 @@ export const authService = {
           'Multiple incorrect password attempts were blocked on your account. If this was not you, change your password in Settings.'
         );
       }
-      const err = new Error('Invalid email/username or password.');
-      (err as any).status = 401;
-      (err as any).code = 'INVALID_CREDENTIALS';
-      throw err;
+      throw new Error('Invalid email/username or password.');
     }
 
     if (userRow.status === 'suspended') {
-      const err = new Error('This account has been suspended by moderation.');
-      (err as any).status = 403;
-      (err as any).code = 'ACCOUNT_SUSPENDED';
-      throw err;
+      throw new Error('This account has been suspended by moderation.');
     }
 
     if (needsPasswordRehash(userRow.password_hash)) {
@@ -565,10 +535,7 @@ export const authService = {
     // Enforce RFC-6238 TOTP MFA if enabled on Admin or Moderator accounts
     if ((userRow.role === 'admin' || userRow.role === 'moderator') && Boolean(userRow.mfa_enabled) && userRow.mfa_secret) {
       if (!mfaCode || !mfaCode.trim()) {
-        const err = new Error('MFA_REQUIRED: Enter the 6-digit authenticator code for this account.');
-        (err as any).status = 403;
-        (err as any).code = 'MFA_REQUIRED';
-        throw err;
+        throw new Error('MFA_REQUIRED: Enter the 6-digit authenticator code for this account.');
       }
       if (!verifyTotpToken(userRow.mfa_secret, mfaCode)) {
         this.recordLoginAttempt(trimmedId, false, ipAddress);
@@ -580,10 +547,7 @@ export const authService = {
           ipAddress,
           userAgent,
         });
-        const err = new Error('Invalid 6-digit MFA authenticator code.');
-        (err as any).status = 401;
-        (err as any).code = 'INVALID_MFA_CODE';
-        throw err;
+        throw new Error('Invalid 6-digit MFA authenticator code.');
       }
     }
 

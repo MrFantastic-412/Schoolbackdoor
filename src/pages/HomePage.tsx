@@ -120,9 +120,7 @@ interface HomePageProps {
   hasMorePosts?: boolean;
   isLoading?: boolean;
   isLoadingMore?: boolean;
-  isRetryingFeed?: boolean;
   feedError?: string | null;
-  feedErrorCode?: string | null;
   onLoadMore?: () => void;
   onRetryLoad?: () => void;
 }
@@ -1236,9 +1234,7 @@ export const HomePage: React.FC<HomePageProps> = ({
   hasMorePosts = false,
   isLoading = false,
   isLoadingMore = false,
-  isRetryingFeed = false,
   feedError = null,
-  feedErrorCode = null,
   onLoadMore,
   onRetryLoad,
 }) => {
@@ -2233,44 +2229,8 @@ export const HomePage: React.FC<HomePageProps> = ({
             {/* Infinite Scroll Skeleton */}
             {isLoadingMore && <FeedSkeleton count={2} />}
 
-            {/* Empty-Feed Backend / Preview Unavailable State + Retry */}
-            {feedError && filteredPosts.length === 0 && (
-              <GlassCard
-                tone="cream"
-                padding="lg"
-                className="flex flex-col items-center text-center gap-3 border border-[#D98BA5]/50"
-              >
-                <div className="w-10 h-10 rounded-full bg-[#F6E2E6] dark:bg-[#3A222A] flex items-center justify-center text-[#A9496B] dark:text-[#E59BB5]">
-                  <AlertCircle className="w-5 h-5" />
-                </div>
-                <div className="space-y-1 max-w-md">
-                  <h3 className="text-sm font-semibold text-[#171613] dark:text-[#F5EFE3]">
-                    {feedErrorCode === 'PREVIEW_NO_BACKEND' || feedErrorCode === 'SPA_HTML_FALLBACK'
-                      ? 'Backend API not connected in this preview'
-                      : 'Unable to load the campus feed'}
-                  </h3>
-                  <p className="text-xs leading-relaxed text-[#6B6359] dark:text-[#B9AFA3]">
-                    {feedErrorCode === 'SPA_HTML_FALLBACK'
-                      ? 'This preview is serving static frontend HTML for /api/posts because no backend server is running here. Set VITE_API_URL to a running backend or deploy to Vercel (https://schoolbackdoor.vercel.app), then tap Retry.'
-                      : feedError}
-                  </p>
-                </div>
-                {onRetryLoad && (
-                  <GlassButton
-                    variant="pink"
-                    size="sm"
-                    onClick={onRetryLoad}
-                    disabled={isRetryingFeed}
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isRetryingFeed ? 'animate-spin' : ''}`} />
-                    <span>{isRetryingFeed ? 'Retrying...' : 'Retry'}</span>
-                  </GlassButton>
-                )}
-              </GlassCard>
-            )}
-
-            {/* Pagination Network Error + Explicit Retry Banner */}
-            {feedError && filteredPosts.length > 0 && (
+            {/* Network Error + Explicit Retry Banner */}
+            {feedError && (
               <GlassCard
                 tone="cream"
                 padding="md"
@@ -2281,14 +2241,9 @@ export const HomePage: React.FC<HomePageProps> = ({
                   <span>{feedError}</span>
                 </div>
                 {onRetryLoad && (
-                  <GlassButton
-                    variant="pink"
-                    size="sm"
-                    onClick={onRetryLoad}
-                    disabled={isRetryingFeed}
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isRetryingFeed ? 'animate-spin' : ''}`} />
-                    <span>{isRetryingFeed ? 'Retrying...' : 'Retry'}</span>
+                  <GlassButton variant="pink" size="sm" onClick={onRetryLoad}>
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Retry</span>
                   </GlassButton>
                 )}
               </GlassCard>

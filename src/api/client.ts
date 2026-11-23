@@ -51,142 +51,7 @@ import {
   LocationSearchHistoryItem,
 } from '../types';
 
-export function resolveApiBase(rawConfiguredBase?: string): string {
-  const envConfigured =
-    rawConfiguredBase !== undefined
-      ? rawConfiguredBase
-      : typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_URL
-        ? String((import.meta as any).env.VITE_API_URL)
-        : '';
-  const trimmed = envConfigured.trim().replace(/\/+$/, '');
-  if (!trimmed) return '/api';
-  if (trimmed === '/api' || /\/api$/i.test(trimmed)) {
-    return trimmed;
-  }
-  return `${trimmed}/api`;
-}
-
-const API_BASE = resolveApiBase();
-
-function isCrossOriginApi(): boolean {
-  if (typeof window === 'undefined' || !/^https?:\/\//i.test(API_BASE)) {
-    return false;
-  }
-  try {
-    return new URL(API_BASE).origin !== window.location.origin;
-  } catch {
-    return false;
-  }
-}
-
-export function isStaticPreviewMissingBackend(
-  hostname: string | undefined = typeof window !== 'undefined' ? window.location?.hostname : undefined,
-  apiBase: string = API_BASE
-): boolean {
-  if (apiBase !== '/api') return false;
-  const normalizedHost = String(hostname || '').trim().toLowerCase();
-  if (!normalizedHost) return false;
-  return normalizedHost.endsWith('.scf.usercontent.goog') || normalizedHost === 'aistudio.google.com';
-}
-
-function buildNotFoundError(
-  status: number,
-  options?: { hostname?: string; apiBase?: string }
-): Error {
-  if (status === 404 && isStaticPreviewMissingBackend(options?.hostname, options?.apiBase)) {
-    const err: any = new Error(
-      'Backend API unavailable in AI Studio static preview (HTTP 404 on /api). Signup, login, and live data require setting VITE_API_URL to a running backend or deploying to Vercel (https://schoolbackdoor.vercel.app).'
-    );
-    err.status = 404;
-    err.code = 'PREVIEW_NO_BACKEND';
-    err.isPreviewNoBackend = true;
-    return err;
-  }
-
-  const err: any = new Error(
-    'API endpoint not found (HTTP 404). Verify Vercel API routing or VITE_API_URL configuration.'
-  );
-  err.status = status;
-  err.code = 'NON_JSON_RESPONSE';
-  return err;
-}
-
-export async function parseApiJson<T = any>(
-  res: Response,
-  fallbackMessage = 'Request failed.',
-  options?: { hostname?: string; apiBase?: string }
-): Promise<T> {
-  const rawText = await res.text();
-  const trimmed = rawText.trim();
-
-  if (!trimmed) {
-    if (res.ok) {
-      return {} as T;
-    }
-    if (res.status === 404) {
-      throw buildNotFoundError(404, options);
-    }
-    const err: any = new Error(fallbackMessage);
-    err.status = res.status;
-    throw err;
-  }
-
-  let parsed: any;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    const contentType = String(res.headers.get('content-type') || '').toLowerCase();
-    const looksLikeHtml =
-      contentType.includes('text/html') ||
-      contentType.includes('application/xhtml+xml') ||
-      /^<(?:!doctype\s+html|html\b)/i.test(trimmed);
-    const isNotFoundHtmlOrText =
-      res.status === 404 || /the page could not be found/i.test(trimmed);
-
-    if (isNotFoundHtmlOrText) {
-      throw buildNotFoundError(404, options);
-    }
-
-    let diagnostic: string;
-    let code = 'NON_JSON_RESPONSE';
-    let isSpaFallback = false;
-
-    if (res.status >= 500) {
-      diagnostic = `Server returned an invalid non-JSON response (HTTP ${res.status}). Please try again shortly.`;
-    } else if (res.ok && looksLikeHtml) {
-      diagnostic =
-        'No backend API server is connected in this preview environment (received the app HTML instead of API JSON). Start the Express backend or configure VITE_API_URL, then retry.';
-      code = 'SPA_HTML_FALLBACK';
-      isSpaFallback = true;
-    } else {
-      diagnostic = `Unexpected non-JSON response from server (HTTP ${res.status || 0}).`;
-    }
-
-    const err: any = new Error(diagnostic);
-    err.status = res.status;
-    err.code = code;
-    if (isSpaFallback) {
-      err.isSpaFallback = true;
-    }
-    throw err;
-  }
-
-  if (!res.ok || (parsed && typeof parsed === 'object' && parsed.success === false)) {
-    const message =
-      (parsed && typeof parsed === 'object' && (parsed.error || parsed.message)) ||
-      fallbackMessage;
-    const err: any = new Error(message);
-    err.status = res.status;
-    if (parsed && typeof parsed === 'object') {
-      err.code = parsed.code;
-      err.mfaRequired = Boolean(parsed.mfaRequired);
-      err.retryAfterSeconds = parsed.retryAfterSeconds;
-    }
-    throw err;
-  }
-
-  return parsed as T;
-}
+const API_BASE = '/api';
 
 // Client-side TTL cache strictly reserved for non-PII public read endpoints
 const publicResponseCache = new Map<string, { value: unknown; expiresAt: number }>();
@@ -267,10 +132,9 @@ async function refreshAccessToken(): Promise<boolean> {
   if (refreshPromise) return refreshPromise;
   refreshPromise = (async () => {
     try {
-      const credentialsMode: RequestCredentials = isCrossOriginApi() ? 'include' : 'same-origin';
       const res = await rawFetch(`${API_BASE}/auth/refresh`, {
         method: 'POST',
-        credentials: credentialsMode,
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
       });
       if (!res.ok) {
@@ -279,16 +143,9 @@ async function refreshAccessToken(): Promise<boolean> {
         noRefreshCooldownUntil = Date.now() + 2500;
         return false;
       }
-      const text = await res.text();
-      let data: any = {};
-      try {
-        data = text ? JSON.parse(text) : {};
-      } catch {
-        return false;
-      }
-      const refreshedToken = data?.token ?? data?.data?.token;
-      if (refreshedToken) {
-        inMemoryAuthToken = refreshedToken;
+      const data = await res.json().catch(() => ({}));
+      if (data?.token) {
+        inMemoryAuthToken = data.token;
       }
       hasKnownSession = true;
       noRefreshCooldownUntil = 0;
@@ -314,7 +171,6 @@ const SKIP_REFRESH_PATHS = [
 
 async function fetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-  const defaultCredentials: RequestCredentials = isCrossOriginApi() ? 'include' : 'same-origin';
 
   const buildHeaders = (): Record<string, string> => {
     const merged: Record<string, string> = {};
@@ -337,7 +193,7 @@ async function fetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<
 
   let res = await rawFetch(input, {
     ...init,
-    credentials: init.credentials ?? defaultCredentials,
+    credentials: init.credentials ?? 'same-origin',
     headers: buildHeaders(),
   });
 
@@ -355,7 +211,7 @@ async function fetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<
       }
       res = await rawFetch(input, {
         ...init,
-        credentials: init.credentials ?? defaultCredentials,
+        credentials: init.credentials ?? 'same-origin',
         headers: retryHeaders,
       });
     }
@@ -402,12 +258,12 @@ export const api = {
   // --- Diagnostics ---
   async getHealth() {
     const res = await fetch(`${API_BASE}/health`);
-    return parseApiJson(res, 'Failed to check service health.');
+    return res.json();
   },
 
   async getStats() {
     const res = await fetch(`${API_BASE}/stats`);
-    return parseApiJson(res, 'Failed to load service statistics.');
+    return res.json();
   },
 
   // --- Authentication ---
@@ -431,21 +287,19 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     });
-    const result = await parseApiJson<any>(res, 'Registration failed.');
-    const token = result.token ?? result.data?.token;
-    const profile = result.profile ?? result.data?.profile;
-    const user = result.user ?? result.data?.user;
-    if (token) {
-      this.setToken(token);
+    const result = await res.json();
+    if (!res.ok) {
+      const err: any = new Error(result.error || 'Registration failed.');
+      err.status = res.status;
+      err.code = result.code;
+      throw err;
+    }
+    if (result.token) {
+      this.setToken(result.token);
     } else {
       hasKnownSession = true;
     }
-    return {
-      ...result,
-      token,
-      profile,
-      user,
-    };
+    return result;
   },
 
   async getPlatformConfig(): Promise<PlatformConfig | null> {
@@ -454,7 +308,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/platform/config`);
       if (!res.ok) return null;
-      const data = await parseApiJson<PlatformConfig>(res, 'Failed to load platform configuration.');
+      const data = (await res.json()) as PlatformConfig;
       setPublicCached('platform:config', data, 10000);
       return data;
     } catch {
@@ -468,21 +322,20 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ identifier, password, mfaCode }),
     });
-    const result = await parseApiJson<any>(res, 'Authentication failed.');
-    const token = result.token ?? result.data?.token;
-    const profile = result.profile ?? result.data?.profile;
-    const user = result.user ?? result.data?.user;
-    if (token) {
-      this.setToken(token);
+    const result = await res.json();
+    if (!res.ok) {
+      const err: any = new Error(result.error || 'Authentication failed.');
+      err.mfaRequired = Boolean(result.mfaRequired);
+      err.code = result.code;
+      err.retryAfterSeconds = result.retryAfterSeconds;
+      throw err;
+    }
+    if (result.token) {
+      this.setToken(result.token);
     } else {
       hasKnownSession = true;
     }
-    return {
-      ...result,
-      token,
-      profile,
-      user,
-    };
+    return result;
   },
 
   async refreshSession(): Promise<boolean> {
@@ -509,7 +362,7 @@ export const api = {
       if (!res.ok) {
         return { onlineCount: 0, message: '0 students online now.', updatedAt: new Date().toISOString() };
       }
-      return await parseApiJson(res, 'Failed to load presence.');
+      return res.json();
     } catch {
       return { onlineCount: 0, message: '0 students online now.', updatedAt: new Date().toISOString() };
     }
@@ -523,7 +376,7 @@ export const api = {
         body: JSON.stringify({ clientId: getOrCreateTabClientId() }),
       });
       if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to record presence heartbeat.');
+      return res.json();
     } catch {
       return null;
     }
@@ -549,7 +402,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ code }),
     });
-    return parseApiJson(res, 'Verification failed.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Verification failed.');
+    return result;
   },
 
   async resendVerificationCode() {
@@ -557,7 +412,9 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Unable to resend verification code.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Unable to resend verification code.');
+    return result;
   },
 
   async forgotPassword(identifier: string) {
@@ -566,7 +423,9 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ identifier }),
     });
-    return parseApiJson(res, 'Password recovery failed.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Password recovery failed.');
+    return result;
   },
 
   async resetPassword(resetCode: string, newPassword: string, identifier?: string) {
@@ -575,7 +434,9 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ resetCode, newPassword, ...(identifier ? { identifier } : {}) }),
     });
-    return parseApiJson(res, 'Password reset failed.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Password reset failed.');
+    return result;
   },
 
   // --- Profile & Multi-Device Session Controls ---
@@ -583,12 +444,11 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/me`, { headers: getAuthHeaders() });
       if (!res.ok) return null;
-      const data = await parseApiJson<any>(res, 'Unable to load profile.');
-      const profile = data?.profile ?? data?.data?.profile ?? null;
-      if (profile?.userId) {
+      const data = await res.json();
+      if (data?.profile?.userId) {
         hasKnownSession = true;
       }
-      return profile;
+      return data.profile;
     } catch {
       return null;
     }
@@ -600,7 +460,9 @@ export const api = {
       headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ accept: true }),
     });
-    return parseApiJson(res, 'Failed to accept Terms.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to accept Terms.');
+    return result;
   },
 
   async reauthenticate(password: string): Promise<{ success: boolean; lastReauthenticatedAt: string }> {
@@ -609,7 +471,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ password }),
     });
-    return parseApiJson(res, 'Password verification failed.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Password verification failed.');
+    return result;
   },
 
   async changePassword(currentPassword: string, newPassword: string): Promise<{ success: boolean; revokedOtherSessions: number }> {
@@ -618,7 +482,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ currentPassword, newPassword }),
     });
-    return parseApiJson(res, 'Failed to update password.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update password.');
+    return result;
   },
 
   async getMySessions(): Promise<{
@@ -628,20 +494,17 @@ export const api = {
     refreshTtlDays: number;
     maxLifetimeDays: number;
   }> {
-    const fallback = {
-      sessions: [],
-      maxActiveDevices: 5,
-      accessTtlMinutes: 15,
-      refreshTtlDays: 30,
-      maxLifetimeDays: 90,
-    };
-    try {
-      const res = await fetch(`${API_BASE}/me/sessions`, { headers: getAuthHeaders() });
-      if (!res.ok) return fallback;
-      return await parseApiJson(res, 'Failed to load sessions.');
-    } catch {
-      return fallback;
+    const res = await fetch(`${API_BASE}/me/sessions`, { headers: getAuthHeaders() });
+    if (!res.ok) {
+      return {
+        sessions: [],
+        maxActiveDevices: 5,
+        accessTtlMinutes: 15,
+        refreshTtlDays: 30,
+        maxLifetimeDays: 90,
+      };
     }
+    return res.json();
   },
 
   async revokeMySession(sessionId: string): Promise<{ success: boolean; revokedSelf?: boolean }> {
@@ -649,10 +512,8 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await parseApiJson<{ success: boolean; revokedSelf?: boolean }>(
-      res,
-      'Failed to sign out device.'
-    );
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to sign out device.');
     if (result.revokedSelf) {
       this.clearToken();
     }
@@ -664,17 +525,15 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to revoke other device sessions.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to revoke other device sessions.');
+    return result;
   },
 
   async getMfaStatus(): Promise<{ mfaEnabled: boolean; role: string }> {
-    try {
-      const res = await fetch(`${API_BASE}/auth/mfa/status`, { headers: getAuthHeaders() });
-      if (!res.ok) return { mfaEnabled: false, role: 'student' };
-      return await parseApiJson(res, 'Failed to check MFA status.');
-    } catch {
-      return { mfaEnabled: false, role: 'student' };
-    }
+    const res = await fetch(`${API_BASE}/auth/mfa/status`, { headers: getAuthHeaders() });
+    if (!res.ok) return { mfaEnabled: false, role: 'student' };
+    return res.json();
   },
 
   async setupMfa(): Promise<{ secret: string; otpauthUri: string; sampleCurrentCode?: string }> {
@@ -682,7 +541,9 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to start MFA setup.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to start MFA setup.');
+    return result;
   },
 
   async verifyMfa(code: string): Promise<{ success: boolean; mfaEnabled: boolean }> {
@@ -691,7 +552,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ code }),
     });
-    return parseApiJson(res, 'Invalid verification code.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Invalid verification code.');
+    return result;
   },
 
   async disableMfa(password: string): Promise<{ success: boolean; mfaEnabled: boolean }> {
@@ -700,7 +563,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ password }),
     });
-    return parseApiJson(res, 'Failed to disable MFA.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to disable MFA.');
+    return result;
   },
 
   async searchUsers(query = '', limit = 20): Promise<UserSearchResult[]> {
@@ -712,7 +577,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to search users.');
+      return res.json();
     } catch {
       return [];
     }
@@ -734,7 +599,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load mention candidates.');
+      return res.json();
     } catch {
       return [];
     }
@@ -744,7 +609,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/users/${userId}/profile`, { headers: getAuthHeaders() });
       if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to load user profile.');
+      return res.json();
     } catch {
       return null;
     }
@@ -755,7 +620,9 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Unable to update connection.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Unable to update connection.');
+    return result;
   },
 
   async getUserPosts(userId: string, limit = 20): Promise<Post[]> {
@@ -764,7 +631,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Unable to load user posts.');
+      return res.json();
     } catch {
       return [];
     }
@@ -782,7 +649,14 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(updates),
     });
-    return parseApiJson(res, 'Failed to update profile.');
+    const result = await res.json();
+    if (!res.ok) {
+      const err: any = new Error(result.error || 'Failed to update profile.');
+      err.status = res.status;
+      err.code = result.code;
+      throw err;
+    }
+    return result;
   },
 
   async uploadImage(
@@ -824,11 +698,9 @@ export const api = {
 
         xhr.onload = async () => {
           let result: any = {};
-          let isJson = true;
           try {
-            result = xhr.responseText ? JSON.parse(xhr.responseText) : {};
+            result = JSON.parse(xhr.responseText || '{}');
           } catch {
-            isJson = false;
             result = {};
           }
 
@@ -845,14 +717,10 @@ export const api = {
             }
           }
 
-          if (xhr.status < 200 || xhr.status >= 300 || !isJson) {
-            const fallbackMsg =
-              xhr.status === 404
-                ? 'Image upload endpoint not found (HTTP 404). Verify Vercel API routing or VITE_API_URL configuration.'
-                : 'Image upload failed.';
-            const err: any = new Error(result.error || result.message || fallbackMsg);
+          if (xhr.status < 200 || xhr.status >= 300) {
+            const err: any = new Error(result.error || 'Image upload failed.');
             err.status = xhr.status;
-            err.code = result.code || (!isJson ? 'NON_JSON_RESPONSE' : undefined);
+            err.code = result.code;
             reject(err);
             return;
           }
@@ -872,7 +740,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/me/blocks`, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load blocked users.');
+      return res.json();
     } catch {
       return [];
     }
@@ -883,7 +751,9 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to block student.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to block student.');
+    return result;
   },
 
   async unblockUser(targetUserId: string) {
@@ -891,7 +761,9 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to unblock student.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to unblock student.');
+    return result;
   },
 
   // --- Posts & Feed ---
@@ -909,7 +781,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/feed/locations`);
       if (!res.ok) return [];
-      const data = await parseApiJson<any[]>(res, 'Failed to load feed locations.');
+      const data = await res.json();
       setPublicCached('feed:locations', data, 60000);
       return data;
     } catch {
@@ -933,14 +805,16 @@ export const api = {
         preferredLocationArea: data.locationSharingEnabled ? data.preferredLocationArea ?? null : null,
       }),
     });
-    return parseApiJson(res, 'Failed to update location preference.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update location preference.');
+    return result;
   },
 
   async getPosts(): Promise<Post[]> {
     try {
       const res = await fetch(`${API_BASE}/posts`, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Unable to load posts.');
+      return res.json();
     } catch {
       return [];
     }
@@ -964,14 +838,11 @@ export const api = {
     const res = await fetch(`${API_BASE}/posts?${params.toString()}`, {
       headers: getAuthHeaders(),
     });
-    const data = await parseApiJson<PaginatedPostsResponse>(res, 'Unable to load posts right now.');
-    if (!data || !Array.isArray(data.posts)) {
-      const err: any = new Error('Received an invalid feed payload from the server.');
-      err.status = res.status;
-      err.code = 'INVALID_FEED_PAYLOAD';
-      throw err;
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || 'Unable to load posts right now.');
     }
-    return data;
+    return res.json();
   },
 
   async recordPostViews(
@@ -991,7 +862,7 @@ export const api = {
         }),
       });
       if (!res.ok) return { recorded: 0, skippedBot: false, viewsByPost: {} };
-      return await parseApiJson(res, 'Failed to record post views.');
+      return res.json();
     } catch {
       return { recorded: 0, skippedBot: false, viewsByPost: {} };
     }
@@ -1007,7 +878,7 @@ export const api = {
         }),
       });
       if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to record post share.');
+      return res.json();
     } catch {
       return null;
     }
@@ -1017,7 +888,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/posts/${postId}`, { headers: getAuthHeaders() });
       if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to load post.');
+      return res.json();
     } catch {
       return null;
     }
@@ -1041,7 +912,14 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(post),
     });
-    return parseApiJson(res, 'Failed to publish post.');
+    const result = await res.json();
+    if (!res.ok) {
+      const err: any = new Error(result.error || 'Failed to publish post.');
+      err.status = res.status;
+      err.code = result.code;
+      throw err;
+    }
+    return result;
   },
 
   async votePoll(postId: string, optionId: string): Promise<{ postId: string; poll: PostPoll }> {
@@ -1050,7 +928,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ optionId }),
     });
-    return parseApiJson(res, 'Unable to record vote right now.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Unable to record vote right now.');
+    return result;
   },
 
   async toggleLike(postId: string): Promise<{ isLiked: boolean; likes: number } | null> {
@@ -1058,7 +938,9 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Unable to update like right now.');
+    const result = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(result.error || 'Unable to update like right now.');
+    return result;
   },
 
   async toggleRepost(postId: string): Promise<{ isReposted: boolean; reposts: number } | null> {
@@ -1066,7 +948,9 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Unable to repost right now.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Unable to repost right now.');
+    return result;
   },
 
   async editPost(postId: string, content: string): Promise<Post> {
@@ -1075,7 +959,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ content }),
     });
-    return parseApiJson(res, 'Failed to update post.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update post.');
+    return result;
   },
 
   async deletePost(postId: string): Promise<{ success: boolean }> {
@@ -1083,7 +969,9 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to delete post.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to delete post.');
+    return result;
   },
 
   async addComment(postId: string, content: string, parentCommentId?: string, images?: string[]) {
@@ -1092,7 +980,14 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ content, parentCommentId, images }),
     });
-    return parseApiJson(res, 'Failed to post reply.');
+    const result = await res.json();
+    if (!res.ok) {
+      const err: any = new Error(result.error || 'Failed to post reply.');
+      err.status = res.status;
+      err.code = result.code;
+      throw err;
+    }
+    return result;
   },
 
   async editComment(commentId: string, content: string) {
@@ -1101,7 +996,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ content }),
     });
-    return parseApiJson(res, 'Failed to edit comment.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to edit comment.');
+    return result;
   },
 
   async deleteComment(commentId: string): Promise<{ success: boolean }> {
@@ -1109,7 +1006,9 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to delete comment.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to delete comment.');
+    return result;
   },
 
   // --- Chats & Messaging ---
@@ -1117,7 +1016,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/chats`, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load chats.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1127,7 +1026,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/chats/${chatId}/messages`, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load chat messages.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1146,7 +1045,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return { messages: [], total: 0, hasMore: false, nextOffset: 0 };
-      return await parseApiJson(res, 'Failed to load chat messages.');
+      return res.json();
     } catch {
       return { messages: [], total: 0, hasMore: false, nextOffset: 0 };
     }
@@ -1164,7 +1063,14 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ text, location, images, client_id: clientId }),
     });
-    return parseApiJson(res, 'Failed to send message.');
+    const result = await res.json();
+    if (!res.ok) {
+      const err: any = new Error(result.error || 'Failed to send message.');
+      err.status = res.status;
+      err.code = result.code;
+      throw err;
+    }
+    return result;
   },
 
   async editMessage(chatId: string, messageId: string, text: string): Promise<Message> {
@@ -1173,7 +1079,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ text }),
     });
-    return parseApiJson(res, 'Failed to update message.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update message.');
+    return result;
   },
 
   async deleteMessage(chatId: string, messageId: string): Promise<{ success: boolean; deletedMessageId: string; chatId: string }> {
@@ -1181,7 +1089,9 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to delete message.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to delete message.');
+    return result;
   },
 
   async markChatAsRead(chatId: string): Promise<{ success: boolean; chatId?: string; readCount?: number; readAt?: string }> {
@@ -1191,7 +1101,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return { success: false };
-      return await parseApiJson(res, 'Failed to mark chat as read.');
+      return res.json();
     } catch {
       return { success: false };
     }
@@ -1203,7 +1113,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to search users.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1216,7 +1126,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return { purgedCount: 0 };
-      return await parseApiJson(res, 'Failed to purge expired messages.');
+      return res.json();
     } catch {
       return { purgedCount: 0 };
     }
@@ -1228,7 +1138,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ targetUserId }),
     });
-    return parseApiJson(res, 'Failed to start direct conversation.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to start direct conversation.');
+    return result;
   },
 
   // --- Real-Time SSE Subscription ---
@@ -1260,27 +1172,18 @@ export const api = {
             headers: getAuthHeaders(),
           });
           if (ticketRes.ok) {
-            const ticketData = await parseApiJson<any>(ticketRes, 'Failed to create realtime ticket.');
+            const ticketData = await ticketRes.json();
             if (ticketData?.ticket) {
               params.set('ticket', ticketData.ticket);
             }
-          } else if (ticketRes.status === 404 && isStaticPreviewMissingBackend()) {
-            return;
           }
-        } catch (ticketErr: any) {
-          if (
-            ticketErr?.isSpaFallback ||
-            ticketErr?.code === 'SPA_HTML_FALLBACK' ||
-            ticketErr?.code === 'PREVIEW_NO_BACKEND'
-          ) {
-            return;
-          }
+        } catch {
           // Fall back to anonymous SSE channel if ticket exchange fails temporarily
         }
 
         if (isClosed) return;
         const url = `${API_BASE}/realtime/stream?${params.toString()}`;
-        eventSource = new EventSource(url, { withCredentials: isCrossOriginApi() });
+        eventSource = new EventSource(url);
 
         eventSource.addEventListener('message:new', (e) => {
           try {
@@ -1401,7 +1304,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load notifications.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1420,7 +1323,11 @@ export const api = {
     const res = await fetch(`${API_BASE}/notifications?${params.toString()}`, {
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to load activity.');
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || 'Failed to load activity.');
+    }
+    return res.json();
   },
 
   async markNotificationAsRead(id: string): Promise<{ success: boolean }> {
@@ -1430,7 +1337,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return { success: false };
-      return await parseApiJson(res, 'Failed to mark notification as read.');
+      return res.json();
     } catch {
       return { success: false };
     }
@@ -1443,7 +1350,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return { success: false };
-      return await parseApiJson(res, 'Failed to mark notifications as read.');
+      return res.json();
     } catch {
       return { success: false };
     }
@@ -1454,7 +1361,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/communities`, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load communities.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1464,7 +1371,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/communities/${id}`, { headers: getAuthHeaders() });
       if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to load community.');
+      return res.json();
     } catch {
       return null;
     }
@@ -1485,7 +1392,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to create community.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to create community.');
+    return result;
   },
 
   async editCommunity(id: string, updates: {
@@ -1501,7 +1410,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(updates),
     });
-    return parseApiJson(res, 'Failed to update community.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update community.');
+    return result;
   },
 
   async toggleJoinCommunity(communityId: string) {
@@ -1509,7 +1420,11 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to update membership.');
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to update membership.');
+    }
+    return res.json();
   },
 
   async getCommunityMembers(communityId: string): Promise<CommunityMember[]> {
@@ -1518,7 +1433,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load community members.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1537,7 +1452,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return { members: [], total: 0, hasMore: false, nextOffset: 0 };
-      return await parseApiJson(res, 'Failed to load community members.');
+      return res.json();
     } catch {
       return { members: [], total: 0, hasMore: false, nextOffset: 0 };
     }
@@ -1553,7 +1468,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ role }),
     });
-    return parseApiJson(res, 'Failed to update member role.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update member role.');
+    return result;
   },
 
   async removeCommunityMember(communityId: string, userId: string) {
@@ -1561,7 +1478,9 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to remove member.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to remove member.');
+    return result;
   },
 
   async getCommunityPosts(communityId: string): Promise<Post[]> {
@@ -1570,7 +1489,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load community discussions.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1587,7 +1506,11 @@ export const api = {
     const res = await fetch(`${API_BASE}/communities/${communityId}/posts?${params.toString()}`, {
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to load community discussions.');
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || 'Failed to load community discussions.');
+    }
+    return res.json();
   },
 
   async createCommunityPost(
@@ -1605,7 +1528,14 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to post to community.');
+    const result = await res.json();
+    if (!res.ok) {
+      const err: any = new Error(result.error || 'Failed to post to community.');
+      err.status = res.status;
+      err.code = result.code;
+      throw err;
+    }
+    return result;
   },
 
   // --- Campus & Off-Campus Landmarks (Zero paid API cost) ---
@@ -1629,7 +1559,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return [];
-      const data = await parseApiJson<CampusLandmark[]>(res, 'Failed to load landmarks.');
+      const data = (await res.json()) as CampusLandmark[];
       setPublicCached(cacheKey, data, 30000);
       return data;
     } catch {
@@ -1643,7 +1573,7 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to load landmark.');
+      return res.json();
     } catch {
       return null;
     }
@@ -1657,7 +1587,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/notices`, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      const data = await parseApiJson<Notice[]>(res, 'Failed to load notices.');
+      const data = (await res.json()) as Notice[];
       setPublicCached('notices:all', data, 30000);
       return data;
     } catch {
@@ -1676,7 +1606,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to submit moderation report.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to submit moderation report.');
+    return result;
   },
 
   // --- Stage 8 Administration & Security Client Methods ---
@@ -1684,7 +1616,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/admin/dashboard`, { headers: getAuthHeaders() });
       if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to load admin dashboard.');
+      return res.json();
     } catch {
       return null;
     }
@@ -1695,7 +1627,7 @@ export const api = {
       const url = status ? `${API_BASE}/admin/reports?status=${encodeURIComponent(status)}` : `${API_BASE}/admin/reports`;
       const res = await fetch(url, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load reports.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1707,7 +1639,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ status, resolutionNotes, actionTaken }),
     });
-    return parseApiJson(res, 'Failed to update report.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update report.');
+    return result;
   },
 
   async warnUser(userId: string, reason: string, severity = 'standard', details?: string) {
@@ -1716,7 +1650,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason, severity, details }),
     });
-    return parseApiJson(res, 'Failed to issue account warning.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to issue account warning.');
+    return result;
   },
 
   async suspendUser(userId: string, durationDays: number, reason: string) {
@@ -1725,7 +1661,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ durationDays, reason }),
     });
-    return parseApiJson(res, 'Failed to suspend user.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to suspend user.');
+    return result;
   },
 
   async unsuspendUser(userId: string, reason?: string) {
@@ -1734,7 +1672,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason }),
     });
-    return parseApiJson(res, 'Failed to lift suspension.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to lift suspension.');
+    return result;
   },
 
   async getAppeals(status?: string): Promise<AppealRecord[]> {
@@ -1742,7 +1682,7 @@ export const api = {
       const url = status ? `${API_BASE}/admin/appeals?status=${encodeURIComponent(status)}` : `${API_BASE}/admin/appeals`;
       const res = await fetch(url, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load appeals.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1754,7 +1694,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ type, statement, targetId }),
     });
-    return parseApiJson(res, 'Failed to submit appeal.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to submit appeal.');
+    return result;
   },
 
   async reviewAppeal(id: string, status: 'accepted' | 'rejected', reviewNotes?: string) {
@@ -1763,14 +1705,16 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ status, reviewNotes }),
     });
-    return parseApiJson(res, 'Failed to review appeal.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to review appeal.');
+    return result;
   },
 
   async getStaffRoster(): Promise<StaffMember[]> {
     try {
       const res = await fetch(`${API_BASE}/admin/staff`, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load staff roster.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1782,7 +1726,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ userId, role }),
     });
-    return parseApiJson(res, 'Failed to assign role.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to assign role.');
+    return result;
   },
 
   async trigger72HourPurge(): Promise<any> {
@@ -1790,7 +1736,9 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to execute 72h purge job.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to execute 72h purge job.');
+    return result;
   },
 
   async deleteAccountPermanently(reason?: string, password?: string) {
@@ -1803,7 +1751,8 @@ export const api = {
         ...(password ? { password } : {}),
       }),
     });
-    const result = await parseApiJson(res, 'Failed to delete account.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to delete account.');
     this.clearToken();
     return result;
   },
@@ -1812,7 +1761,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/admin/backups`, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load backups.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1823,7 +1772,9 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to create backup.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to create backup.');
+    return result;
   },
 
   async restoreBackup(id: string) {
@@ -1831,14 +1782,16 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to restore backup snapshot.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to restore backup snapshot.');
+    return result;
   },
 
   async getAdminAuditLogs(): Promise<AdminAuditLog[]> {
     try {
       const res = await fetch(`${API_BASE}/admin/audit-logs`, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load audit logs.');
+      return res.json();
     } catch {
       return [];
     }
@@ -1850,15 +1803,11 @@ export const api = {
     if (params?.search) qs.set('search', params.search);
     if (params?.role) qs.set('role', params.role);
     if (params?.status) qs.set('status', params.status);
-    try {
-      const res = await fetch(`${API_BASE}/admin/users${qs.toString() ? `?${qs.toString()}` : ''}`, {
-        headers: getAuthHeaders(),
-      });
-      if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to list users.');
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/admin/users${qs.toString() ? `?${qs.toString()}` : ''}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return [];
+    return res.json();
   },
 
   async adminCreateUser(data: {
@@ -1877,7 +1826,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to create account.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to create account.');
+    return result;
   },
 
   async adminUpdateUserProfile(userId: string, patch: {
@@ -1894,7 +1845,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    return parseApiJson(res, 'Failed to update profile.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update profile.');
+    return result;
   },
 
   async adminDeleteUserPermanently(userId: string, reason?: string) {
@@ -1903,18 +1856,16 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ confirmation: 'PERMANENTLY_DELETE', reason }),
     });
-    return parseApiJson(res, 'Failed to delete user.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to delete user.');
+    return result;
   },
 
   async adminListContent(search?: string): Promise<{ posts: AdminContentPost[]; comments: AdminContentComment[] }> {
     const url = search ? `${API_BASE}/admin/content?search=${encodeURIComponent(search)}` : `${API_BASE}/admin/content`;
-    try {
-      const res = await fetch(url, { headers: getAuthHeaders() });
-      if (!res.ok) return { posts: [], comments: [] };
-      return await parseApiJson(res, 'Failed to list content.');
-    } catch {
-      return { posts: [], comments: [] };
-    }
+    const res = await fetch(url, { headers: getAuthHeaders() });
+    if (!res.ok) return { posts: [], comments: [] };
+    return res.json();
   },
 
   async adminTogglePostVisibility(postId: string, hidden: boolean) {
@@ -1923,7 +1874,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ hidden }),
     });
-    return parseApiJson(res, 'Failed to update post visibility.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update post visibility.');
+    return result;
   },
 
   async adminTogglePostPin(postId: string, pinned: boolean) {
@@ -1932,7 +1885,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ pinned }),
     });
-    return parseApiJson(res, 'Failed to pin/unpin post.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to pin/unpin post.');
+    return result;
   },
 
   async adminDeletePost(postId: string) {
@@ -1940,7 +1895,9 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to delete post.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to delete post.');
+    return result;
   },
 
   async adminDeleteComment(commentId: string) {
@@ -1948,17 +1905,15 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to delete comment.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to delete comment.');
+    return result;
   },
 
   async adminListChats(): Promise<AdminChatOverview[]> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/chats`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to list chats.');
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/admin/chats`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return res.json();
   },
 
   async adminInspectChat(chatId: string, reason: string) {
@@ -1967,7 +1922,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason }),
     });
-    return parseApiJson(res, 'Failed to inspect chat.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to inspect chat.');
+    return result;
   },
 
   async adminDeleteChat(chatId: string, reason: string) {
@@ -1976,17 +1933,15 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason }),
     });
-    return parseApiJson(res, 'Failed to remove chat.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to remove chat.');
+    return result;
   },
 
   async adminListNotifications(): Promise<AdminNotificationRecord[]> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/notifications`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to list notifications.');
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/admin/notifications`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return res.json();
   },
 
   async adminBroadcastNotification(data: { title: string; body: string; targetUserId?: string; link?: string }) {
@@ -1995,17 +1950,15 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to broadcast notification.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to broadcast notification.');
+    return result;
   },
 
   async adminListCommunities(): Promise<AdminCommunityRecord[]> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/communities`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to list communities.');
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/admin/communities`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return res.json();
   },
 
   async adminUpdateCommunity(communityId: string, patch: { name?: string; description?: string; location?: string; isVerified?: boolean }) {
@@ -2014,7 +1967,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    return parseApiJson(res, 'Failed to update community.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update community.');
+    return result;
   },
 
   async adminDeleteCommunity(communityId: string) {
@@ -2022,17 +1977,15 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to delete community.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to delete community.');
+    return result;
   },
 
   async adminGetStorageOverview(): Promise<AdminStorageOverview | null> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/storage`, { headers: getAuthHeaders() });
-      if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to load storage overview.');
-    } catch {
-      return null;
-    }
+    const res = await fetch(`${API_BASE}/admin/storage`, { headers: getAuthHeaders() });
+    if (!res.ok) return null;
+    return res.json();
   },
 
   async adminCleanOrphanedFiles() {
@@ -2041,7 +1994,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ confirmation: 'CLEAN_ORPHANS' }),
     });
-    return parseApiJson(res, 'Failed to clean orphaned files.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to clean orphaned files.');
+    return result;
   },
 
   async adminClearExpiredCaches() {
@@ -2049,22 +2004,22 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to clear caches.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to clear caches.');
+    return result;
   },
 
   async adminDownloadStorageReport() {
     const res = await fetch(`${API_BASE}/admin/storage/report`, { headers: getAuthHeaders() });
-    return parseApiJson(res, 'Failed to generate storage report.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to generate storage report.');
+    return result;
   },
 
   async adminGetSecurityOverview(): Promise<AdminSecurityOverview | null> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/security`, { headers: getAuthHeaders() });
-      if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to load security overview.');
-    } catch {
-      return null;
-    }
+    const res = await fetch(`${API_BASE}/admin/security`, { headers: getAuthHeaders() });
+    if (!res.ok) return null;
+    return res.json();
   },
 
   async adminSetupMfa(): Promise<{ secret: string; otpauthUri: string; sampleCurrentCode?: string }> {
@@ -2072,7 +2027,9 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to start MFA setup.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to start MFA setup.');
+    return result;
   },
 
   async adminVerifyMfa(code: string) {
@@ -2081,7 +2038,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ code }),
     });
-    return parseApiJson(res, 'Invalid MFA verification code.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Invalid MFA verification code.');
+    return result;
   },
 
   async adminDisableMfa(password: string) {
@@ -2090,7 +2049,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ password }),
     });
-    return parseApiJson(res, 'Failed to disable MFA.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to disable MFA.');
+    return result;
   },
 
   async adminRevokeSessions() {
@@ -2098,18 +2059,16 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to revoke sessions.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to revoke sessions.');
+    return result;
   },
 
   async adminGetSecuritySessions(): Promise<DeviceSession[]> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/security/sessions`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      const data = await parseApiJson<any>(res, 'Failed to load sessions.');
-      return Array.isArray(data?.sessions) ? data.sessions : [];
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/admin/security/sessions`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data?.sessions) ? data.sessions : [];
   },
 
   async adminRevokeSession(sessionId: string): Promise<{ success: boolean }> {
@@ -2117,7 +2076,9 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to revoke session.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to revoke session.');
+    return result;
   },
 
   async adminRevokeUserSessions(userId: string): Promise<{ success: boolean; revokedCount: number }> {
@@ -2125,29 +2086,23 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to revoke user sessions.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to revoke user sessions.');
+    return result;
   },
 
   async adminGetSecurityEvents(severity?: string): Promise<SecurityEventRecord[]> {
     const qs = severity && severity !== 'all' ? `?severity=${encodeURIComponent(severity)}` : '';
-    try {
-      const res = await fetch(`${API_BASE}/admin/security/events${qs}`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      const data = await parseApiJson<any>(res, 'Failed to load security events.');
-      return Array.isArray(data?.events) ? data.events : [];
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/admin/security/events${qs}`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data?.events) ? data.events : [];
   },
 
   async adminListFeatures(): Promise<PlatformFeature[]> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/features`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load platform features.');
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/admin/features`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return res.json();
   },
 
   async adminRegisterFeature(data: {
@@ -2163,7 +2118,8 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await parseApiJson(res, 'Failed to register feature flag.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to register feature flag.');
     clearPublicCache();
     return result;
   },
@@ -2174,19 +2130,16 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    const result = await parseApiJson(res, 'Failed to update feature configuration.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update feature configuration.');
     clearPublicCache();
     return result;
   },
 
   async adminGetWebsiteSettings(): Promise<Record<string, string>> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/settings`, { headers: getAuthHeaders() });
-      if (!res.ok) return {};
-      return await parseApiJson(res, 'Failed to load settings.');
-    } catch {
-      return {};
-    }
+    const res = await fetch(`${API_BASE}/admin/settings`, { headers: getAuthHeaders() });
+    if (!res.ok) return {};
+    return res.json();
   },
 
   async adminUpdateWebsiteSettings(settings: Record<string, string>) {
@@ -2195,7 +2148,8 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(settings),
     });
-    const result = await parseApiJson(res, 'Failed to update website settings.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update website settings.');
     clearPublicCache();
     return result;
   },
@@ -2219,7 +2173,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to publish official Admin post.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to publish official Admin post.');
+    return result;
   },
 
   async adminUpdatePost(
@@ -2240,7 +2196,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    return parseApiJson(res, 'Failed to update post.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update post.');
+    return result;
   },
 
   async adminTogglePostFeature(postId: string, featured: boolean, distributionScope?: string) {
@@ -2249,7 +2207,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ featured, distributionScope }),
     });
-    return parseApiJson(res, 'Failed to update featured status.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update featured status.');
+    return result;
   },
 
   async adminLiftUserRestriction(userId: string, reason?: string) {
@@ -2258,20 +2218,18 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason }),
     });
-    return parseApiJson(res, 'Failed to lift restriction.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to lift restriction.');
+    return result;
   },
 
   // --- Comprehensive Real-DB Analytics & Export ---
   async adminGetAnalytics(range: AnalyticsRange = '7d'): Promise<AdminAnalyticsReport | null> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/analytics?range=${encodeURIComponent(range)}`, {
-        headers: getAuthHeaders(),
-      });
-      if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to load analytics.');
-    } catch {
-      return null;
-    }
+    const res = await fetch(`${API_BASE}/admin/analytics?range=${encodeURIComponent(range)}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return null;
+    return res.json();
   },
 
   async adminDownloadAnalyticsExport(range: AnalyticsRange = '7d', format: 'csv' | 'json' = 'csv') {
@@ -2280,7 +2238,8 @@ export const api = {
       { headers: getAuthHeaders() }
     );
     if (!res.ok) {
-      await parseApiJson(res, 'Failed to export analytics report.');
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to export analytics report.');
     }
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
@@ -2293,13 +2252,9 @@ export const api = {
 
   // --- Moderator Role & Permission Management (Admin Only) ---
   async adminListModerators(): Promise<ModeratorAccount[]> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/moderators`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load moderators.');
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/admin/moderators`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return res.json();
   },
 
   async adminAssignModerator(data: {
@@ -2316,7 +2271,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to assign Moderator.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to assign Moderator.');
+    return result;
   },
 
   async adminUpdateModeratorPermissions(userId: string, patch: Partial<ModeratorPermissions>): Promise<ModeratorAccount> {
@@ -2325,7 +2282,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    return parseApiJson(res, 'Failed to update Moderator permissions.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update Moderator permissions.');
+    return result;
   },
 
   async adminRevokeModerator(userId: string) {
@@ -2333,7 +2292,9 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to revoke Moderator.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to revoke Moderator.');
+    return result;
   },
 
   // --- Advertisements & Payment Records (Admin Only) ---
@@ -2343,7 +2304,7 @@ export const api = {
         `${API_BASE}/advertisements/active?area=${encodeURIComponent(area)}&placement=${encodeURIComponent(placement)}`
       );
       if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load advertisements.');
+      return res.json();
     } catch {
       return [];
     }
@@ -2362,13 +2323,9 @@ export const api = {
   },
 
   async adminListAdvertisements(): Promise<AdvertisementRecord[]> {
-    try {
-      const res = await fetch(`${API_BASE}/admin/advertisements`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load advertisements.');
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/admin/advertisements`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return res.json();
   },
 
   async adminCreateAdvertisement(data: {
@@ -2387,7 +2344,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to create advertisement.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to create advertisement.');
+    return result;
   },
 
   async adminUpdateAdvertisement(adId: string, patch: Partial<AdvertisementRecord>): Promise<AdvertisementRecord> {
@@ -2396,7 +2355,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    return parseApiJson(res, 'Failed to update advertisement.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update advertisement.');
+    return result;
   },
 
   async adminDeleteAdvertisement(adId: string) {
@@ -2404,27 +2365,26 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to delete advertisement.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to delete advertisement.');
+    return result;
   },
 
   async adminListPaymentRecords(params?: { status?: string; search?: string }): Promise<PaymentRecordsResponse> {
-    const fallback: PaymentRecordsResponse = {
-      records: [],
-      retainedArchives: [],
-      summary: { totalRecords: 0, confirmedNaira: 0, pendingNaira: 0, retainedCount: 0 },
-    };
     const qs = new URLSearchParams();
     if (params?.status) qs.set('status', params.status);
     if (params?.search) qs.set('search', params.search);
-    try {
-      const res = await fetch(`${API_BASE}/admin/payment-records${qs.toString() ? `?${qs.toString()}` : ''}`, {
-        headers: getAuthHeaders(),
-      });
-      if (!res.ok) return fallback;
-      return await parseApiJson(res, 'Failed to load payment records.');
-    } catch {
-      return fallback;
+    const res = await fetch(`${API_BASE}/admin/payment-records${qs.toString() ? `?${qs.toString()}` : ''}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) {
+      return {
+        records: [],
+        retainedArchives: [],
+        summary: { totalRecords: 0, confirmedNaira: 0, pendingNaira: 0, retainedCount: 0 },
+      };
     }
+    return res.json();
   },
 
   async adminCreatePaymentRecord(data: {
@@ -2443,7 +2403,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to record payment entry.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to record payment entry.');
+    return result;
   },
 
   async adminUpdatePaymentRecordStatus(
@@ -2456,33 +2418,27 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ status, notes }),
     });
-    return parseApiJson(res, 'Failed to update payment record status.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update payment record status.');
+    return result;
   },
 
   // --- Moderator Desk Scoped API (Zero Admin/Finance/Settings access) ---
   async modGetDashboard(): Promise<ModeratorDashboardData | null> {
-    try {
-      const res = await fetch(`${API_BASE}/mod/dashboard`, { headers: getAuthHeaders() });
-      if (!res.ok) return null;
-      return await parseApiJson(res, 'Failed to load moderator dashboard.');
-    } catch {
-      return null;
-    }
+    const res = await fetch(`${API_BASE}/mod/dashboard`, { headers: getAuthHeaders() });
+    if (!res.ok) return null;
+    return res.json();
   },
 
   async modListReports(params?: { status?: string; scope?: 'all' | 'assigned' | 'escalated' }): Promise<ModeratorReportItem[]> {
     const qs = new URLSearchParams();
     if (params?.status) qs.set('status', params.status);
     if (params?.scope) qs.set('scope', params.scope);
-    try {
-      const res = await fetch(`${API_BASE}/mod/reports${qs.toString() ? `?${qs.toString()}` : ''}`, {
-        headers: getAuthHeaders(),
-      });
-      if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load moderator reports.');
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/mod/reports${qs.toString() ? `?${qs.toString()}` : ''}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return [];
+    return res.json();
   },
 
   async modReviewReport(
@@ -2496,7 +2452,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ status, resolutionNotes, actionTaken }),
     });
-    return parseApiJson(res, 'Failed to update report.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update report.');
+    return result;
   },
 
   async modEscalateReport(reportId: string, reason: string) {
@@ -2505,7 +2463,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason }),
     });
-    return parseApiJson(res, 'Failed to escalate report to Admin.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to escalate report to Admin.');
+    return result;
   },
 
   async modModerateContent(
@@ -2519,7 +2479,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ action, reason }),
     });
-    return parseApiJson(res, 'Moderation action denied.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Moderation action denied.');
+    return result;
   },
 
   async modWarnUser(userId: string, reason: string, severity: 'minor' | 'standard' | 'severe' = 'standard', details?: string) {
@@ -2528,7 +2490,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason, severity, details }),
     });
-    return parseApiJson(res, 'Failed to issue warning.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to issue warning.');
+    return result;
   },
 
   async modRestrictUser(userId: string, durationHours: number, reason: string) {
@@ -2537,29 +2501,23 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ durationHours, reason }),
     });
-    return parseApiJson(res, 'Failed to apply restriction.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to apply restriction.');
+    return result;
   },
 
   async modListCommunities(): Promise<ModeratorCommunityReviewData> {
-    try {
-      const res = await fetch(`${API_BASE}/mod/communities`, { headers: getAuthHeaders() });
-      if (!res.ok) return { flaggedPosts: [], communities: [] };
-      return await parseApiJson(res, 'Failed to load moderator communities.');
-    } catch {
-      return { flaggedPosts: [], communities: [] };
-    }
+    const res = await fetch(`${API_BASE}/mod/communities`, { headers: getAuthHeaders() });
+    if (!res.ok) return { flaggedPosts: [], communities: [] };
+    return res.json();
   },
 
   async modGetHistory(scope: 'mine' | 'team' = 'mine'): Promise<ModerationHistoryEntry[]> {
-    try {
-      const res = await fetch(`${API_BASE}/mod/history?scope=${encodeURIComponent(scope)}`, {
-        headers: getAuthHeaders(),
-      });
-      if (!res.ok) return [];
-      return await parseApiJson(res, 'Failed to load moderation history.');
-    } catch {
-      return [];
-    }
+    const res = await fetch(`${API_BASE}/mod/history?scope=${encodeURIComponent(scope)}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return [];
+    return res.json();
   },
 
   // --- Saved & Pinned Locations + Search History (Strictly private per authenticated account) ---
@@ -2573,7 +2531,11 @@ export const api = {
     const res = await fetch(`${API_BASE}/locations/saved${qs.toString() ? `?${qs.toString()}` : ''}`, {
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to load saved locations.');
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to load saved locations.');
+    }
+    return res.json();
   },
 
   async saveOrPinLocation(data: {
@@ -2596,7 +2558,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to save location.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to save location.');
+    return result;
   },
 
   async updateSavedLocation(
@@ -2616,7 +2580,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    return parseApiJson(res, 'Failed to update saved location.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to update saved location.');
+    return result;
   },
 
   async deleteSavedLocation(locationId: string): Promise<{ success: boolean; deletedId: string }> {
@@ -2624,7 +2590,9 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to delete saved location.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to delete saved location.');
+    return result;
   },
 
   async getLocationSearchHistory(params?: { search?: string; limit?: number }): Promise<LocationSearchHistoryItem[]> {
@@ -2634,7 +2602,11 @@ export const api = {
     const res = await fetch(`${API_BASE}/locations/history${qs.toString() ? `?${qs.toString()}` : ''}`, {
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to load location search history.');
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to load location search history.');
+    }
+    return res.json();
   },
 
   async recordLocationSearch(data: {
@@ -2655,7 +2627,9 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    return parseApiJson(res, 'Failed to record search history.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to record search history.');
+    return result;
   },
 
   async deleteLocationSearchHistoryItem(historyId: string): Promise<{ success: boolean; deletedId: string }> {
@@ -2663,7 +2637,9 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to remove search history entry.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to remove search history entry.');
+    return result;
   },
 
   async clearLocationSearchHistory(): Promise<{ success: boolean; clearedCount: number }> {
@@ -2671,7 +2647,9 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Failed to clear location search history.');
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Failed to clear location search history.');
+    return result;
   },
 };
 

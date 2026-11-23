@@ -196,11 +196,8 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
 
     if (resolvedUser) {
       if (resolvedUser.status === 'suspended') {
-        const msg = 'Account suspended. Contact campus admin.';
         res.status(403).json({
-          success: false,
-          message: msg,
-          error: msg,
+          error: 'Account suspended. Contact campus admin.',
           code: 'ACCOUNT_SUSPENDED',
         });
         return;
@@ -226,8 +223,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
  */
 export function requireAuth(req: Request, res: Response, next: NextFunction) {
   if (!req.user) {
-    const msg = 'Authentication required. Please sign in.';
-    res.status(401).json({ success: false, message: msg, error: msg, code: 'AUTH_REQUIRED' });
+    res.status(401).json({ error: 'Authentication required. Please sign in.' });
     return;
   }
   next();
@@ -238,16 +234,12 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
  */
 export function requireTermsAccepted(req: Request, res: Response, next: NextFunction) {
   if (!req.user) {
-    const msg = 'Authentication required. Please sign in.';
-    res.status(401).json({ success: false, message: msg, error: msg, code: 'AUTH_REQUIRED' });
+    res.status(401).json({ error: 'Authentication required. Please sign in.' });
     return;
   }
   if (!req.user.acceptedTermsVersion) {
-    const msg = 'Please review and accept our Terms of Service and Community Guidelines before posting.';
     res.status(403).json({
-      success: false,
-      message: msg,
-      error: msg,
+      error: 'Please review and accept our Terms of Service and Community Guidelines before posting.',
       code: 'TERMS_ACCEPTANCE_REQUIRED',
     });
     return;
@@ -270,18 +262,14 @@ export function hasRecentReauth(user: AuthenticatedUser | undefined, maxAgeMinut
  */
 export function requireNotRestricted(req: Request, res: Response, next: NextFunction) {
   if (!req.user) {
-    const msg = 'Authentication required. Please sign in.';
-    res.status(401).json({ success: false, message: msg, error: msg, code: 'AUTH_REQUIRED' });
+    res.status(401).json({ error: 'Authentication required. Please sign in.' });
     return;
   }
   if (req.user.restricted_until) {
     const untilMs = parseTimestampMs(req.user.restricted_until);
     if (Number.isFinite(untilMs) && untilMs > Date.now()) {
-      const msg = `Your account is temporarily restricted until ${req.user.restricted_until}. Reason: ${req.user.restriction_reason || 'Moderation action'}`;
       res.status(403).json({
-        success: false,
-        message: msg,
-        error: msg,
+        error: `Your account is temporarily restricted until ${req.user.restricted_until}. Reason: ${req.user.restriction_reason || 'Moderation action'}`,
         code: 'ACCOUNT_RESTRICTED',
         restrictedUntil: req.user.restricted_until,
       });
@@ -297,8 +285,7 @@ export function requireNotRestricted(req: Request, res: Response, next: NextFunc
 export function requireRole(...allowedRoles: UserRole[]) {
   return (req: Request, res: Response, next: NextFunction) => {
     if (!req.user) {
-      const msg = 'Authentication required.';
-      res.status(401).json({ success: false, message: msg, error: msg, code: 'AUTH_REQUIRED' });
+      res.status(401).json({ error: 'Authentication required.' });
       return;
     }
 
@@ -307,11 +294,8 @@ export function requireRole(...allowedRoles: UserRole[]) {
       return next();
     }
 
-    const msg = `Forbidden. This operation requires: ${allowedRoles.join(', ')}`;
     res.status(403).json({
-      success: false,
-      message: msg,
-      error: msg,
+      error: `Forbidden. This operation requires: ${allowedRoles.join(', ')}`,
       code: 'INSUFFICIENT_PRIVILEGES',
     });
   };

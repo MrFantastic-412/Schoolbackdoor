@@ -131,12 +131,9 @@ export interface FileServePolicy {
 }
 
 export function getUploadsDir(): string {
-  const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
   const dir = process.env.SCHOOLBACKDOOR_UPLOADS_DIR
     ? path.resolve(process.env.SCHOOLBACKDOOR_UPLOADS_DIR)
-    : isVercel
-      ? path.join(path.dirname(CACHE_DIR), 'uploads')
-      : path.resolve(process.cwd(), 'data', 'uploads');
+    : path.resolve(process.cwd(), 'data', 'uploads');
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }

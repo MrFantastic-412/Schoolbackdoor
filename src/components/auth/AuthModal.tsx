@@ -180,7 +180,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         setNeedsMfa(true);
         setError('Two-factor authentication is enabled for this account. Enter your 6-digit authenticator code below.');
       } else {
-        setError(err?.message || 'Invalid email/username or password.');
+        setError(err.message || 'Invalid email/username or password.');
       }
     } finally {
       setIsLoading(false);
@@ -236,7 +236,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setMode('verifyEmail');
     } catch (err: any) {
       triggerHaptic('error');
-      setError(err?.message || 'Registration failed.');
+      setError(err.message || 'Registration failed.');
     } finally {
       setIsLoading(false);
     }
@@ -254,14 +254,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       await api.verifyAccount(verifyCodeInput.trim());
       setVerifyCodeInput('');
       if (pendingProfile) {
-        const finalized = { ...pendingProfile, verified: true };
-        setPendingProfile(null);
-        onAuthSuccess(finalized, `Welcome to Schoolbackdoor, ${finalized.handle}!`);
+        onAuthSuccess({ ...pendingProfile, verified: true }, `Welcome to Schoolbackdoor, ${pendingProfile.handle}!`);
       }
       onClose();
     } catch (err: any) {
       triggerHaptic('error');
-      setError(err?.message || 'Verification failed.');
+      setError(err.message || 'Verification failed.');
     } finally {
       setIsLoading(false);
     }
@@ -275,7 +273,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setSuccessMsg(res.message || 'A fresh verification code has been prepared.');
     } catch (err: any) {
       triggerHaptic('error');
-      setError(err?.message || 'Could not resend verification code.');
+      setError(err.message || 'Could not resend verification code.');
     } finally {
       setIsLoading(false);
     }
@@ -283,18 +281,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
   const handleSkipVerification = () => {
     if (pendingProfile) {
-      const finalized = pendingProfile;
-      setPendingProfile(null);
-      onAuthSuccess(finalized, `Welcome to Schoolbackdoor, ${finalized.handle}!`);
-    }
-    onClose();
-  };
-
-  const handleModalClose = () => {
-    if (mode === 'verifyEmail' && pendingProfile) {
-      const finalized = pendingProfile;
-      setPendingProfile(null);
-      onAuthSuccess(finalized, `Welcome to Schoolbackdoor, ${finalized.handle}!`);
+      onAuthSuccess(pendingProfile, `Welcome to Schoolbackdoor, ${pendingProfile.handle}!`);
     }
     onClose();
   };
@@ -315,7 +302,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setMode('reset');
     } catch (err: any) {
       triggerHaptic('error');
-      setError(err?.message || 'Password recovery failed.');
+      setError(err.message || 'Password recovery failed.');
     } finally {
       setIsLoading(false);
     }
@@ -343,7 +330,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setResetCode('');
     } catch (err: any) {
       triggerHaptic('error');
-      setError(err?.message || 'Failed to reset password.');
+      setError(err.message || 'Failed to reset password.');
     } finally {
       setIsLoading(false);
     }
@@ -366,7 +353,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     <>
       <GlassModal
         isOpen={isOpen}
-        onClose={handleModalClose}
+        onClose={onClose}
         maxWidthClass="max-w-md"
         title={modalTitle}
         subtitle="Schoolbackdoor · Independent Student Social Platform"
@@ -411,10 +398,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         {error && (
           <div
             role="alert"
-            className="p-3 rounded-xl bg-[#F6E2E6] dark:bg-[#4A2532]/70 border border-[#D98BA5]/60 dark:border-[#D98BA5]/45 text-[#171613] dark:text-[#F5EFE3] text-xs leading-relaxed flex items-start gap-2"
+            className="p-3 rounded-xl bg-[#F6E2E6] dark:bg-[#4A2532]/70 border border-[#D98BA5]/60 dark:border-[#D98BA5]/45 text-[#171613] dark:text-[#F5EFE3] text-xs flex items-start gap-2"
           >
             <AlertCircle className="w-4 h-4 text-[#C4718E] dark:text-[#E5A4BA] shrink-0 mt-0.5" />
-            <span className="break-words">{error}</span>
+            <span>{error}</span>
           </div>
         )}
 

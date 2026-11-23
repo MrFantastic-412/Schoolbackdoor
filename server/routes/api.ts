@@ -106,33 +106,20 @@ const REFRESH_COOKIE_NAME = 'sb_refresh';
 
 function shouldSetSecureCookie(req: Request): boolean {
   if (req.secure) return true;
-  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').toLowerCase();
   if (forwardedProto === 'https') return true;
-  if (process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL)) {
+  if (process.env.NODE_ENV === 'production') {
     const host = String(req.hostname || '').toLowerCase();
     return host !== '127.0.0.1' && host !== 'localhost';
   }
   return false;
 }
 
-function isCrossOriginRequest(req: Request): boolean {
-  const origin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
-  const forwardedHost = typeof req.headers['x-forwarded-host'] === 'string' ? req.headers['x-forwarded-host'].split(',')[0].trim() : '';
-  const hostHeader = forwardedHost || (typeof req.headers.host === 'string' ? req.headers.host.trim() : '');
-  if (!origin || !hostHeader) return false;
-  try {
-    return new URL(origin).host !== hostHeader;
-  } catch {
-    return false;
-  }
-}
-
-function formatCookie(name: string, value: string, maxAgeSeconds: number, secure: boolean, crossOrigin = false): string {
-  const sameSite = crossOrigin && secure ? 'None' : 'Strict';
+function formatCookie(name: string, value: string, maxAgeSeconds: number, secure: boolean): string {
   const parts = [
     `${name}=${value ? encodeURIComponent(value) : ''}`,
     'HttpOnly',
-    `SameSite=${sameSite}`,
+    'SameSite=Strict',
     'Path=/',
     `Max-Age=${maxAgeSeconds}`,
   ];
@@ -142,22 +129,20 @@ function formatCookie(name: string, value: string, maxAgeSeconds: number, secure
 
 function setSessionCookie(req: Request, res: Response, rawToken: string, rawRefreshToken?: string) {
   const secure = shouldSetSecureCookie(req);
-  const crossOrigin = isCrossOriginRequest(req);
   const accessMaxAge = SESSION_POLICY.accessTtlMinutes * 60;
   const refreshMaxAge = SESSION_POLICY.refreshInactivityDays * 24 * 60 * 60;
-  const cookies = [formatCookie(SESSION_COOKIE_NAME, rawToken, accessMaxAge, secure, crossOrigin)];
+  const cookies = [formatCookie(SESSION_COOKIE_NAME, rawToken, accessMaxAge, secure)];
   if (rawRefreshToken) {
-    cookies.push(formatCookie(REFRESH_COOKIE_NAME, rawRefreshToken, refreshMaxAge, secure, crossOrigin));
+    cookies.push(formatCookie(REFRESH_COOKIE_NAME, rawRefreshToken, refreshMaxAge, secure));
   }
   res.setHeader('Set-Cookie', cookies);
 }
 
 function clearSessionCookie(req: Request, res: Response) {
   const secure = shouldSetSecureCookie(req);
-  const crossOrigin = isCrossOriginRequest(req);
   res.setHeader('Set-Cookie', [
-    formatCookie(SESSION_COOKIE_NAME, '', 0, secure, crossOrigin),
-    formatCookie(REFRESH_COOKIE_NAME, '', 0, secure, crossOrigin),
+    formatCookie(SESSION_COOKIE_NAME, '', 0, secure),
+    formatCookie(REFRESH_COOKIE_NAME, '', 0, secure),
   ]);
 }
 
@@ -170,74 +155,44 @@ function sanitizeAuthUserPayload(user: Record<string, any> | null | undefined) {
 function sendApiMediaError(res: Response, err: any, fallbackStatus = 400) {
   const msg = String(err?.message || 'Request failed.');
   if (err?.status === 413 || err?.code === 'IMAGE_TOO_LARGE') {
-    res.status(413).json({ success: false, message: msg, error: msg, code: 'IMAGE_TOO_LARGE' });
+    res.status(413).json({ error: msg, code: 'IMAGE_TOO_LARGE' });
     return;
   }
   if (err?.status === 507 || err?.code === 'STORAGE_PROTECTION_ACTIVE' || msg.includes('Storage Protection Mode')) {
-    res.status(507).json({ success: false, message: msg, error: msg, code: 'STORAGE_PROTECTION_ACTIVE' });
+    res.status(507).json({ error: msg, code: 'STORAGE_PROTECTION_ACTIVE' });
     return;
   }
   const status = typeof err?.status === 'number' && err.status >= 400 && err.status < 600 ? err.status : fallbackStatus;
-  res.status(status).json({
-    success: false,
-    message: msg,
-    error: msg,
-    ...(err?.code ? { code: err.code } : {}),
-  });
+  res.status(status).json({ error: msg, ...(err?.code ? { code: err.code } : {}) });
 }
 
 // --- Authentication & Account Lifecycle ---
 apiRouter.post('/auth/register', (req: Request, res: Response) => {
   try {
-    const body = req.body || {};
-    const rawEmail = String(body.email ?? body.identifier ?? '').trim();
-    const rawUsername = String(body.username ?? '').trim();
-    const rawPassword = typeof body.password === 'string' ? body.password : '';
-    if (!rawEmail || !rawUsername || !rawPassword) {
-      const msg = 'Username, Gmail address, and password are required.';
-      res.status(400).json({ success: false, message: msg, error: msg, code: 'MISSING_FIELDS' });
-      return;
-    }
-    if (body.acceptTerms !== true) {
-      const msg = 'You must accept the Terms of Service and Community Guidelines before creating an account.';
+    if (req.body?.acceptTerms !== true) {
       res.status(400).json({
-        success: false,
-        message: msg,
-        error: msg,
+        error: 'You must accept the Terms of Service and Community Guidelines before creating an account.',
         code: 'TERMS_ACCEPTANCE_REQUIRED',
       });
       return;
     }
     const ip = req.ip || req.socket.remoteAddress;
     const result = authService.register(
-      { ...body, userAgent: req.headers['user-agent'] },
+      { ...req.body, userAgent: req.headers['user-agent'] },
       ip
     );
     if (result.token) {
       setSessionCookie(req, res, result.token, result.refreshToken);
     }
     const { refreshToken: _rt, ...safeResult } = result as Record<string, any>;
-    const safeUser = sanitizeAuthUserPayload(result.user);
-    const payload = {
-      ...safeResult,
-      user: safeUser,
-    };
     res.status(201).json({
-      success: true,
-      message: 'Account created successfully.',
-      data: payload,
-      ...payload,
+      ...safeResult,
+      user: sanitizeAuthUserPayload(result.user),
     });
   } catch (err: any) {
     if (err instanceof AuthRateLimitError || err?.status === 429) {
       res.setHeader('Retry-After', String(err.retryAfterSeconds || 3600));
-      res.status(429).json({
-        success: false,
-        message: err.message,
-        error: err.message,
-        code: 'RATE_LIMITED',
-        retryAfterSeconds: err.retryAfterSeconds || 3600,
-      });
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 3600 });
       return;
     }
     sendApiMediaError(res, err, 400);
@@ -246,7 +201,7 @@ apiRouter.post('/auth/register', (req: Request, res: Response) => {
 
 apiRouter.post('/auth/login', (req: Request, res: Response) => {
   try {
-    const { identifier, password, mfaCode } = req.body || {};
+    const { identifier, password, mfaCode } = req.body;
     const ip = req.ip || req.socket.remoteAddress;
     const userAgent = req.headers['user-agent'];
     const result = authService.login(identifier, password, ip, userAgent, mfaCode);
@@ -255,45 +210,19 @@ apiRouter.post('/auth/login', (req: Request, res: Response) => {
       setSessionCookie(req, res, result.token, result.refreshToken);
     }
     const { refreshToken: _rt, ...safeResult } = result as Record<string, any>;
-    const safeUser = sanitizeAuthUserPayload(result.user);
-    const payload = {
-      ...safeResult,
-      user: safeUser,
-      profile,
-    };
     res.json({
-      success: true,
-      message: 'Signed in successfully.',
-      data: payload,
-      ...payload,
+      ...safeResult,
+      user: sanitizeAuthUserPayload(result.user),
+      profile,
     });
   } catch (err: any) {
     if (err instanceof AuthRateLimitError || err?.status === 429) {
       res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
-      res.status(429).json({
-        success: false,
-        message: err.message,
-        error: err.message,
-        code: 'RATE_LIMITED',
-        retryAfterSeconds: err.retryAfterSeconds || 900,
-      });
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
       return;
     }
-    const mfaRequired = typeof err?.message === 'string' && err.message.startsWith('MFA_REQUIRED:');
-    const statusCode =
-      mfaRequired
-        ? 403
-        : typeof err?.status === 'number' && err.status >= 400 && err.status < 500
-          ? err.status
-          : 401;
-    const msg = err?.message || 'Authentication failed.';
-    res.status(statusCode).json({
-      success: false,
-      message: msg,
-      error: msg,
-      mfaRequired,
-      ...(err?.code ? { code: err.code } : {}),
-    });
+    const statusCode = typeof err?.message === 'string' && err.message.startsWith('MFA_REQUIRED:') ? 403 : 401;
+    res.status(statusCode).json({ error: err.message, mfaRequired: statusCode === 403 });
   }
 });
 
@@ -301,34 +230,23 @@ apiRouter.post('/auth/refresh', (req: Request, res: Response) => {
   try {
     const rawRefresh = extractRefreshToken(req);
     if (!rawRefresh) {
-      const msg = 'Refresh session cookie is missing or expired.';
-      res.status(401).json({ success: false, message: msg, error: msg, code: 'REFRESH_MISSING' });
+      res.status(401).json({ error: 'Refresh session cookie is missing or expired.' });
       return;
     }
     const ip = req.ip || req.socket.remoteAddress;
     const userAgent = req.headers['user-agent'];
     const refreshed = authService.refreshSession(rawRefresh, ip, userAgent);
     setSessionCookie(req, res, refreshed.token, refreshed.refreshToken);
-    const safeUser = sanitizeAuthUserPayload(refreshed.user);
-    const payload = {
+    res.json({
       token: refreshed.token,
       sessionId: refreshed.sessionId,
       expiresAt: refreshed.expiresAt,
-      user: safeUser,
-    };
-    res.json({
-      success: true,
-      message: 'Session refreshed.',
-      data: payload,
-      ...payload,
+      user: sanitizeAuthUserPayload(refreshed.user),
     });
   } catch (err: any) {
     clearSessionCookie(req, res);
-    const msg = err?.message || 'Session refresh failed.';
     res.status(401).json({
-      success: false,
-      message: msg,
-      error: msg,
+      error: err?.message || 'Session refresh failed.',
       ...(err?.code ? { code: err.code } : {}),
     });
   }
@@ -338,25 +256,14 @@ apiRouter.post('/auth/reauthenticate', requireAuth, (req: Request, res: Response
   try {
     const ip = req.ip || req.socket.remoteAddress;
     const result = authService.reauthenticate(req.user!.id, req.body?.password || '', ip);
-    res.json({
-      message: 'Password confirmed.',
-      data: result,
-      ...result,
-      success: true,
-    });
+    res.json(result);
   } catch (err: any) {
     if (err instanceof AuthRateLimitError || err?.status === 429) {
       res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
-      res.status(429).json({
-        success: false,
-        message: err.message,
-        error: err.message,
-        retryAfterSeconds: err.retryAfterSeconds || 900,
-      });
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
       return;
     }
-    const msg = err?.message || 'Re-authentication failed.';
-    res.status(401).json({ success: false, message: msg, error: msg });
+    res.status(401).json({ error: err?.message || 'Re-authentication failed.' });
   }
 });
 
@@ -370,24 +277,14 @@ apiRouter.post('/auth/change-password', requireAuth, (req: Request, res: Respons
       req.sessionTokenHash,
       ip
     );
-    res.json({
-      data: result,
-      ...result,
-      success: true,
-    });
+    res.json(result);
   } catch (err: any) {
     if (err instanceof AuthRateLimitError || err?.status === 429) {
       res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
-      res.status(429).json({
-        success: false,
-        message: err.message,
-        error: err.message,
-        retryAfterSeconds: err.retryAfterSeconds || 900,
-      });
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
       return;
     }
-    const msg = err?.message || 'Unable to change password.';
-    res.status(400).json({ success: false, message: msg, error: msg });
+    res.status(400).json({ error: err?.message || 'Unable to change password.' });
   }
 });
 
@@ -405,10 +302,10 @@ apiRouter.post('/auth/mfa/verify', requireRole('admin', 'moderator'), (req: Requ
   } catch (err: any) {
     if (err instanceof AuthRateLimitError || err?.status === 429) {
       res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
-      res.status(429).json({ success: false, message: err.message, error: err.message });
+      res.status(429).json({ error: err.message });
       return;
     }
-    res.status(400).json({ success: false, message: err.message, error: err.message });
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -418,29 +315,25 @@ apiRouter.post('/auth/mfa/disable', requireRole('admin', 'moderator'), (req: Req
   } catch (err: any) {
     if (err instanceof AuthRateLimitError || err?.status === 429) {
       res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
-      res.status(429).json({ success: false, message: err.message, error: err.message });
+      res.status(429).json({ error: err.message });
       return;
     }
-    res.status(400).json({ success: false, message: err.message, error: err.message });
+    res.status(400).json({ error: err.message });
   }
 });
 
 apiRouter.post('/auth/logout', (req: Request, res: Response) => {
-  try {
-    const token = extractSessionToken(req);
-    const clientId = typeof req.body?.clientId === 'string' ? req.body.clientId : undefined;
-    if (req.user?.id) {
-      const summary = presenceService.removeClientPresence(req.user.id, clientId);
-      sseManager.broadcastPresenceUpdate(summary);
-    }
-    if (token) {
-      authService.logout(token);
-    }
-  } catch {
-    // Always clear cookies and confirm logout cleanly
+  const token = extractSessionToken(req);
+  const clientId = typeof req.body?.clientId === 'string' ? req.body.clientId : undefined;
+  if (req.user?.id) {
+    const summary = presenceService.removeClientPresence(req.user.id, clientId);
+    sseManager.broadcastPresenceUpdate(summary);
+  }
+  if (token) {
+    authService.logout(token);
   }
   clearSessionCookie(req, res);
-  res.json({ success: true, message: 'Signed out successfully.', data: { signedOut: true } });
+  res.json({ success: true, message: 'Signed out successfully.' });
 });
 
 // --- Live Presence & Unique Online Users ---
@@ -485,21 +378,16 @@ apiRouter.post('/presence/offline', requireAuth, (req: Request, res: Response) =
 
 apiRouter.post('/auth/verify', requireAuth, (req: Request, res: Response) => {
   try {
-    const { code } = req.body || {};
+    const { code } = req.body;
     const ip = req.ip || req.socket.remoteAddress;
     const result = authService.verifyAccount(req.user!.id, code, ip);
-    res.json({
-      message: 'Account verified successfully.',
-      data: result,
-      ...result,
-      success: true,
-    });
+    res.json(result);
   } catch (err: any) {
     const isRateLimited = String(err?.message || '').includes('Too many');
     if (isRateLimited) {
       res.setHeader('Retry-After', '900');
     }
-    res.status(isRateLimited ? 429 : 400).json({ success: false, message: err.message, error: err.message });
+    res.status(isRateLimited ? 429 : 400).json({ error: err.message });
   }
 });
 
@@ -508,83 +396,59 @@ apiRouter.post('/auth/verify/resend', requireAuth, (req: Request, res: Response)
     const ip = req.ip || req.socket.remoteAddress;
     const result = authService.resendVerificationCode(req.user!.id, ip);
     const { verification_code: _vc, ...safeResult } = result as Record<string, any>;
-    res.json({
-      success: true,
-      data: safeResult,
-      ...safeResult,
-    });
+    res.json(safeResult);
   } catch (err: any) {
     const isRateLimited = String(err?.message || '').includes('Too many');
     if (isRateLimited) {
       res.setHeader('Retry-After', '3600');
     }
-    res.status(isRateLimited ? 429 : 400).json({ success: false, message: err.message, error: err.message });
+    res.status(isRateLimited ? 429 : 400).json({ error: err.message });
   }
 });
 
 apiRouter.post('/auth/forgot-password', (req: Request, res: Response) => {
   try {
-    const { identifier } = req.body || {};
+    const { identifier } = req.body;
     const ip = req.ip || req.socket.remoteAddress;
     const result = authService.requestPasswordReset(identifier, ip);
     const { resetCode: _rc, ...safeResult } = result as Record<string, any>;
-    res.json({
-      success: true,
-      data: safeResult,
-      ...safeResult,
-    });
+    res.json(safeResult);
   } catch (err: any) {
     const isRateLimited = String(err?.message || '').includes('Too many');
     if (isRateLimited) {
       res.setHeader('Retry-After', '3600');
     }
-    res.status(isRateLimited ? 429 : 400).json({ success: false, message: err.message, error: err.message });
+    res.status(isRateLimited ? 429 : 400).json({ error: err.message });
   }
 });
 
 apiRouter.post('/auth/reset-password', (req: Request, res: Response) => {
   try {
-    const { resetCode, newPassword, identifier } = req.body || {};
+    const { resetCode, newPassword, identifier } = req.body;
     const ip = req.ip || req.socket.remoteAddress;
     const result = authService.resetPasswordWithCode(resetCode, newPassword, ip, identifier);
     clearSessionCookie(req, res);
-    res.json({
-      data: result,
-      ...result,
-      success: true,
-    });
+    res.json(result);
   } catch (err: any) {
     const isRateLimited = err instanceof AuthRateLimitError || err?.status === 429 || String(err?.message || '').includes('Too many');
     if (isRateLimited) {
       res.setHeader('Retry-After', String(err?.retryAfterSeconds || 900));
     }
-    res.status(isRateLimited ? 429 : 400).json({ success: false, message: err.message, error: err.message });
+    res.status(isRateLimited ? 429 : 400).json({ error: err.message });
   }
 });
 
 // --- User & Profile ---
 apiRouter.get('/me', requireAuth, (req: Request, res: Response) => {
-  try {
-    const profile = userService.getProfileByUserId(req.user!.id, req.user!.id, req.user!.role);
-    if (!profile) {
-      const msg = 'Profile not found.';
-      res.status(404).json({ success: false, message: msg, error: msg, code: 'PROFILE_NOT_FOUND' });
-      return;
-    }
-    const payload = {
-      user: req.user,
-      profile,
-    };
-    res.json({
-      success: true,
-      message: 'Active session verified.',
-      data: payload,
-      ...payload,
-    });
-  } catch {
-    const msg = 'Unable to load active user session.';
-    res.status(500).json({ success: false, message: msg, error: msg, code: 'SESSION_LOOKUP_ERROR' });
+  const profile = userService.getProfileByUserId(req.user!.id, req.user!.id, req.user!.role);
+  if (!profile) {
+    res.status(404).json({ error: 'Profile not found.' });
+    return;
   }
+  res.json({
+    user: req.user,
+    profile,
+  });
 });
 
 apiRouter.post('/me/accept-terms', requireAuth, (req: Request, res: Response) => {
@@ -2403,6 +2267,5 @@ apiRouter.get('/mod/history', requireRole('moderator', 'admin'), (req: Request, 
 
 // Explicit JSON 404 for unknown or removed /api/* endpoints (prevents falling through to SPA HTML)
 apiRouter.use((_req: Request, res: Response) => {
-  const msg = 'API endpoint not found.';
-  res.status(404).json({ success: false, message: msg, error: msg, code: 'NOT_FOUND' });
+  res.status(404).json({ error: 'API endpoint not found.' });
 });

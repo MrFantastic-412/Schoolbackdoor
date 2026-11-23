@@ -3,20 +3,11 @@ const CDN_BASE =
     ? String((import.meta as any).env.VITE_CDN_URL).trim().replace(/\/+$/, '')
     : '';
 
-const API_ORIGIN = (() => {
-  if (typeof import.meta === 'undefined') return '';
-  const raw = (import.meta as any).env?.VITE_API_URL;
-  if (!raw || typeof raw !== 'string') return '';
-  const cleaned = raw.trim().replace(/\/+$/, '').replace(/\/api$/i, '');
-  return /^https?:\/\//i.test(cleaned) ? cleaned : '';
-})();
-
 const SAFE_DATA_IMAGE_REGEX = /^data:image\/(jpeg|jpg|png|webp|avif);base64,[A-Za-z0-9+/=]+$/i;
 
 /**
  * Resolves a public or uploaded asset path against an optional configured CDN origin
- * (`VITE_CDN_URL`) or split backend API origin (`VITE_API_URL`), rejecting dangerous
- * URI schemes (`javascript:`, SVG/HTML `data:`, `//`).
+ * (`VITE_CDN_URL`), rejecting dangerous URI schemes (`javascript:`, SVG/HTML `data:`, `//`).
  */
 export function resolveMediaUrl(url?: string): string {
   if (!url || typeof url !== 'string') return '';
@@ -37,9 +28,6 @@ export function resolveMediaUrl(url?: string): string {
   }
   if (CDN_BASE && (trimmed.startsWith('/api/uploads/') || trimmed.startsWith('/assets/'))) {
     return `${CDN_BASE}${trimmed}`;
-  }
-  if (API_ORIGIN && trimmed.startsWith('/api/uploads/')) {
-    return `${API_ORIGIN}${trimmed}`;
   }
   return trimmed.startsWith('/') ? trimmed : '';
 }
