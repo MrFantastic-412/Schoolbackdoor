@@ -79,9 +79,42 @@ function isCrossOriginApi(): boolean {
   }
 }
 
+export function isStaticPreviewMissingBackend(
+  hostname: string | undefined = typeof window !== 'undefined' ? window.location?.hostname : undefined,
+  apiBase: string = API_BASE
+): boolean {
+  if (apiBase !== '/api') return false;
+  const normalizedHost = String(hostname || '').trim().toLowerCase();
+  if (!normalizedHost) return false;
+  return normalizedHost.endsWith('.scf.usercontent.goog') || normalizedHost === 'aistudio.google.com';
+}
+
+function buildNotFoundError(
+  status: number,
+  options?: { hostname?: string; apiBase?: string }
+): Error {
+  if (status === 404 && isStaticPreviewMissingBackend(options?.hostname, options?.apiBase)) {
+    const err: any = new Error(
+      'Backend API unavailable in AI Studio static preview (HTTP 404 on /api). Signup, login, and live data require setting VITE_API_URL to a running backend or deploying to Vercel (https://schoolbackdoor.vercel.app).'
+    );
+    err.status = 404;
+    err.code = 'PREVIEW_NO_BACKEND';
+    err.isPreviewNoBackend = true;
+    return err;
+  }
+
+  const err: any = new Error(
+    'API endpoint not found (HTTP 404). Verify Vercel API routing or VITE_API_URL configuration.'
+  );
+  err.status = status;
+  err.code = 'NON_JSON_RESPONSE';
+  return err;
+}
+
 export async function parseApiJson<T = any>(
   res: Response,
-  fallbackMessage = 'Request failed.'
+  fallbackMessage = 'Request failed.',
+  options?: { hostname?: string; apiBase?: string }
 ): Promise<T> {
   const rawText = await res.text();
   const trimmed = rawText.trim();
@@ -90,11 +123,10 @@ export async function parseApiJson<T = any>(
     if (res.ok) {
       return {} as T;
     }
-    const err: any = new Error(
-      res.status === 404
-        ? 'API endpoint not found (HTTP 404). Verify Vercel API routing or VITE_API_URL configuration.'
-        : fallbackMessage
-    );
+    if (res.status === 404) {
+      throw buildNotFoundError(404, options);
+    }
+    const err: any = new Error(fallbackMessage);
     err.status = res.status;
     throw err;
   }
@@ -103,16 +135,39 @@ export async function parseApiJson<T = any>(
   try {
     parsed = JSON.parse(trimmed);
   } catch {
+    const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+    const looksLikeHtml =
+      contentType.includes('text/html') ||
+      contentType.includes('application/xhtml+xml') ||
+      /^<(?:!doctype\s+html|html\b)/i.test(trimmed);
     const isNotFoundHtmlOrText =
       res.status === 404 || /the page could not be found/i.test(trimmed);
-    const diagnostic = isNotFoundHtmlOrText
-      ? 'API endpoint not found (HTTP 404). Verify Vercel API routing or VITE_API_URL configuration.'
-      : res.status >= 500
-        ? `Server returned an invalid non-JSON response (HTTP ${res.status}). Please try again shortly.`
-        : `Unexpected non-JSON response from server (HTTP ${res.status || 0}).`;
+
+    if (isNotFoundHtmlOrText) {
+      throw buildNotFoundError(404, options);
+    }
+
+    let diagnostic: string;
+    let code = 'NON_JSON_RESPONSE';
+    let isSpaFallback = false;
+
+    if (res.status >= 500) {
+      diagnostic = `Server returned an invalid non-JSON response (HTTP ${res.status}). Please try again shortly.`;
+    } else if (res.ok && looksLikeHtml) {
+      diagnostic =
+        'No backend API server is connected in this preview environment (received the app HTML instead of API JSON). Start the Express backend or configure VITE_API_URL, then retry.';
+      code = 'SPA_HTML_FALLBACK';
+      isSpaFallback = true;
+    } else {
+      diagnostic = `Unexpected non-JSON response from server (HTTP ${res.status || 0}).`;
+    }
+
     const err: any = new Error(diagnostic);
     err.status = res.status;
-    err.code = 'NON_JSON_RESPONSE';
+    err.code = code;
+    if (isSpaFallback) {
+      err.isSpaFallback = true;
+    }
     throw err;
   }
 
@@ -909,7 +964,14 @@ export const api = {
     const res = await fetch(`${API_BASE}/posts?${params.toString()}`, {
       headers: getAuthHeaders(),
     });
-    return parseApiJson(res, 'Unable to load posts right now.');
+    const data = await parseApiJson<PaginatedPostsResponse>(res, 'Unable to load posts right now.');
+    if (!data || !Array.isArray(data.posts)) {
+      const err: any = new Error('Received an invalid feed payload from the server.');
+      err.status = res.status;
+      err.code = 'INVALID_FEED_PAYLOAD';
+      throw err;
+    }
+    return data;
   },
 
   async recordPostViews(
@@ -1202,8 +1264,17 @@ export const api = {
             if (ticketData?.ticket) {
               params.set('ticket', ticketData.ticket);
             }
+          } else if (ticketRes.status === 404 && isStaticPreviewMissingBackend()) {
+            return;
           }
-        } catch {
+        } catch (ticketErr: any) {
+          if (
+            ticketErr?.isSpaFallback ||
+            ticketErr?.code === 'SPA_HTML_FALLBACK' ||
+            ticketErr?.code === 'PREVIEW_NO_BACKEND'
+          ) {
+            return;
+          }
           // Fall back to anonymous SSE channel if ticket exchange fails temporarily
         }
 

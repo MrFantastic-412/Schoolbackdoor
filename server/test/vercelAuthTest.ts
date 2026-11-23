@@ -87,6 +87,89 @@ async function runTests() {
   );
   pass('parseApiJson handles 502 HTML responses gracefully');
 
+  const spaHtmlFallbackResp = new Response(
+    '<!doctype html><html lang="en"><head><title>Schoolbackdoor</title></head><body><div id="root"></div></body></html>',
+    {
+      status: 200,
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    }
+  );
+  await assert.rejects(
+    () => parseApiJson(spaHtmlFallbackResp, 'Unable to load posts right now.'),
+    (err: any) =>
+      err instanceof Error &&
+      (err as any).code === 'SPA_HTML_FALLBACK' &&
+      (err as any).isSpaFallback === true &&
+      (err as any).status === 200 &&
+      err.message.toLowerCase().includes('preview') &&
+      !err.message.includes('Unexpected non-JSON response from server (HTTP 200)'),
+    'HTTP 200 text/html SPA fallback produces helpful preview diagnostic error'
+  );
+  pass('parseApiJson detects HTTP 200 HTML SPA fallback cleanly');
+
+  const preview404Resp = () =>
+    new Response('Not Found', {
+      status: 404,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    });
+
+  await assert.rejects(
+    () =>
+      parseApiJson(preview404Resp(), 'Authentication failed.', {
+        hostname: 'abc-123.scf.usercontent.goog',
+        apiBase: '/api',
+      }),
+    (err: any) =>
+      err instanceof Error &&
+      (err as any).code === 'PREVIEW_NO_BACKEND' &&
+      (err as any).status === 404 &&
+      err.message.includes('VITE_API_URL') &&
+      err.message.includes('https://schoolbackdoor.vercel.app'),
+    'AI Studio .scf.usercontent.goog preview 404 with relative /api throws PREVIEW_NO_BACKEND'
+  );
+
+  await assert.rejects(
+    () =>
+      parseApiJson(preview404Resp(), 'Authentication failed.', {
+        hostname: 'aistudio.google.com',
+        apiBase: '/api',
+      }),
+    (err: any) =>
+      err instanceof Error &&
+      (err as any).code === 'PREVIEW_NO_BACKEND' &&
+      (err as any).status === 404,
+    'aistudio.google.com preview 404 with relative /api throws PREVIEW_NO_BACKEND'
+  );
+
+  await assert.rejects(
+    () =>
+      parseApiJson(preview404Resp(), 'Authentication failed.', {
+        hostname: 'abc-123.scf.usercontent.goog',
+        apiBase: 'https://schoolbackdoor.vercel.app/api',
+      }),
+    (err: any) =>
+      err instanceof Error &&
+      (err as any).code === 'NON_JSON_RESPONSE' &&
+      (err as any).status === 404 &&
+      err.message === 'API endpoint not found (HTTP 404). Verify Vercel API routing or VITE_API_URL configuration.',
+    'Preview with VITE_API_URL configured keeps standard HTTP 404 message'
+  );
+
+  await assert.rejects(
+    () =>
+      parseApiJson(preview404Resp(), 'Authentication failed.', {
+        hostname: 'schoolbackdoor.vercel.app',
+        apiBase: '/api',
+      }),
+    (err: any) =>
+      err instanceof Error &&
+      (err as any).code === 'NON_JSON_RESPONSE' &&
+      (err as any).status === 404 &&
+      err.message === 'API endpoint not found (HTTP 404). Verify Vercel API routing or VITE_API_URL configuration.',
+    'Production Vercel domain 404 keeps standard HTTP 404 message'
+  );
+  pass('parseApiJson differentiates AI Studio preview 404 (PREVIEW_NO_BACKEND) from production/configured 404');
+
   const okJsonResp = new Response(JSON.stringify({ success: true, token: 'tok-123' }), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },

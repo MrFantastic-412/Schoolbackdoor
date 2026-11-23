@@ -197,7 +197,9 @@ export default function App() {
   const [hasMorePosts, setHasMorePosts] = useState(false);
   const [nextPostsOffset, setNextPostsOffset] = useState(0);
   const [isLoadingMorePosts, setIsLoadingMorePosts] = useState(false);
+  const [isRetryingFeed, setIsRetryingFeed] = useState(false);
   const [feedError, setFeedError] = useState<string | null>(null);
+  const [feedErrorCode, setFeedErrorCode] = useState<string | null>(null);
   const loadMoreLockRef = useRef(false);
 
   const [viewingUserId, setViewingUserId] = useState<string | null>(initialRoute.current.viewingUserId);
@@ -406,6 +408,7 @@ export default function App() {
       activeLocation: LocationFilterKey = 'all'
     ) => {
       setFeedError(null);
+      setFeedErrorCode(null);
       try {
         const [
           paginatedPosts,
@@ -425,8 +428,9 @@ export default function App() {
               category: activeCategory,
               location: activeLocation,
             })
-            .catch((err) => {
+            .catch((err: any) => {
               setFeedError(err?.message || 'Unable to load posts right now.');
+              setFeedErrorCode(err?.code || null);
               return null;
             }),
           api.getNotices(),
@@ -443,6 +447,7 @@ export default function App() {
           setHasMorePosts(paginatedPosts.hasMore);
           setNextPostsOffset(paginatedPosts.nextOffset);
           setFeedError(null);
+          setFeedErrorCode(null);
         }
         if (liveNotices && liveNotices.length > 0) setNotices(liveNotices);
         if (liveCommunities && liveCommunities.length > 0) setCommunities(liveCommunities);
@@ -489,6 +494,7 @@ export default function App() {
       errorFallback = 'Unable to load posts right now.'
     ) => {
       setFeedError(null);
+      setFeedErrorCode(null);
       loadMoreLockRef.current = false;
       try {
         const page = await api.getPostsPaginated({
@@ -503,6 +509,7 @@ export default function App() {
         setNextPostsOffset(page.nextOffset);
       } catch (err: any) {
         setFeedError(err?.message || errorFallback);
+        setFeedErrorCode(err?.code || null);
       }
     },
     []
@@ -537,6 +544,7 @@ export default function App() {
     loadMoreLockRef.current = true;
     setIsLoadingMorePosts(true);
     setFeedError(null);
+    setFeedErrorCode(null);
     try {
       const page = await api.getPostsPaginated({
         limit: FEED_PAGE_SIZE,
@@ -561,19 +569,26 @@ export default function App() {
       }
     } catch (err: any) {
       setFeedError(err?.message || 'Network error while loading more posts.');
+      setFeedErrorCode(err?.code || null);
     } finally {
       loadMoreLockRef.current = false;
       setIsLoadingMorePosts(false);
     }
   }, [feedCategory, feedFilter, feedLocation, hasMorePosts, isLoadingMorePosts, nextPostsOffset]);
 
-  const handleRetryFeedPage = useCallback(() => {
-    if (posts.length === 0) {
-      fetchFirstFeedPage(feedFilter, feedCategory, feedLocation);
-    } else {
-      handleLoadMorePosts();
+  const handleRetryFeedPage = useCallback(async () => {
+    if (isRetryingFeed) return;
+    setIsRetryingFeed(true);
+    try {
+      if (posts.length === 0) {
+        await loadData(feedFilter, feedCategory, feedLocation);
+      } else {
+        await handleLoadMorePosts();
+      }
+    } finally {
+      setIsRetryingFeed(false);
     }
-  }, [feedCategory, feedFilter, feedLocation, fetchFirstFeedPage, handleLoadMorePosts, posts.length]);
+  }, [feedCategory, feedFilter, feedLocation, handleLoadMorePosts, isRetryingFeed, loadData, posts.length]);
 
   useEffect(() => {
     const disconnect = api.connectRealtime({
@@ -1820,7 +1835,9 @@ export default function App() {
                     hasMorePosts={hasMorePosts}
                     isLoading={!hasLoadedSession}
                     isLoadingMore={isLoadingMorePosts}
+                    isRetryingFeed={isRetryingFeed}
                     feedError={feedError}
+                    feedErrorCode={feedErrorCode}
                     onLoadMore={handleLoadMorePosts}
                     onRetryLoad={handleRetryFeedPage}
                   />
