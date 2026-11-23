@@ -13,4 +13,5 @@ data/logs/
 data/backups/*.enc
 data/backups/*.db
 data/schoolbackdoor.db*
-
+api/_server/app.mjs
+api/_server/schema.sql

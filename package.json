@@ -8,17 +8,20 @@
   },
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build",
+    "build": "vite build && npm run build:server",
+    "build:server": "node scripts/build-server.mjs",
+    "postinstall": "node scripts/build-server.mjs --if-exists",
     "start": "node server.ts",
     "test:backend": "tsx server/test/backend.test.ts",
     "test:load": "tsx server/test/loadTest.ts",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
+    "clean": "rm -rf dist server.js api/_server/app.mjs api/_server/schema.sql",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "@vitejs/plugin-react": "^6.1.1",
+    "esbuild": "^0.28.2",
     "express": "^4.21.2",
     "leaflet": "^1.9.4",
     "lucide-react": "^0.546.0",

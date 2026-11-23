@@ -27,6 +27,7 @@ class SSEManager {
    * Registers a client SSE connection for a user (optionally tied to a unique tab clientId)
    */
   addClient(userId: string, res: Response, options?: { clientId?: string; isAuthenticated?: boolean; userAgent?: string }) {
+    if (res.writableEnded || res.destroyed) return;
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -110,6 +111,10 @@ class SSEManager {
     const payload = `event: presence:count\ndata: ${JSON.stringify(currentSummary)}\n\n`;
     for (const [userId, connections] of this.userConnections.entries()) {
       for (const entry of connections) {
+        if (entry.res.writableEnded || entry.res.destroyed) {
+          connections.delete(entry);
+          continue;
+        }
         try {
           entry.res.write(payload);
         } catch {
@@ -136,6 +141,10 @@ class SSEManager {
     const payload = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const [userId, connections] of this.userConnections.entries()) {
       for (const entry of connections) {
+        if (entry.res.writableEnded || entry.res.destroyed) {
+          connections.delete(entry);
+          continue;
+        }
         try {
           entry.res.write(payload);
         } catch {
@@ -157,9 +166,14 @@ class SSEManager {
 
     const payload = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const entry of connections) {
+      if (entry.res.writableEnded || entry.res.destroyed) {
+        connections.delete(entry);
+        continue;
+      }
       try {
         entry.res.write(payload);
       } catch (err) {
+        connections.delete(entry);
         console.warn(`[SSE] Failed writing to user ${userId}:`, err);
       }
     }
@@ -200,6 +214,10 @@ class SSEManager {
     const heartbeatEntries: Array<{ userId: string; clientId: string }> = [];
     for (const [userId, connections] of this.userConnections.entries()) {
       for (const entry of connections) {
+        if (entry.res.writableEnded || entry.res.destroyed) {
+          connections.delete(entry);
+          continue;
+        }
         try {
           entry.res.write(': ping\n\n');
           if (entry.isAuthenticated && entry.clientId) {

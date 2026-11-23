@@ -39,7 +39,7 @@ async function runTests() {
   console.log('==============================================================\n');
 
   const { resolveApiBase, parseApiJson } = await import('../../src/api/client');
-  const { default: vercelHandler } = await import('../../api/index');
+  const { default: vercelHandler } = await import('../../api/index.js');
   const { db } = await import('../db/database');
 
   // 1. Frontend URL resolution & safe JSON parser tests
@@ -378,6 +378,79 @@ async function runTests() {
       (err: any) => err.code === 'NOT_FOUND' && err.status === 404
     );
     pass('Unmatched /api/* returns structured JSON 404 (not HTML/plaintext)');
+
+    // 3h. Realtime SSE ticket & SSE stream via Vercel rewrite
+    const unauthTicketRes = await fetch(`${base}/api/index?__sb_path=/api/realtime/ticket`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(unauthTicketRes.status, 401);
+    pass('Unauthenticated POST /api/realtime/ticket rejected with 401 JSON');
+
+    const ticketLoginRes = await fetch(`${base}/api/index?__sb_path=/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier: validEmail, password: validPassword }),
+    });
+    assert.equal(ticketLoginRes.status, 200);
+    const ticketLoginJson = await parseApiJson<any>(ticketLoginRes, 'Login for realtime test failed');
+
+    const ticketRes = await fetch(`${base}/api/index?__sb_path=/api/realtime/ticket`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${ticketLoginJson.token}`,
+      },
+      body: JSON.stringify({}),
+    });
+    assert.equal(ticketRes.status, 200);
+    const ticketJson = await parseApiJson<any>(ticketRes, 'Realtime ticket failed');
+    assert.ok(typeof ticketJson.ticket === 'string' && ticketJson.ticket.length >= 32);
+    assert.equal(ticketJson.expiresInMs, 60000);
+    pass('Authenticated POST /api/realtime/ticket issues short-lived ticket');
+
+    const ssePayload = await new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>(
+      (resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('SSE stream timed out waiting for initial frames')), 5000);
+        const sseReq = http.get(
+          `${base}/api/index?__sb_path=/api/realtime/stream&clientId=test-tab-1&ticket=${encodeURIComponent(ticketJson.ticket)}`,
+          (sseRes) => {
+            let received = '';
+            sseRes.setEncoding('utf8');
+            sseRes.on('data', (chunk: string) => {
+              received += chunk;
+              if (received.includes(': connected at ') && received.includes('event: presence:count')) {
+                clearTimeout(timeout);
+                sseReq.destroy();
+                resolve({
+                  status: sseRes.statusCode || 0,
+                  headers: sseRes.headers,
+                  body: received,
+                });
+              }
+            });
+            sseRes.on('error', (err) => {
+              clearTimeout(timeout);
+              reject(err);
+            });
+          }
+        );
+        sseReq.on('error', (err: any) => {
+          if (err?.code === 'ECONNRESET') return;
+          clearTimeout(timeout);
+          reject(err);
+        });
+      }
+    );
+    assert.equal(ssePayload.status, 200);
+    assert.ok(String(ssePayload.headers['content-type'] || '').includes('text/event-stream'));
+    assert.equal(ssePayload.headers['cache-control'], 'no-cache, no-transform');
+    assert.equal(ssePayload.headers['x-accel-buffering'], 'no');
+    assert.equal(ssePayload.headers['content-encoding'], undefined);
+    assert.ok(ssePayload.body.includes(': connected at '));
+    assert.ok(ssePayload.body.includes('event: presence:count'));
+    pass('GET /api/realtime/stream connects cleanly via SSE and emits initial presence event');
 
     // 4. Direct invocation simulating @vercel/node pre-parsed req.body
     await new Promise<void>((resolve, reject) => {

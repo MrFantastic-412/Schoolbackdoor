@@ -1,9 +1,9 @@
-import type { Request, Response } from 'express';
-import { createExpressApp, attachJsonErrorHandler, type ExpressAppBundle } from '../server/app';
+import { createExpressApp, attachJsonErrorHandler } from './_server/app.mjs';
 
-let cachedBundle: ExpressAppBundle | null = null;
+/** @type {import('./_server/app.mjs').ExpressAppBundle | null} */
+let cachedBundle = null;
 
-function getServerlessApp(): ExpressAppBundle {
+function getServerlessApp() {
   if (!cachedBundle) {
     const bundle = createExpressApp({
       isProduction: process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL),
@@ -15,7 +15,12 @@ function getServerlessApp(): ExpressAppBundle {
   return cachedBundle;
 }
 
-function normalizeRewrittenUrl(req: Request) {
+/**
+ * Restores the rewritten API/compliance route from Vercel's `__sb_path` query parameter
+ * while preserving all caller query parameters (such as SSE `ticket`, `clientId`, pagination, etc.).
+ * @param {import('express').Request} req
+ */
+function normalizeRewrittenUrl(req) {
   const rawUrl = req.url || '/';
   try {
     const parsed = new URL(rawUrl, 'http://localhost');
@@ -31,20 +36,25 @@ function normalizeRewrittenUrl(req: Request) {
   }
 }
 
-export default function handler(req: Request, res: Response) {
+/**
+ * Vercel Node 22 native ESM serverless entrypoint.
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ */
+export default function handler(req, res) {
   try {
     normalizeRewrittenUrl(req);
 
     // Vercel @vercel/node may pre-parse req.body without setting Express body-parser's _body flag
-    if (req.body !== undefined && !(req as any)._body) {
-      (req as any)._body = true;
+    if (req.body !== undefined && !req._body) {
+      req._body = true;
     }
 
     const { app, runServerlessMaintenanceTick } = getServerlessApp();
     runServerlessMaintenanceTick();
     return app(req, res);
-  } catch (err: any) {
-    if (!res.headersSent) {
+  } catch (err) {
+    if (!res.headersSent && !res.writableEnded) {
       res.status(500).setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(
         JSON.stringify({

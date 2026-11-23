@@ -4,8 +4,8 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/index.ts": {
-      "includeFiles": "server/db/schema.sql",
+    "api/index.js": {
+      "includeFiles": "{server/db/schema.sql,api/_server/**}",
       "maxDuration": 30
     }
   },
