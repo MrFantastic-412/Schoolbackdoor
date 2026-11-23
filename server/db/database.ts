@@ -1,12 +1,21 @@
 import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { SqliteConnectionPool } from './pool';
 import { hashPassword, verifyPassword } from '../utils/security';
 
-// Allow isolated database path for load testing or staging without touching production data
-const DEFAULT_DB_DIR = path.resolve(process.cwd(), 'data');
+const __dbFilename = fileURLToPath(import.meta.url);
+const __dbDirname = path.dirname(__dbFilename);
+export const IS_VERCEL_SERVERLESS = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+
+// Allow isolated database path for load testing or staging without touching production data.
+// On Vercel serverless functions, process.cwd() (/var/task) is read-only outside /tmp.
+const DEFAULT_DB_DIR = IS_VERCEL_SERVERLESS
+  ? path.join(os.tmpdir(), 'schoolbackdoor-data')
+  : path.resolve(process.cwd(), 'data');
 export const DB_FILE = process.env.SCHOOLBACKDOOR_DB_PATH
   ? path.resolve(process.env.SCHOOLBACKDOOR_DB_PATH)
   : path.join(DEFAULT_DB_DIR, 'schoolbackdoor.db');
@@ -23,7 +32,19 @@ export const CACHE_DIR = process.env.SCHOOLBACKDOOR_CACHE_DIR
 export const LOGS_DIR = process.env.SCHOOLBACKDOOR_LOGS_DIR
   ? path.resolve(process.env.SCHOOLBACKDOOR_LOGS_DIR)
   : path.join(DB_DIR, 'logs');
-const SCHEMA_FILE = path.resolve(process.cwd(), 'server', 'db', 'schema.sql');
+
+const SCHEMA_CANDIDATES = [
+  path.resolve(process.cwd(), 'server', 'db', 'schema.sql'),
+  path.resolve(__dbDirname, 'schema.sql'),
+  path.resolve(__dbDirname, '..', 'db', 'schema.sql'),
+];
+const SCHEMA_FILE = SCHEMA_CANDIDATES.find((p) => fs.existsSync(p)) || SCHEMA_CANDIDATES[0];
+
+if (IS_VERCEL_SERVERLESS && !process.env.SCHOOLBACKDOOR_DB_PATH) {
+  console.warn(
+    '[Database] Running on Vercel serverless without external persistent backend/DB path; defaulting SQLite storage to ephemeral /tmp.'
+  );
+}
 
 // Ensure data runtime folders exist cleanly
 for (const dir of [DB_DIR, BACKUP_DIR, TMP_DIR, CACHE_DIR, LOGS_DIR]) {

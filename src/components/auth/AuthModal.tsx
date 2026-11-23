@@ -254,7 +254,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       await api.verifyAccount(verifyCodeInput.trim());
       setVerifyCodeInput('');
       if (pendingProfile) {
-        onAuthSuccess({ ...pendingProfile, verified: true }, `Welcome to Schoolbackdoor, ${pendingProfile.handle}!`);
+        const finalized = { ...pendingProfile, verified: true };
+        setPendingProfile(null);
+        onAuthSuccess(finalized, `Welcome to Schoolbackdoor, ${finalized.handle}!`);
       }
       onClose();
     } catch (err: any) {
@@ -281,7 +283,18 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
   const handleSkipVerification = () => {
     if (pendingProfile) {
-      onAuthSuccess(pendingProfile, `Welcome to Schoolbackdoor, ${pendingProfile.handle}!`);
+      const finalized = pendingProfile;
+      setPendingProfile(null);
+      onAuthSuccess(finalized, `Welcome to Schoolbackdoor, ${finalized.handle}!`);
+    }
+    onClose();
+  };
+
+  const handleModalClose = () => {
+    if (mode === 'verifyEmail' && pendingProfile) {
+      const finalized = pendingProfile;
+      setPendingProfile(null);
+      onAuthSuccess(finalized, `Welcome to Schoolbackdoor, ${finalized.handle}!`);
     }
     onClose();
   };
@@ -353,7 +366,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     <>
       <GlassModal
         isOpen={isOpen}
-        onClose={onClose}
+        onClose={handleModalClose}
         maxWidthClass="max-w-md"
         title={modalTitle}
         subtitle="Schoolbackdoor · Independent Student Social Platform"

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/index.ts": {
+      "includeFiles": "server/db/schema.sql",
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index?__sb_path=/api/$1"
+    },
+    {
+      "source": "/privacy",
+      "destination": "/api/index?__sb_path=/privacy"
+    },
+    {
+      "source": "/terms",
+      "destination": "/api/index?__sb_path=/terms"
+    },
+    {
+      "source": "/support",
+      "destination": "/api/index?__sb_path=/support"
+    },
+    {
+      "source": "/account-deletion",
+      "destination": "/api/index?__sb_path=/account-deletion"
+    },
+    {
+      "source": "/robots.txt",
+      "destination": "/api/index?__sb_path=/robots.txt"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
