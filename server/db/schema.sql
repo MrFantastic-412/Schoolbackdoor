@@ -9,7 +9,9 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   matric_number TEXT UNIQUE NOT NULL,
-  email TEXT UNIQUE NOT NULL,
+  email TEXT,
+  phone_number TEXT,
+  username TEXT,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'student' CHECK(role IN ('student', 'staff', 'admin', 'moderator')),
   status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'pending_verification')),
@@ -20,12 +22,16 @@ CREATE TABLE IF NOT EXISTS users (
   accepted_terms_at DATETIME,
   accepted_terms_version TEXT,
   last_reauthenticated_at DATETIME,
+  recovery_codes_generated_at DATETIME,
+  recovery_codes_remaining INTEGER NOT NULL DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_matric ON users(matric_number);
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users(LOWER(email)) WHERE email IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username)) WHERE username IS NOT NULL;
 
 -- 2. User Profiles table
 CREATE TABLE IF NOT EXISTS user_profiles (
@@ -450,6 +456,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   revoked_at DATETIME,
   revoked_reason TEXT,
   is_suspicious INTEGER NOT NULL DEFAULT 0,
+  auth_method TEXT NOT NULL DEFAULT 'password',
   expires_at DATETIME NOT NULL,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -460,6 +467,97 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_id ON sessions(id);
 CREATE INDEX IF NOT EXISTS idx_sessions_refresh_hash ON sessions(refresh_token_hash);
 CREATE INDEX IF NOT EXISTS idx_sessions_active_lookup ON sessions(user_id, revoked_at, expires_at);
+
+-- 17b. Single-Use Hashed Recovery Codes (Stage 3B)
+CREATE TABLE IF NOT EXISTS recovery_codes (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  code_salt TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  used_at DATETIME,
+  invalidated_at DATETIME,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_codes_active ON recovery_codes(user_id, used_at, invalidated_at);
+CREATE INDEX IF NOT EXISTS idx_recovery_codes_hash ON recovery_codes(code_hash);
+
+-- 17c. Shared Account Lockouts (Temporary cooldowns, anti-victim-DoS)
+CREATE TABLE IF NOT EXISTS account_lockouts (
+  account_key TEXT PRIMARY KEY,
+  user_id TEXT,
+  failed_count INTEGER NOT NULL DEFAULT 0,
+  first_failed_at DATETIME,
+  last_failed_at DATETIME,
+  locked_until DATETIME,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_lockouts_user ON account_lockouts(user_id);
+
+-- 17d. Privacy-Preserving Proof-of-Work Bot Challenges (Zero personal data)
+CREATE TABLE IF NOT EXISTS bot_challenges (
+  id TEXT PRIMARY KEY,
+  purpose TEXT NOT NULL DEFAULT 'register',
+  nonce TEXT UNIQUE NOT NULL,
+  difficulty INTEGER NOT NULL DEFAULT 14,
+  ip_address TEXT,
+  expires_at DATETIME NOT NULL,
+  used_at DATETIME,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_challenges_expires ON bot_challenges(expires_at);
+
+-- 17e. Passkeys / WebAuthn Credentials & Challenges (Prepared for Stage 3C)
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  credential_id TEXT UNIQUE NOT NULL,
+  public_key TEXT NOT NULL,
+  counter INTEGER NOT NULL DEFAULT 0,
+  transports_json TEXT,
+  device_type TEXT,
+  backed_up INTEGER NOT NULL DEFAULT 0,
+  aaguid TEXT,
+  label TEXT NOT NULL DEFAULT 'Passkey',
+  last_used_at DATETIME,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_webauthn_creds_user ON webauthn_credentials(user_id);
+
+CREATE TABLE IF NOT EXISTS webauthn_challenges (
+  id TEXT PRIMARY KEY,
+  user_id TEXT,
+  challenge TEXT UNIQUE NOT NULL,
+  ceremony_type TEXT NOT NULL CHECK(ceremony_type IN ('registration', 'authentication')),
+  purpose TEXT NOT NULL DEFAULT 'login',
+  rp_id TEXT NOT NULL,
+  expires_at DATETIME NOT NULL,
+  used_at DATETIME,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_expires ON webauthn_challenges(expires_at);
+CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_purpose ON webauthn_challenges(challenge, ceremony_type, purpose);
+
+CREATE TABLE IF NOT EXISTS passkey_recovery_tokens (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  token_hash TEXT UNIQUE NOT NULL,
+  credential_id TEXT NOT NULL,
+  expires_at DATETIME NOT NULL,
+  used_at DATETIME,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_passkey_recovery_expires ON passkey_recovery_tokens(expires_at);
 
 -- 18. User Blocks (Restricted direct communications)
 CREATE TABLE IF NOT EXISTS user_blocks (
@@ -475,7 +573,7 @@ CREATE TABLE IF NOT EXISTS user_blocks (
 CREATE INDEX IF NOT EXISTS idx_blocks_blocker ON user_blocks(blocker_id);
 CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON user_blocks(blocked_id);
 
--- 19. Login Attempts (Rate Limiting)
+-- 19. Login Attempts (Shared DB Rate Limiting)
 CREATE TABLE IF NOT EXISTS login_attempts (
   id TEXT PRIMARY KEY,
   identifier TEXT NOT NULL,
@@ -485,19 +583,50 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_login_attempts_lookup ON login_attempts(identifier, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_lookup ON login_attempts(ip_address, attempted_at);
 
--- 20. Password Reset Tokens
+-- 19b. Email Verification Tokens (SHA-256 hashed, single-use, expiring)
+CREATE TABLE IF NOT EXISTS email_verifications (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  email TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  token_hash TEXT UNIQUE NOT NULL,
+  expires_at DATETIME NOT NULL,
+  used_at DATETIME,
+  failed_attempts INTEGER NOT NULL DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_verif_user ON email_verifications(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_email_verif_token ON email_verifications(token_hash);
+CREATE INDEX IF NOT EXISTS idx_email_verif_code ON email_verifications(user_id, code_hash);
+
+-- 19c. Registration Idempotency Keys (Double-submit & duplicate protection)
+CREATE TABLE IF NOT EXISTS registration_idempotency (
+  idempotency_key TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  expires_at DATETIME NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- 20. Password Reset Tokens (SHA-256 hashed, single-use, expiring)
 CREATE TABLE IF NOT EXISTS password_resets (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
   reset_code TEXT NOT NULL,
+  reset_code_hash TEXT,
   expires_at DATETIME NOT NULL,
   is_used INTEGER NOT NULL DEFAULT 0,
+  failed_attempts INTEGER NOT NULL DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_password_resets_code ON password_resets(reset_code, is_used);
+CREATE INDEX IF NOT EXISTS idx_password_resets_hash ON password_resets(reset_code_hash, is_used);
 
 -- 21. Campus & Off-Campus Landmarks (Free OpenStreetMap / Leaflet compatible)
 CREATE TABLE IF NOT EXISTS landmarks (

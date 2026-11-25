@@ -1,8 +1,8 @@
 import crypto from 'node:crypto';
-import { db, runInTransaction, withReadConnection } from '../db/database';
-import { cache } from '../utils/cache';
-import { escapeLikePattern, sanitizeInputText, validateLocationInput } from '../utils/security';
-import { CampusAreaKey, inferPostLocation } from './locationTaxonomy';
+import { db, runInTransaction, withReadConnection } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { escapeLikePattern, sanitizeInputText, validateLocationInput } from '../utils/security.js';
+import { CampusAreaKey, inferPostLocation } from './locationTaxonomy.js';
 
 export type SavedLocationSource = 'search' | 'map' | 'landmark' | 'post' | 'chat' | 'manual';
 export type SavedLocationCategory =

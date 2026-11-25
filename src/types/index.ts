@@ -369,14 +369,31 @@ export interface BlockedUser {
 export interface AuthUser {
   id: string;
   matric_number: string;
-  email: string;
+  email?: string | null;
   phone_number?: string;
   username: string;
   role: string;
   status: string;
   is_verified: boolean;
+  recoveryCodesRemaining?: number;
   restricted_until?: string | null;
   restriction_reason?: string | null;
+}
+
+export interface RecoveryCodeStatus {
+  remainingCount: number;
+  totalCount: number;
+  generatedAt: string | null;
+}
+
+export interface PasskeySummary {
+  id: string;
+  label: string;
+  deviceType: string;
+  backedUp: boolean;
+  transports: string[];
+  createdAt: string;
+  lastUsedAt: string | null;
 }
 
 export interface BackgroundJobRecord {
@@ -496,7 +513,7 @@ export interface StaffMember {
   id: string;
   name: string;
   handle: string;
-  email: string;
+  email?: string | null;
   matricNumber: string;
   department: string;
   role: 'admin' | 'moderator' | 'staff' | 'student';
@@ -568,7 +585,7 @@ export interface PlatformConfig {
 export interface AdminUserRecord {
   id: string;
   matricNumber: string;
-  email: string;
+  email?: string | null;
   phoneNumber: string;
   role: 'admin' | 'moderator' | 'staff' | 'student';
   status: 'active' | 'suspended';
@@ -793,7 +810,7 @@ export interface ModeratorAccount {
   id: string;
   name: string;
   handle: string;
-  email: string;
+  email?: string | null;
   matricNumber: string;
   department: string;
   campus: string;

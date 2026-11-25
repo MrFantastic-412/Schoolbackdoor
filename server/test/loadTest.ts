@@ -212,12 +212,12 @@ function openSseStream(
 
 async function runLoadTest() {
   const express = (await import('express')).default;
-  const { initDatabase, db, runInTransaction, checkpointDatabase } = await import('../db/database');
-  const { seedInitialData } = await import('../db/seed');
-  const { apiRouter } = await import('../routes/api');
-  const { adminSecurityService } = await import('../services/adminSecurityService');
-  const { sseManager } = await import('../realtime/sseManager');
-  const { cache } = await import('../utils/cache');
+  const { initDatabase, db, runInTransaction, checkpointDatabase } = await import('../db/database.js');
+  const { seedInitialData } = await import('../db/seed.js');
+  const { apiRouter } = await import('../routes/api.js');
+  const { adminSecurityService } = await import('../services/adminSecurityService.js');
+  const { sseManager } = await import('../realtime/sseManager.js');
+  const { cache } = await import('../utils/cache.js');
 
   console.log('\n==============================================================');
   console.log('🚀 SCHOOLBACKDOOR STAGE 9 ISOLATED LOAD TEST (100 / 500 / 1000)');

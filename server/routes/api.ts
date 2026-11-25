@@ -10,35 +10,36 @@ import {
   requireNotRestricted,
   requireRole,
   requireTermsAccepted,
-} from '../middleware/auth';
-import { AuthRateLimitError, authService } from '../services/authService';
-import { SESSION_POLICY } from '../utils/security';
-import { blockService } from '../services/blockService';
-import { userService } from '../services/userService';
-import { postService } from '../services/postService';
-import { commentReactionService } from '../services/commentReactionService';
-import { chatService } from '../services/chatService';
-import { communityService } from '../services/communityService';
-import { notificationService } from '../services/notificationService';
-import { mentionService } from '../services/mentionService';
-import { fileService, PROTECTION_MODE_MAX_UPLOAD_BYTES } from '../services/fileService';
-import { adminReportService } from '../services/adminReportService';
-import { adminSecurityService } from '../services/adminSecurityService';
-import { adminControlService } from '../services/adminControlService';
-import { ForbiddenModeratorActionError, moderatorService } from '../services/moderatorService';
-import { adminAnalyticsService, AnalyticsRange } from '../services/adminAnalyticsService';
-import { adminAdsPaymentsService } from '../services/adminAdsPaymentsService';
-import { landmarkService } from '../services/landmarkService';
-import { savedLocationService } from '../services/savedLocationService';
-import { presenceService } from '../services/presenceService';
-import { deletionService } from '../services/deletionService';
-import { sseManager } from '../realtime/sseManager';
-import { db, withReadConnection, getPoolStats } from '../db/database';
-import { cache } from '../utils/cache';
-import type { FeedFilter } from '../services/postService';
-import { feedRankingService, normalizeFeedCategory } from '../services/feedRankingService';
-import { CAMPUS_AREAS, isValidLocationFilter } from '../services/locationTaxonomy';
-import type { LocationFilterKey } from '../services/locationTaxonomy';
+} from '../middleware/auth.js';
+import { AuthRateLimitError, authService } from '../services/authService.js';
+import { passkeyService } from '../services/passkeyService.js';
+import { SESSION_POLICY } from '../utils/security.js';
+import { blockService } from '../services/blockService.js';
+import { userService } from '../services/userService.js';
+import { postService } from '../services/postService.js';
+import { commentReactionService } from '../services/commentReactionService.js';
+import { chatService } from '../services/chatService.js';
+import { communityService } from '../services/communityService.js';
+import { notificationService } from '../services/notificationService.js';
+import { mentionService } from '../services/mentionService.js';
+import { fileService, PROTECTION_MODE_MAX_UPLOAD_BYTES } from '../services/fileService.js';
+import { adminReportService } from '../services/adminReportService.js';
+import { adminSecurityService } from '../services/adminSecurityService.js';
+import { adminControlService } from '../services/adminControlService.js';
+import { ForbiddenModeratorActionError, moderatorService } from '../services/moderatorService.js';
+import { adminAnalyticsService, AnalyticsRange } from '../services/adminAnalyticsService.js';
+import { adminAdsPaymentsService } from '../services/adminAdsPaymentsService.js';
+import { landmarkService } from '../services/landmarkService.js';
+import { savedLocationService } from '../services/savedLocationService.js';
+import { presenceService } from '../services/presenceService.js';
+import { deletionService } from '../services/deletionService.js';
+import { sseManager } from '../realtime/sseManager.js';
+import { db, withReadConnection, getPoolStats } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import type { FeedFilter } from '../services/postService.js';
+import { feedRankingService, normalizeFeedCategory } from '../services/feedRankingService.js';
+import { CAMPUS_AREAS, isValidLocationFilter } from '../services/locationTaxonomy.js';
+import type { LocationFilterKey } from '../services/locationTaxonomy.js';
 
 export const apiRouter = Router();
 
@@ -71,6 +72,59 @@ apiRouter.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
+const IS_SERVERLESS_RUNTIME = Boolean(
+  process.env.VERCEL ||
+    process.env.VERCEL_ENV ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.NETLIFY
+);
+
+const REALTIME_TICKET_SECRET =
+  process.env.REALTIME_TICKET_SECRET ||
+  process.env.SESSION_SECRET ||
+  crypto
+    .createHmac('sha256', 'schoolbackdoor-realtime-ticket-v1')
+    .update(process.env.ADMIN_PASSWORD || process.env.SCHOOLBACKDOOR_DB_PATH || process.cwd())
+    .digest('hex');
+
+function signRealtimeTicket(userId: string, ttlMs = 60_000): string {
+  const payload = Buffer.from(
+    JSON.stringify({
+      uid: userId,
+      exp: Date.now() + ttlMs,
+      jti: crypto.randomBytes(12).toString('hex'),
+    }),
+    'utf8'
+  ).toString('base64url');
+  const sig = crypto.createHmac('sha256', REALTIME_TICKET_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifySignedRealtimeTicket(token: string): string | null {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 2) return null;
+  const [payloadB64, sigB64] = parts;
+  if (!payloadB64 || !sigB64) return null;
+  const expectedSig = crypto.createHmac('sha256', REALTIME_TICKET_SECRET).update(payloadB64).digest('base64url');
+  const sigBuf = Buffer.from(sigB64, 'utf8');
+  const expectedBuf = Buffer.from(expectedSig, 'utf8');
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as {
+      uid?: string;
+      exp?: number;
+    };
+    if (!parsed?.uid || typeof parsed.exp !== 'number' || Date.now() > parsed.exp) {
+      return null;
+    }
+    return parsed.uid;
+  } catch {
+    return null;
+  }
+}
+
 // --- System & Diagnostics ---
 apiRouter.get('/health', (_req: Request, res: Response) => {
   const clusterWorkers = Math.max(1, Number(process.env.CLUSTER_WORKERS) || 1);
@@ -81,6 +135,11 @@ apiRouter.get('/health', (_req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     dbPool: getPoolStats(),
     cache: cache.getStats(),
+    realtime: {
+      mode: IS_SERVERLESS_RUNTIME ? 'polling' : 'sse',
+      sseSupported: !IS_SERVERLESS_RUNTIME,
+      pollIntervalMs: 4000,
+    },
     scaling: {
       clusterWorkers,
       mode: clusterWorkers > 1 ? 'multi-worker' : 'single-process',
@@ -167,6 +226,20 @@ function sendApiMediaError(res: Response, err: any, fallbackStatus = 400) {
 }
 
 // --- Authentication & Account Lifecycle ---
+apiRouter.get('/auth/challenge', (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    res.json(authService.issueRegistrationChallenge(ip));
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 3600));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 3600 });
+      return;
+    }
+    res.status(400).json({ error: err?.message || 'Unable to issue signup challenge.' });
+  }
+});
+
 apiRouter.post('/auth/register', (req: Request, res: Response) => {
   try {
     if (req.body?.acceptTerms !== true) {
@@ -177,10 +250,21 @@ apiRouter.post('/auth/register', (req: Request, res: Response) => {
       return;
     }
     const ip = req.ip || req.socket.remoteAddress;
+    const idempotencyKey =
+      (typeof req.body?.idempotencyKey === 'string' && req.body.idempotencyKey.trim()) ||
+      (typeof req.headers['idempotency-key'] === 'string' && req.headers['idempotency-key'].trim()) ||
+      undefined;
+
     const result = authService.register(
-      { ...req.body, userAgent: req.headers['user-agent'] },
+      {
+        ...req.body,
+        idempotencyKey,
+        userAgent: req.headers['user-agent'],
+        requireBotChallenge: true,
+      },
       ip
     );
+
     if (result.token) {
       setSessionCookie(req, res, result.token, result.refreshToken);
     }
@@ -188,6 +272,7 @@ apiRouter.post('/auth/register', (req: Request, res: Response) => {
     res.status(201).json({
       ...safeResult,
       user: sanitizeAuthUserPayload(result.user),
+      message: 'Account created! Save your 10 single-use recovery codes somewhere safe — they are shown only once.',
     });
   } catch (err: any) {
     if (err instanceof AuthRateLimitError || err?.status === 429) {
@@ -199,12 +284,13 @@ apiRouter.post('/auth/register', (req: Request, res: Response) => {
   }
 });
 
-apiRouter.post('/auth/login', (req: Request, res: Response) => {
+apiRouter.post('/auth/login', async (req: Request, res: Response) => {
   try {
-    const { identifier, password, mfaCode } = req.body;
+    const { username, identifier, password, mfaCode } = req.body || {};
+    const loginHandle = typeof username === 'string' && username.trim() ? username : identifier;
     const ip = req.ip || req.socket.remoteAddress;
     const userAgent = req.headers['user-agent'];
-    const result = authService.login(identifier, password, ip, userAgent, mfaCode);
+    const result = authService.login(loginHandle, password, ip, userAgent, mfaCode);
     const profile = userService.getProfileByUserId(result.user.id, result.user.id, result.user.role);
     if (result.token) {
       setSessionCookie(req, res, result.token, result.refreshToken);
@@ -220,6 +306,9 @@ apiRouter.post('/auth/login', (req: Request, res: Response) => {
       res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
       res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
       return;
+    }
+    if (typeof err?.progressiveDelayMs === 'number' && err.progressiveDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(err.progressiveDelayMs, 5000)));
     }
     const statusCode = typeof err?.message === 'string' && err.message.startsWith('MFA_REQUIRED:') ? 403 : 401;
     res.status(statusCode).json({ error: err.message, mfaRequired: statusCode === 403 });
@@ -293,7 +382,7 @@ apiRouter.get('/auth/mfa/status', requireRole('admin', 'moderator'), (req: Reque
 });
 
 apiRouter.post('/auth/mfa/setup', requireRole('admin', 'moderator'), (req: Request, res: Response) => {
-  res.json(authService.initiateMfaSetup(req.user!.id, req.user!.email));
+  res.json(authService.initiateMfaSetup(req.user!.id, req.user!.username || req.user!.matric_number));
 });
 
 apiRouter.post('/auth/mfa/verify', requireRole('admin', 'moderator'), (req: Request, res: Response) => {
@@ -324,13 +413,14 @@ apiRouter.post('/auth/mfa/disable', requireRole('admin', 'moderator'), (req: Req
 
 apiRouter.post('/auth/logout', (req: Request, res: Response) => {
   const token = extractSessionToken(req);
+  const ip = req.ip || req.socket.remoteAddress;
   const clientId = typeof req.body?.clientId === 'string' ? req.body.clientId : undefined;
   if (req.user?.id) {
     const summary = presenceService.removeClientPresence(req.user.id, clientId);
     sseManager.broadcastPresenceUpdate(summary);
   }
   if (token) {
-    authService.logout(token);
+    authService.logout(token, ip);
   }
   clearSessionCookie(req, res);
   res.json({ success: true, message: 'Signed out successfully.' });
@@ -376,65 +466,271 @@ apiRouter.post('/presence/offline', requireAuth, (req: Request, res: Response) =
   }
 });
 
-apiRouter.post('/auth/verify', requireAuth, (req: Request, res: Response) => {
-  try {
-    const { code } = req.body;
-    const ip = req.ip || req.socket.remoteAddress;
-    const result = authService.verifyAccount(req.user!.id, code, ip);
-    res.json(result);
-  } catch (err: any) {
-    const isRateLimited = String(err?.message || '').includes('Too many');
-    if (isRateLimited) {
-      res.setHeader('Retry-After', '900');
-    }
-    res.status(isRateLimited ? 429 : 400).json({ error: err.message });
-  }
-});
-
-apiRouter.post('/auth/verify/resend', requireAuth, (req: Request, res: Response) => {
+// --- Recovery Codes & Password Recovery (Method A) ---
+apiRouter.post('/auth/recovery/reset', (req: Request, res: Response) => {
   try {
     const ip = req.ip || req.socket.remoteAddress;
-    const result = authService.resendVerificationCode(req.user!.id, ip);
-    const { verification_code: _vc, ...safeResult } = result as Record<string, any>;
-    res.json(safeResult);
-  } catch (err: any) {
-    const isRateLimited = String(err?.message || '').includes('Too many');
-    if (isRateLimited) {
-      res.setHeader('Retry-After', '3600');
-    }
-    res.status(isRateLimited ? 429 : 400).json({ error: err.message });
-  }
-});
-
-apiRouter.post('/auth/forgot-password', (req: Request, res: Response) => {
-  try {
-    const { identifier } = req.body;
-    const ip = req.ip || req.socket.remoteAddress;
-    const result = authService.requestPasswordReset(identifier, ip);
-    const { resetCode: _rc, ...safeResult } = result as Record<string, any>;
-    res.json(safeResult);
-  } catch (err: any) {
-    const isRateLimited = String(err?.message || '').includes('Too many');
-    if (isRateLimited) {
-      res.setHeader('Retry-After', '3600');
-    }
-    res.status(isRateLimited ? 429 : 400).json({ error: err.message });
-  }
-});
-
-apiRouter.post('/auth/reset-password', (req: Request, res: Response) => {
-  try {
-    const { resetCode, newPassword, identifier } = req.body;
-    const ip = req.ip || req.socket.remoteAddress;
-    const result = authService.resetPasswordWithCode(resetCode, newPassword, ip, identifier);
+    const { username, recoveryCode, newPassword, confirmPassword } = req.body || {};
+    const result = authService.resetPasswordWithRecoveryCode({
+      username,
+      recoveryCode,
+      newPassword,
+      confirmPassword,
+      ipAddress: ip,
+      userAgent: req.headers['user-agent'],
+    });
     clearSessionCookie(req, res);
     res.json(result);
   } catch (err: any) {
-    const isRateLimited = err instanceof AuthRateLimitError || err?.status === 429 || String(err?.message || '').includes('Too many');
-    if (isRateLimited) {
-      res.setHeader('Retry-After', String(err?.retryAfterSeconds || 900));
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
     }
-    res.status(isRateLimited ? 429 : 400).json({ error: err.message });
+    res.status(400).json({ error: err?.message || 'Unable to reset password.' });
+  }
+});
+
+apiRouter.get('/auth/recovery-codes/status', requireAuth, (req: Request, res: Response) => {
+  res.json(authService.getRecoveryCodeStatus(req.user!.id));
+});
+
+apiRouter.post('/auth/recovery-codes/regenerate', requireAuth, (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const result = authService.regenerateRecoveryCodes(
+      req.user!.id,
+      req.body?.currentPassword || '',
+      ip,
+      req.headers['user-agent']
+    );
+    res.json(result);
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(400).json({ error: err?.message || 'Unable to regenerate recovery codes.' });
+  }
+});
+
+// --- Passkeys / WebAuthn (Stage 3C) ---
+apiRouter.get('/auth/passkeys', requireAuth, (req: Request, res: Response) => {
+  res.json({ passkeys: passkeyService.listPasskeys(req.user!.id) });
+});
+
+apiRouter.post('/auth/passkeys/register/options', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const options = await passkeyService.createRegistrationOptions(
+      req.user!.id,
+      ip,
+      req.headers['user-agent']
+    );
+    res.json(options);
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(err?.status || 400).json({ error: err?.message || 'Unable to start passkey setup.' });
+  }
+});
+
+apiRouter.post('/auth/passkeys/register/verify', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const result = await passkeyService.verifyRegistration(
+      req.user!.id,
+      req.body?.response,
+      req.body?.label,
+      ip,
+      req.headers['user-agent']
+    );
+    res.status(201).json(result);
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(err?.status || 400).json({ error: err?.message || 'Passkey verification failed.' });
+  }
+});
+
+apiRouter.delete('/auth/passkeys/:id', requireAuth, (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const result = passkeyService.removePasskey(req.user!.id, req.params.id, {
+      currentPassword: req.body?.currentPassword ?? req.body?.password,
+      hasRecentReauth: hasRecentReauth(req.user),
+      ipAddress: ip,
+      userAgent: req.headers['user-agent'],
+    });
+    res.json(result);
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(err?.status || 400).json({
+      error: err?.message || 'Unable to remove passkey.',
+      ...(err?.code ? { code: err.code } : {}),
+    });
+  }
+});
+
+apiRouter.post('/auth/passkeys/reauth/options', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const options = await passkeyService.createAuthenticationOptions({
+      purpose: 'reauth',
+      userId: req.user!.id,
+      ipAddress: ip,
+    });
+    res.json(options);
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(err?.status || 400).json({ error: err?.message || 'Unable to initialize passkey verification.' });
+  }
+});
+
+apiRouter.post('/auth/passkeys/reauth/verify', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const result = await passkeyService.verifyReauth(
+      req.user!.id,
+      req.body?.response,
+      ip,
+      req.headers['user-agent']
+    );
+    res.json(result);
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(err?.status || 401).json({ error: err?.message || 'Passkey verification failed.' });
+  }
+});
+
+apiRouter.post('/auth/passkeys/login/options', async (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const options = await passkeyService.createAuthenticationOptions({
+      purpose: 'login',
+      username: typeof req.body?.username === 'string' ? req.body.username : undefined,
+      ipAddress: ip,
+    });
+    res.json(options);
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(err?.status || 400).json({ error: err?.message || 'Unable to initialize passkey sign-in.' });
+  }
+});
+
+apiRouter.post('/auth/passkeys/login/verify', async (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'];
+    const result = await passkeyService.verifyLogin(req.body?.response, ip, userAgent);
+    const profile = userService.getProfileByUserId(result.user.id, result.user.id, result.user.role);
+    if (result.token) {
+      setSessionCookie(req, res, result.token, result.refreshToken);
+    }
+    const { refreshToken: _rt, ...safeResult } = result as Record<string, any>;
+    res.json({
+      ...safeResult,
+      user: sanitizeAuthUserPayload(result.user),
+      profile,
+    });
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(err?.status || 401).json({ error: err?.message || 'Passkey sign-in failed.' });
+  }
+});
+
+apiRouter.post('/auth/passkeys/recovery/options', async (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const options = await passkeyService.createAuthenticationOptions({
+      purpose: 'recovery',
+      username: typeof req.body?.username === 'string' ? req.body.username : undefined,
+      ipAddress: ip,
+    });
+    res.json(options);
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(err?.status || 400).json({ error: err?.message || 'Unable to start passkey recovery.' });
+  }
+});
+
+apiRouter.post('/auth/passkeys/recovery/verify', async (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const result = await passkeyService.verifyRecoveryAssertion(
+      req.body?.response,
+      ip,
+      req.headers['user-agent']
+    );
+    res.json(result);
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(err?.status || 401).json({ error: err?.message || 'Passkey verification failed.' });
+  }
+});
+
+apiRouter.post('/auth/passkeys/recovery/reset', (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const result = passkeyService.resetPasswordWithPasskeyRecovery({
+      recoveryToken: req.body?.recoveryToken,
+      newPassword: req.body?.newPassword,
+      confirmPassword: req.body?.confirmPassword,
+      ipAddress: ip,
+      userAgent: req.headers['user-agent'],
+    });
+    const profile = userService.getProfileByUserId(result.user.id, result.user.id, result.user.role);
+    if (result.token) {
+      setSessionCookie(req, res, result.token, result.refreshToken);
+    }
+    const { refreshToken: _rt, ...safeResult } = result as Record<string, any>;
+    res.json({
+      ...safeResult,
+      user: sanitizeAuthUserPayload(result.user),
+      profile,
+    });
+  } catch (err: any) {
+    if (err instanceof AuthRateLimitError || err?.status === 429) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds || 900));
+      res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
+      return;
+    }
+    res.status(err?.status || 400).json({ error: err?.message || 'Unable to reset password via passkey.' });
   }
 });
 
@@ -462,13 +758,20 @@ apiRouter.post('/me/accept-terms', requireAuth, (req: Request, res: Response) =>
 apiRouter.get('/me/sessions', requireAuth, (req: Request, res: Response) => {
   res.json({
     maxActiveDevices: SESSION_POLICY.maxActiveDevices,
+    accessTtlMinutes: SESSION_POLICY.accessTtlMinutes,
+    refreshTtlDays: SESSION_POLICY.refreshInactivityDays,
+    maxLifetimeDays: SESSION_POLICY.sessionMaxLifetimeDays,
     sessions: authService.getUserSessions(req.user!.id, req.sessionTokenHash),
   });
 });
 
 apiRouter.delete('/me/sessions/:id', requireAuth, (req: Request, res: Response) => {
   try {
-    res.json(authService.revokeUserSession(req.user!.id, req.params.id));
+    const result = authService.revokeUserSession(req.user!.id, req.params.id, req.sessionTokenHash);
+    if (result.revokedSelf) {
+      clearSessionCookie(req, res);
+    }
+    res.json(result);
   } catch (err: any) {
     res.status(404).json({ error: err?.message || 'Device session not found.' });
   }
@@ -476,6 +779,13 @@ apiRouter.delete('/me/sessions/:id', requireAuth, (req: Request, res: Response) 
 
 apiRouter.post('/me/sessions/revoke-others', requireAuth, (req: Request, res: Response) => {
   res.json(authService.revokeOtherUserSessions(req.user!.id, req.sessionTokenHash));
+});
+
+apiRouter.post('/me/sessions/revoke-all', requireAuth, (req: Request, res: Response) => {
+  const ip = req.ip || req.socket.remoteAddress;
+  const result = authService.revokeAllUserSessions(req.user!.id, ip);
+  clearSessionCookie(req, res);
+  res.json({ ...result, signedOutEverywhere: true });
 });
 
 apiRouter.put('/me/profile', requireAuth, (req: Request, res: Response) => {
@@ -930,20 +1240,25 @@ apiRouter.delete('/comments/:id', requireAuth, (req: Request, res: Response) => 
   }
 });
 
-// --- Real-time SSE Stream (with short-lived one-time SSE tickets) ---
+// --- Real-time SSE Stream (with stateless HMAC-signed tickets + serverless polling fallback) ---
 apiRouter.post('/realtime/ticket', requireAuth, (req: Request, res: Response) => {
   if (!req.isAuthenticatedUser || !req.user) {
     res.status(401).json({ error: 'Authenticated session required for SSE ticket.' });
     return;
   }
-  const ticket = crypto.randomBytes(24).toString('hex');
+  const ticket = signRealtimeTicket(req.user.id, 60_000);
   cache.set(`sse:ticket:${ticket}`, req.user, 60_000);
-  res.json({ ticket, expiresInMs: 60_000 });
+  res.json({
+    ticket,
+    expiresInMs: 60_000,
+    mode: IS_SERVERLESS_RUNTIME ? 'polling' : 'sse',
+    pollIntervalMs: 4000,
+  });
 });
 
 apiRouter.get('/realtime/stream', (req: Request, res: Response) => {
   res.setHeader('Referrer-Policy', 'no-referrer');
-  let user = req.user;
+  let user: any = req.user;
   let isExplicitAuth = Boolean(req.isAuthenticatedUser);
   if (req.query.ticket && typeof req.query.ticket === 'string') {
     const ticketKey = `sse:ticket:${req.query.ticket}`;
@@ -952,6 +1267,17 @@ apiRouter.get('/realtime/stream', (req: Request, res: Response) => {
       cache.invalidate(ticketKey);
       user = ticketUser;
       isExplicitAuth = true;
+    } else {
+      const verifiedUserId = verifySignedRealtimeTicket(req.query.ticket);
+      if (verifiedUserId) {
+        const dbUser = db
+          .prepare('SELECT id, matric_number, email, role, status FROM users WHERE id = ?')
+          .get(verifiedUserId) as any;
+        if (dbUser && dbUser.status === 'active') {
+          user = dbUser;
+          isExplicitAuth = true;
+        }
+      }
     }
   } else if (req.query.token && typeof req.query.token === 'string') {
     const tokenUser = authService.validateSession(req.query.token);
@@ -963,11 +1289,79 @@ apiRouter.get('/realtime/stream', (req: Request, res: Response) => {
   // Security: Unauthenticated SSE connections subscribe only to anonymous public channel, never a private student's feed/messages
   const userId = isExplicitAuth && user?.id ? user.id : '__anon__';
   const clientId = typeof req.query.clientId === 'string' ? req.query.clientId.trim() : undefined;
+
+  if (IS_SERVERLESS_RUNTIME) {
+    // On serverless hosts, avoid holding open HTTP sockets until function timeout; send initial state and instruct client to poll
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('X-Accel-Buffering', 'no');
+    if (isExplicitAuth && user?.id && clientId) {
+      try {
+        presenceService.recordHeartbeat(user.id, clientId, req.headers['user-agent']);
+      } catch {
+        // non-fatal
+      }
+    }
+    const summary = presenceService.getOnlineSummary();
+    res.write(`event: presence:count\ndata: ${JSON.stringify(summary)}\n\n`);
+    res.write(
+      `event: realtime:fallback\ndata: ${JSON.stringify({ mode: 'polling', pollIntervalMs: 4000 })}\n\n`
+    );
+    res.end();
+    return;
+  }
+
   sseManager.addClient(userId, res, {
     clientId,
     isAuthenticated: isExplicitAuth,
     userAgent: req.headers['user-agent'],
   });
+});
+
+apiRouter.get('/realtime/poll', (req: Request, res: Response) => {
+  try {
+    const clientId = typeof req.query.clientId === 'string' ? req.query.clientId.trim().slice(0, 128) : undefined;
+    const isAuth = Boolean(req.isAuthenticatedUser && req.user?.id);
+    if (isAuth && req.user && clientId) {
+      try {
+        presenceService.recordHeartbeat(req.user.id, clientId, req.headers['user-agent']);
+      } catch {
+        // non-fatal
+      }
+    }
+
+    const presence = presenceService.getOnlineSummary();
+    const config = adminControlService.getPublicPlatformConfig();
+
+    if (!isAuth || !req.user) {
+      res.json({
+        serverTime: new Date().toISOString(),
+        mode: IS_SERVERLESS_RUNTIME ? 'polling' : 'sse',
+        presence,
+        config,
+      });
+      return;
+    }
+
+    const notifications = notificationService.getUserNotifications(req.user.id, false, 20, 0);
+    const chats = chatService.getUserChats(req.user.id);
+    const adminReports =
+      req.user.role === 'admin' || req.user.role === 'moderator'
+        ? adminReportService.getAllReports('pending').slice(0, 10)
+        : undefined;
+
+    res.json({
+      serverTime: new Date().toISOString(),
+      mode: IS_SERVERLESS_RUNTIME ? 'polling' : 'sse',
+      presence,
+      config,
+      notifications,
+      chats,
+      ...(adminReports ? { adminReports } : {}),
+    });
+  } catch {
+    res.status(500).json({ error: 'Realtime poll failed.' });
+  }
 });
 
 // --- Chats & Messenger ---
@@ -1937,7 +2331,7 @@ apiRouter.get('/admin/security', requireRole('admin'), (req: Request, res: Respo
 });
 
 apiRouter.post('/admin/security/mfa/setup', requireRole('admin'), (req: Request, res: Response) => {
-  res.json(adminControlService.initiateAdminMfaSetup(req.user!.id, req.user!.email));
+  res.json(adminControlService.initiateAdminMfaSetup(req.user!.id, req.user!.username || req.user!.matric_number || '@THEBACKDOOR'));
 });
 
 apiRouter.post('/admin/security/mfa/verify', requireRole('admin'), (req: Request, res: Response) => {

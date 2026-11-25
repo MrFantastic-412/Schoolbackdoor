@@ -10,9 +10,9 @@ import {
   TMP_DIR,
   CACHE_DIR,
   LOGS_DIR,
-} from '../db/database';
-import { cache } from '../utils/cache';
-import { fileService, getUploadsDir } from './fileService';
+} from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { fileService, getUploadsDir } from './fileService.js';
 
 export const DEFAULT_STORAGE_QUOTA_GB = 10;
 export const DEFAULT_STORAGE_QUOTA_BYTES = DEFAULT_STORAGE_QUOTA_GB * 1024 * 1024 * 1024; // 10 GB
@@ -257,6 +257,27 @@ export const deletionService = {
           DELETE FROM password_resets
           WHERE expires_at <= CURRENT_TIMESTAMP
              OR (is_used = 1 AND created_at < datetime('now', '-7 days'))
+        `).run();
+
+        db.prepare(`
+          DELETE FROM bot_challenges
+          WHERE datetime(expires_at) <= datetime('now') OR used_at IS NOT NULL
+        `).run();
+
+        db.prepare(`
+          DELETE FROM webauthn_challenges
+          WHERE datetime(expires_at) <= datetime('now') OR used_at IS NOT NULL
+        `).run();
+
+        db.prepare(`
+          DELETE FROM passkey_recovery_tokens
+          WHERE datetime(expires_at) <= datetime('now') OR used_at IS NOT NULL
+        `).run();
+
+        db.prepare(`
+          DELETE FROM account_lockouts
+          WHERE (locked_until IS NOT NULL AND datetime(locked_until) <= datetime('now', '-24 hours'))
+             OR datetime(last_failed_at) < datetime('now', '-30 days')
         `).run();
 
         db.prepare(`

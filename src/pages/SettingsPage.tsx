@@ -4,15 +4,19 @@ import {
   Bell,
   Camera,
   Check,
+  Copy,
+  Download,
   FileText,
+  Fingerprint,
   KeyRound,
   Laptop,
   Lock,
-  Mail,
   MapPin,
   Monitor,
   Moon,
   Navigation,
+  Plus,
+  RefreshCw,
   Shield,
   ShieldAlert,
   Smartphone,
@@ -21,18 +25,23 @@ import {
   Trash2,
   UserMinus,
 } from 'lucide-react';
+import { startAuthentication, startRegistration } from '@simplewebauthn/browser';
 import {
   BlockedUser,
   DeviceSession,
+  PasskeySummary,
+  RecoveryCodeStatus,
   StudentProfile,
 } from '../types';
 import { api } from '../api/client';
 import { CAMPUS_AREA_OPTIONS, snapCoordsToArea } from '../data/locationAreas';
 import { GlassButton, GlassCard, GlassTab } from '../components/glass';
 import { UserAvatar } from '../components/common/UserAvatar';
+import { downloadRecoveryCodesTxt } from '../components/auth/AuthModal';
 import { IMAGE_UPLOAD_GUIDANCE } from '../utils/imageCompression';
 import { ThemePreference, useTheme } from '../utils/useTheme';
 import { triggerHaptic } from '../utils/haptics';
+import { formatPasskeyError, isPasskeySupported } from '../utils/webauthn';
 
 const AvatarCropModal = lazy(() =>
   import('../components/profile/AvatarCropModal').then((m) => ({ default: m.AvatarCropModal }))
@@ -108,8 +117,19 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [notifSavedSuccess, setNotifSavedSuccess] = useState(false);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
-  const [verifyCode, setVerifyCode] = useState('');
-  const [isVerifying, setIsVerifying] = useState(false);
+  const [recoveryStatus, setRecoveryStatus] = useState<RecoveryCodeStatus | null>(null);
+  const [regenPassword, setRegenPassword] = useState('');
+  const [isRegeneratingCodes, setIsRegeneratingCodes] = useState(false);
+  const [freshRecoveryCodes, setFreshRecoveryCodes] = useState<string[] | null>(null);
+  const [copiedFreshCodes, setCopiedFreshCodes] = useState(false);
+  const [passkeys, setPasskeys] = useState<PasskeySummary[]>([]);
+  const [passkeyLabelInput, setPasskeyLabelInput] = useState('');
+  const [isAddingPasskey, setIsAddingPasskey] = useState(false);
+  const [removingPasskeyId, setRemovingPasskeyId] = useState<string | null>(null);
+  const [reauthPasskeyTargetId, setReauthPasskeyTargetId] = useState<string | null>(null);
+  const [passkeyReauthPassword, setPasskeyReauthPassword] = useState('');
+  const [isPasskeyReauthing, setIsPasskeyReauthing] = useState(false);
+  const webauthnSupported = isPasskeySupported();
   const [isAvatarModalOpen, setIsAvatarModalOpen] = useState(false);
   const [isUpdatingAvatar, setIsUpdatingAvatar] = useState(false);
 
@@ -143,7 +163,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
     if (!profile?.userId) return;
     setIsLoadingSessions(true);
     try {
-      const data = await api.getMySessions();
+      const [data, rcStatus, passkeyList] = await Promise.all([
+        api.getMySessions(),
+        api.getRecoveryCodeStatus().catch(() => null),
+        api.listPasskeys().catch(() => []),
+      ]);
       setSessions(data.sessions || []);
       setSessionLimits({
         maxActiveDevices: data.maxActiveDevices || 5,
@@ -151,6 +175,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         refreshTtlDays: data.refreshTtlDays || 30,
         maxLifetimeDays: data.maxLifetimeDays || 90,
       });
+      if (rcStatus) {
+        setRecoveryStatus(rcStatus);
+      }
+      setPasskeys(passkeyList || []);
       if (profile.role === 'admin' || profile.role === 'moderator') {
         const mfaRes = await api.getMfaStatus();
         setMfaEnabled(Boolean(mfaRes.mfaEnabled));
@@ -474,75 +502,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               </h2>
             </div>
 
-            {profile?.userId && !profile?.verified && (
-              <div className="p-3.5 rounded-2xl bg-[#F6E2E6]/70 dark:bg-[#D98BA5]/15 border border-[#D98BA5]/60 dark:border-[#D98BA5]/35 flex flex-col gap-2.5 text-xs">
-                <div className="flex items-center gap-2 font-semibold text-[#171613] dark:text-[#F5EFE3]">
-                  <Mail className="w-4 h-4 text-[#C4718E] dark:text-[#E5A4BA]" />
-                  <span>Verify Your Gmail Address</span>
-                </div>
-                <p className="text-[11px] text-[#171613]/80 dark:text-[#F5EFE3]/80 leading-relaxed">
-                  Enter the 6-digit verification code sent to your Gmail account or request a fresh code.
-                </p>
-                <div className="flex flex-wrap items-center gap-2">
-                  <input
-                    type="text"
-                    value={verifyCode}
-                    onChange={(e) => setVerifyCode(e.target.value)}
-                    placeholder="6-digit code"
-                    maxLength={8}
-                    className="px-3 py-1.5 rounded-xl glass-input text-xs font-mono text-[#171613] dark:text-[#F5EFE3] w-36 min-h-[40px]"
-                  />
-                  <GlassButton
-                    variant="pink"
-                    size="sm"
-                    disabled={!verifyCode.trim() || isVerifying}
-                    onClick={async () => {
-                      setIsVerifying(true);
-                      try {
-                        const res = await api.verifyAccount(verifyCode.trim());
-                        if (res?.user && onProfileUpdated) {
-                          onProfileUpdated({ ...profile, ...res.user, verified: true });
-                        } else if (onProfileUpdated) {
-                          onProfileUpdated({ ...profile, verified: true });
-                        }
-                        setVerifyCode('');
-                        showNotice('Gmail verified! Your account is now marked verified.');
-                      } catch (err: any) {
-                        showNotice(err.message || 'Verification failed.');
-                      } finally {
-                        setIsVerifying(false);
-                      }
-                    }}
-                  >
-                    {isVerifying ? 'Verifying...' : 'Verify'}
-                  </GlassButton>
-                  <GlassButton
-                    variant="glass"
-                    size="sm"
-                    disabled={isVerifying}
-                    onClick={async () => {
-                      setIsVerifying(true);
-                      try {
-                        const res = await api.resendVerificationCode();
-                        if (res?.debugCode) {
-                          setVerifyCode(res.debugCode);
-                          showNotice(`Verification code issued: ${res.debugCode}`);
-                        } else {
-                          showNotice(res?.message || 'Verification code sent to your Gmail.');
-                        }
-                      } catch (err: any) {
-                        showNotice(err.message || 'Unable to resend verification code.');
-                      } finally {
-                        setIsVerifying(false);
-                      }
-                    }}
-                  >
-                    Resend Code
-                  </GlassButton>
-                </div>
-              </div>
-            )}
-
             <div className="flex flex-col divide-y divide-[#171613]/8 dark:divide-[#F5EFE3]/10 text-xs">
               <div className="flex items-center justify-between py-3.5 gap-4">
                 <div>
@@ -734,22 +693,41 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                     Devices &amp; Active Sessions ({sessions.length}/{sessionLimits.maxActiveDevices})
                   </h2>
                 </div>
-                {profile?.userId && sessions.length > 1 && (
-                  <GlassButton
-                    variant="black"
-                    size="sm"
-                    onClick={async () => {
-                      try {
-                        const res = await api.revokeOtherSessions();
-                        showNotice(`Signed out ${res.revokedCount} other device(s).`);
-                        await loadSessionsAndSecurity();
-                      } catch (e: any) {
-                        showNotice(e?.message || 'Unable to sign out other devices.');
-                      }
-                    }}
-                  >
-                    Sign Out All Other Devices
-                  </GlassButton>
+                {profile?.userId && sessions.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    {sessions.length > 1 && (
+                      <GlassButton
+                        variant="glass"
+                        size="sm"
+                        onClick={async () => {
+                          try {
+                            const res = await api.revokeOtherSessions();
+                            showNotice(`Signed out ${res.revokedCount} other device(s).`);
+                            await loadSessionsAndSecurity();
+                          } catch (e: any) {
+                            showNotice(e?.message || 'Unable to sign out other devices.');
+                          }
+                        }}
+                      >
+                        Sign Out All Other Devices
+                      </GlassButton>
+                    )}
+                    <GlassButton
+                      variant="black"
+                      size="sm"
+                      onClick={async () => {
+                        try {
+                          await api.revokeAllSessions();
+                          triggerHaptic('success');
+                          onLogout?.();
+                        } catch (e: any) {
+                          showNotice(e?.message || 'Unable to sign out everywhere.');
+                        }
+                      }}
+                    >
+                      Sign Out Everywhere
+                    </GlassButton>
+                  </div>
                 )}
               </div>
 
@@ -832,6 +810,210 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </div>
               )}
             </GlassCard>
+
+            {profile?.userId && (
+              <GlassCard tone="cream" padding="lg" className="flex flex-col gap-3.5 text-xs">
+                <div className="flex items-center justify-between gap-2 border-b border-[#171613]/10 dark:border-[#F5EFE3]/10 pb-3">
+                  <div className="flex items-center gap-2">
+                    <Fingerprint className="w-4 h-4 text-[#C4718E] dark:text-[#E5A4BA]" />
+                    <h3 className="font-serif font-bold text-base text-[#171613] dark:text-[#F5EFE3]">
+                      Passkeys (Biometric &amp; Security Keys)
+                    </h3>
+                  </div>
+                  <span className="font-mono text-[11px] px-2.5 py-0.5 rounded-md glass-subtle text-[#171613] dark:text-[#F5EFE3] tabular-nums">
+                    {passkeys.length} registered
+                  </span>
+                </div>
+
+                <p className="text-[11px] text-[#82796F] dark:text-[#A89F95] leading-relaxed">
+                  Sign in faster and recover your password without SMS or email. Schoolbackdoor stores only your public key credential metadata — biometric data never leaves your device.
+                </p>
+
+                {!webauthnSupported && (
+                  <div className="p-3 rounded-xl bg-[#E8DDCC]/60 dark:bg-white/5 text-[11px] text-[#82796F] dark:text-[#A89F95]">
+                    Passkeys are unavailable in this browser or non-HTTPS context. You can still manage previously added passkeys below or use your password.
+                  </div>
+                )}
+
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    if (!webauthnSupported || isAddingPasskey) return;
+                    setIsAddingPasskey(true);
+                    try {
+                      const options = await api.getPasskeyRegisterOptions();
+                      const attestation = await startRegistration({ optionsJSON: options });
+                      const res = await api.verifyPasskeyRegister(
+                        attestation,
+                        passkeyLabelInput.trim() || undefined
+                      );
+                      setPasskeys((prev) => [res.passkey, ...prev]);
+                      setPasskeyLabelInput('');
+                      triggerHaptic('success');
+                      showNotice(`Passkey "${res.passkey.label}" added.`);
+                    } catch (err: any) {
+                      triggerHaptic('error');
+                      showNotice(formatPasskeyError(err, 'Unable to add passkey.'));
+                    } finally {
+                      setIsAddingPasskey(false);
+                    }
+                  }}
+                  className="flex flex-col sm:flex-row gap-2.5"
+                >
+                  <input
+                    type="text"
+                    maxLength={60}
+                    value={passkeyLabelInput}
+                    onChange={(e) => setPasskeyLabelInput(e.target.value)}
+                    placeholder="Device label (e.g. Pixel Chrome, MacBook Touch ID)"
+                    className="flex-1 px-3.5 py-2 rounded-xl glass-input text-xs text-[#171613] dark:text-[#F5EFE3]"
+                  />
+                  <GlassButton
+                    type="submit"
+                    variant="pink"
+                    size="sm"
+                    disabled={!webauthnSupported || isAddingPasskey}
+                    loading={isAddingPasskey}
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Add Passkey</span>
+                  </GlassButton>
+                </form>
+
+                {passkeys.length === 0 ? (
+                  <div className="py-5 text-center text-xs text-[#82796F] dark:text-[#A89F95] glass-subtle rounded-xl">
+                    No passkeys registered yet. Add one above for passwordless sign-in and Method B recovery.
+                  </div>
+                ) : (
+                  <div className="divide-y divide-[#171613]/8 dark:divide-[#F5EFE3]/10">
+                    {passkeys.map((pk) => (
+                      <div key={pk.id} className="py-3 flex flex-col gap-2.5">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-semibold text-[#171613] dark:text-[#F5EFE3]">
+                                {pk.label}
+                              </span>
+                              <span className="px-1.5 py-0.5 rounded-md text-[10px] font-mono bg-[#E8DDCC]/75 dark:bg-white/10 text-[#171613] dark:text-[#F5EFE3]">
+                                {pk.backedUp ? 'Synced Passkey' : pk.deviceType === 'singleDevice' ? 'Device / Key' : 'Passkey'}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-[#82796F] dark:text-[#A89F95] font-mono mt-0.5">
+                              Added {new Date(pk.createdAt).toLocaleDateString()}
+                              {pk.lastUsedAt
+                                ? ` · Last used ${new Date(pk.lastUsedAt).toLocaleString()}`
+                                : ' · Never used yet'}
+                            </div>
+                          </div>
+
+                          <GlassButton
+                            type="button"
+                            variant="glass"
+                            size="sm"
+                            disabled={removingPasskeyId === pk.id}
+                            onClick={async () => {
+                              setRemovingPasskeyId(pk.id);
+                              try {
+                                const res = await api.deletePasskey(pk.id);
+                                setPasskeys((prev) => prev.filter((item) => item.id !== pk.id));
+                                setReauthPasskeyTargetId(null);
+                                triggerHaptic('success');
+                                showNotice(res.message || 'Passkey removed.');
+                              } catch (err: any) {
+                                if (err?.code === 'REAUTH_REQUIRED' || err?.status === 403) {
+                                  setReauthPasskeyTargetId(pk.id);
+                                  setPasskeyReauthPassword('');
+                                  showNotice('Confirm your identity below before removing this passkey.');
+                                } else {
+                                  triggerHaptic('error');
+                                  showNotice(err?.message || 'Unable to remove passkey.');
+                                }
+                              } finally {
+                                setRemovingPasskeyId(null);
+                              }
+                            }}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>{removingPasskeyId === pk.id ? 'Removing...' : 'Remove'}</span>
+                          </GlassButton>
+                        </div>
+
+                        {reauthPasskeyTargetId === pk.id && (
+                          <div className="p-3 rounded-xl glass-subtle border border-[#D98BA5]/55 space-y-2 animate-sb-in">
+                            <div className="text-[11px] font-semibold text-[#171613] dark:text-[#F5EFE3]">
+                              Re-authentication required to remove &ldquo;{pk.label}&rdquo;:
+                            </div>
+                            <div className="flex flex-col sm:flex-row gap-2">
+                              <input
+                                type="password"
+                                autoComplete="current-password"
+                                value={passkeyReauthPassword}
+                                onChange={(e) => setPasskeyReauthPassword(e.target.value)}
+                                placeholder="Enter current password"
+                                className="flex-1 px-3 py-1.5 rounded-xl glass-input text-xs text-[#171613] dark:text-[#F5EFE3]"
+                              />
+                              <GlassButton
+                                type="button"
+                                variant="black"
+                                size="sm"
+                                disabled={!passkeyReauthPassword || isPasskeyReauthing}
+                                onClick={async () => {
+                                  setIsPasskeyReauthing(true);
+                                  try {
+                                    const res = await api.deletePasskey(pk.id, passkeyReauthPassword);
+                                    setPasskeys((prev) => prev.filter((item) => item.id !== pk.id));
+                                    setReauthPasskeyTargetId(null);
+                                    setPasskeyReauthPassword('');
+                                    triggerHaptic('success');
+                                    showNotice(res.message || 'Passkey removed.');
+                                  } catch (err: any) {
+                                    triggerHaptic('error');
+                                    showNotice(err?.message || 'Password verification failed.');
+                                  } finally {
+                                    setIsPasskeyReauthing(false);
+                                  }
+                                }}
+                              >
+                                Confirm &amp; Remove
+                              </GlassButton>
+                              {webauthnSupported && (
+                                <GlassButton
+                                  type="button"
+                                  variant="pink"
+                                  size="sm"
+                                  disabled={isPasskeyReauthing}
+                                  onClick={async () => {
+                                    setIsPasskeyReauthing(true);
+                                    try {
+                                      const opts = await api.getPasskeyReauthOptions();
+                                      const assertion = await startAuthentication({ optionsJSON: opts });
+                                      await api.verifyPasskeyReauth(assertion);
+                                      const res = await api.deletePasskey(pk.id);
+                                      setPasskeys((prev) => prev.filter((item) => item.id !== pk.id));
+                                      setReauthPasskeyTargetId(null);
+                                      triggerHaptic('success');
+                                      showNotice(res.message || 'Passkey verified and removed.');
+                                    } catch (err: any) {
+                                      triggerHaptic('error');
+                                      showNotice(formatPasskeyError(err, 'Passkey verification failed.'));
+                                    } finally {
+                                      setIsPasskeyReauthing(false);
+                                    }
+                                  }}
+                                >
+                                  <Fingerprint className="w-3.5 h-3.5" />
+                                  <span>Use Passkey</span>
+                                </GlassButton>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </GlassCard>
+            )}
 
             {profile?.userId && (
               <GlassCard tone="cream" padding="lg" className="flex flex-col gap-3.5 text-xs">
@@ -995,6 +1177,119 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                         </GlassButton>
                       </div>
                     )}
+                  </div>
+                )}
+              </GlassCard>
+            )}
+
+            {profile?.userId && (
+              <GlassCard tone="cream" padding="lg" className="flex flex-col gap-3.5 text-xs">
+                <div className="flex items-center justify-between gap-2 border-b border-[#171613]/10 dark:border-[#F5EFE3]/10 pb-3">
+                  <div className="flex items-center gap-2">
+                    <KeyRound className="w-4 h-4 text-[#C4718E] dark:text-[#E5A4BA]" />
+                    <h3 className="font-serif font-bold text-base text-[#171613] dark:text-[#F5EFE3]">
+                      Single-Use Recovery Codes
+                    </h3>
+                  </div>
+                  <span className="font-mono text-[11px] px-2.5 py-0.5 rounded-md glass-subtle text-[#171613] dark:text-[#F5EFE3] tabular-nums">
+                    {recoveryStatus ? `${recoveryStatus.remainingCount}/${recoveryStatus.totalCount} unused` : 'Checking...'}
+                  </span>
+                </div>
+
+                <p className="text-[11px] text-[#82796F] dark:text-[#A89F95] leading-relaxed">
+                  Existing recovery codes are stored as cryptographic hashes and cannot be viewed again. Regenerating invalidates all unused codes and issues 10 fresh single-use codes shown once.
+                </p>
+
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    if (!regenPassword) return;
+                    setIsRegeneratingCodes(true);
+                    try {
+                      const res = await api.regenerateRecoveryCodes(regenPassword);
+                      setFreshRecoveryCodes(res.recoveryCodes);
+                      setRecoveryStatus({
+                        remainingCount: res.remainingCount,
+                        totalCount: res.totalCount,
+                        generatedAt: res.generatedAt,
+                      });
+                      setRegenPassword('');
+                      setCopiedFreshCodes(false);
+                      triggerHaptic('success');
+                      showNotice('10 new recovery codes generated. Save them immediately.');
+                    } catch (err: any) {
+                      triggerHaptic('error');
+                      showNotice(err?.message || 'Unable to regenerate recovery codes.');
+                    } finally {
+                      setIsRegeneratingCodes(false);
+                    }
+                  }}
+                  className="flex flex-col sm:flex-row gap-2.5"
+                >
+                  <input
+                    type="password"
+                    autoComplete="current-password"
+                    required
+                    value={regenPassword}
+                    onChange={(e) => setRegenPassword(e.target.value)}
+                    placeholder="Enter current password to regenerate codes"
+                    className="flex-1 px-3.5 py-2 rounded-xl glass-input text-xs text-[#171613] dark:text-[#F5EFE3]"
+                  />
+                  <GlassButton type="submit" variant="pink" size="sm" loading={isRegeneratingCodes}>
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Regenerate 10 Codes</span>
+                  </GlassButton>
+                </form>
+
+                {freshRecoveryCodes && freshRecoveryCodes.length > 0 && (
+                  <div className="p-3.5 rounded-2xl glass-subtle border border-[#D98BA5]/50 space-y-3 animate-sb-in">
+                    <div className="text-[11px] font-semibold text-[#171613] dark:text-[#F5EFE3]">
+                      New Single-Use Recovery Codes (shown once — copy or download now):
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 font-mono text-xs">
+                      {freshRecoveryCodes.map((code, idx) => (
+                        <div
+                          key={code}
+                          className="px-2.5 py-1.5 rounded-lg bg-[#FFFCF7]/85 dark:bg-[#1E1C18] border border-[#171613]/8 dark:border-white/8 text-[#171613] dark:text-[#F5EFE3] flex items-center justify-between gap-1.5"
+                        >
+                          <span className="text-[10px] text-[#82796F] dark:text-[#A89F95]">
+                            {String(idx + 1).padStart(2, '0')}
+                          </span>
+                          <span className="font-semibold tracking-tight select-all">{code}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <GlassButton
+                        type="button"
+                        variant="glass"
+                        size="sm"
+                        onClick={async () => {
+                          try {
+                            await navigator.clipboard.writeText(freshRecoveryCodes.join('\n'));
+                            setCopiedFreshCodes(true);
+                            triggerHaptic('success');
+                          } catch {
+                            showNotice('Clipboard unavailable; please use Download .txt.');
+                          }
+                        }}
+                      >
+                        {copiedFreshCodes ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                        <span>{copiedFreshCodes ? 'Copied All' : 'Copy Codes'}</span>
+                      </GlassButton>
+                      <GlassButton
+                        type="button"
+                        variant="black"
+                        size="sm"
+                        onClick={() => {
+                          downloadRecoveryCodesTxt(profile.handle, freshRecoveryCodes);
+                          triggerHaptic('success');
+                        }}
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Download .txt</span>
+                      </GlassButton>
+                    </div>
                   </div>
                 )}
               </GlassCard>

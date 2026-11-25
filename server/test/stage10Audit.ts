@@ -32,6 +32,30 @@ function assert(cond: any, msg: string) {
   console.log(`✅ AUDIT PASS: ${msg}`);
 }
 
+function countLeadingZeroBits(buf: Buffer): number {
+  let bits = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const byte = buf[i];
+    if (byte === 0) {
+      bits += 8;
+    } else {
+      bits += Math.clz32(byte) - 24;
+      break;
+    }
+  }
+  return bits;
+}
+
+function solvePow(nonce: string, difficulty: number): string {
+  for (let counter = 0; ; counter++) {
+    const sol = counter.toString(36);
+    const digest = crypto.createHash('sha256').update(`${nonce}:${sol}`, 'utf8').digest();
+    if (countLeadingZeroBits(digest) >= difficulty) {
+      return sol;
+    }
+  }
+}
+
 async function waitForServer(port: number, timeoutMs = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -112,23 +136,48 @@ async function runStage10Audit() {
     const anonPurgeRes = await fetch(`${base}/api/chats/maintenance/purge-expired`, { method: 'POST' });
     assert(anonPurgeRes.status === 401, 'Protected /api/chats/maintenance/purge-expired from unauthenticated calls');
 
-    // 3. Register real student via HTTP & verify no verification_code leak in production response
+    // 3. Register real student via HTTP (with privacy-preserving PoW challenge & recovery codes)
     const uniq = Date.now().toString().slice(-5);
+    const chalRes = await fetch(`${base}/api/auth/challenge`);
+    const chalJson = (await chalRes.json()) as { challengeId: string; nonce: string; difficulty: number };
+    assert(chalRes.status === 200 && Boolean(chalJson.challengeId && chalJson.nonce), 'Issued PoW signup challenge without PII');
+    const powSolution = solvePow(chalJson.nonce, chalJson.difficulty);
+
     const regRes = await fetch(`${base}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: `stage10_${uniq}@gmail.com`,
         username: `@audit_${uniq}`,
         password: 'AuditPassword2026!',
+        confirmPassword: 'AuditPassword2026!',
         acceptTerms: true,
         name: 'Audit Student',
         department: 'CSC',
+        botChallengeId: chalJson.challengeId,
+        botChallengeNonce: chalJson.nonce,
+        botChallengeSolution: powSolution,
       }),
     });
     const regJson = (await regRes.json()) as any;
-    assert(regRes.status === 201 && Boolean(regJson.token), 'Student registered & received cryptographic session token');
-    assert(regJson.user?.verification_code === undefined, 'Verification code NOT leaked in production registration response');
+    assert(
+      regRes.status === 201 &&
+        Boolean(regJson.token) &&
+        Array.isArray(regJson.recoveryCodes) &&
+        regJson.recoveryCodes.length === 10,
+      'Student registered with PoW, received session token and 10 single-use recovery codes once'
+    );
+    assert(regJson.user?.verification_code === undefined, 'Legacy verification_code NOT leaked in production registration response');
+
+    const rcStatusRes = await fetch(`${base}/api/auth/recovery-codes/status`, {
+      headers: { Authorization: `Bearer ${regJson.token}` },
+    });
+    const rcStatusJson = (await rcStatusRes.json()) as any;
+    assert(
+      rcStatusRes.status === 200 &&
+        rcStatusJson.remainingCount === 10 &&
+        rcStatusJson.recoveryCodes === undefined,
+      'Recovery code status returns remainingCount without exposing codes or hashes'
+    );
 
     // 4. Student cannot access admin dashboard & obsolete payment endpoints are removed
     const studentAdminRes = await fetch(`${base}/api/admin/dashboard`, {
@@ -178,20 +227,36 @@ async function runStage10Audit() {
       'Uploaded files served with Content-Security-Policy sandbox'
     );
 
-    // 6. Password reset request does not leak resetCode in production
-    const forgotRes = await fetch(`${base}/api/auth/forgot-password`, {
+    // 6. Legacy email password-reset removed (404) & Method A recovery reset prevents enumeration
+    const legacyForgotRes = await fetch(`${base}/api/auth/forgot-password`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier: `stage10_${uniq}@gmail.com` }),
+      body: JSON.stringify({ username: `@audit_${uniq}` }),
     });
-    const forgotJson = (await forgotRes.json()) as any;
-    assert(forgotRes.status === 200 && forgotJson.resetCode === undefined, 'Password reset code NOT leaked in production JSON');
+    assert(legacyForgotRes.status === 404, 'Removed legacy /api/auth/forgot-password returns 404');
+
+    const badRecoveryRes = await fetch(`${base}/api/auth/recovery/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: `@audit_${uniq}`,
+        recoveryCode: 'AAAA-BBBB-CCCC-DDDD',
+        newPassword: 'AuditResetPassword2026!',
+        confirmPassword: 'AuditResetPassword2026!',
+      }),
+    });
+    const badRecoveryJson = (await badRecoveryRes.json()) as any;
+    assert(
+      badRecoveryRes.status === 400 &&
+        badRecoveryJson.error === 'Invalid username or recovery code. Please check your details and try again.',
+      'Recovery reset rejects invalid code with generic non-enumerating error'
+    );
 
     // 7. Admin login (@THEBACKDOOR + ADMIN_PASSWORD env secret) & RBAC verification over HTTP
     const adminLoginRes = await fetch(`${base}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier: '@THEBACKDOOR', password: auditAdminPassword }),
+      body: JSON.stringify({ username: '@THEBACKDOOR', password: auditAdminPassword }),
     });
     const adminLoginJson = (await adminLoginRes.json()) as any;
     assert(adminLoginRes.status === 200 && Boolean(adminLoginJson.token), 'Admin @THEBACKDOOR authenticated via env secret over HTTP session');
@@ -344,9 +409,9 @@ async function runStage10Audit() {
     process.env.SCHOOLBACKDOOR_BACKUP_DIR = TEST_BACKUP_DIR;
     process.env.SCHOOLBACKDOOR_UPLOADS_DIR = TEST_UPLOADS_DIR;
 
-    const { initDatabase, db, runInTransaction, checkpointDatabase } = await import('../db/database');
-    const { adminSecurityService } = await import('../services/adminSecurityService');
-    const { postService } = await import('../services/postService');
+    const { initDatabase, db, runInTransaction, checkpointDatabase } = await import('../db/database.js');
+    const { adminSecurityService } = await import('../services/adminSecurityService.js');
+    const { postService } = await import('../services/postService.js');
 
     initDatabase();
 

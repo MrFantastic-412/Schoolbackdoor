@@ -79,6 +79,19 @@ export function formatDuration(seconds: number): string {
   return remainingMins > 0 ? `${hours}h ${remainingMins}m` : `${hours}h`;
 }
 
+async function safeExternalJson<T = any>(res: Response): Promise<T | null> {
+  if (!res.ok) return null;
+  const ct = String(res.headers.get('content-type') || '').toLowerCase();
+  if (ct && !ct.includes('json')) return null;
+  try {
+    const text = await res.text();
+    if (!text) return null;
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Search locations via OpenStreetMap Nominatim API with fallback
  */
@@ -103,11 +116,11 @@ export async function searchNominatim(query: string): Promise<CampusLocation[]> 
     });
     clearTimeout(timeoutId);
 
-    if (!res.ok) {
-      throw new Error(`Nominatim error: ${res.status}`);
+    const data = await safeExternalJson<any[]>(res);
+    if (!Array.isArray(data)) {
+      return [];
     }
 
-    const data = await res.json();
     return data.map((item: any, index: number) => {
       const lat = parseFloat(item.lat);
       const lon = parseFloat(item.lon);
@@ -149,8 +162,8 @@ export async function reverseGeocode(
     });
     clearTimeout(timeoutId);
 
-    if (!res.ok) return null;
-    const data = await res.json();
+    const data = await safeExternalJson<any>(res);
+    if (!data) return null;
 
     const road =
       data.address?.road ||
@@ -197,23 +210,21 @@ export async function calculateRoute(
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timeoutId);
 
-    if (res.ok) {
-      const data = await res.json();
-      if (data.routes && data.routes[0]) {
-        const route = data.routes[0];
-        // GeoJSON coordinates are [lon, lat] -> convert to [lat, lon] for Leaflet
-        const coords: [number, number][] = route.geometry.coordinates.map(
-          ([lon, lat]: [number, number]) => [lat, lon]
-        );
+    const data = await safeExternalJson<any>(res);
+    if (data?.routes && data.routes[0]) {
+      const route = data.routes[0];
+      // GeoJSON coordinates are [lon, lat] -> convert to [lat, lon] for Leaflet
+      const coords: [number, number][] = route.geometry.coordinates.map(
+        ([lon, lat]: [number, number]) => [lat, lon]
+      );
 
-        return {
-          distanceMeters: Math.round(route.distance),
-          durationSeconds: Math.round(route.duration),
-          coordinates: coords,
-          summary: route.legs?.[0]?.summary || undefined,
-          profile,
-        };
-      }
+      return {
+        distanceMeters: Math.round(route.distance),
+        durationSeconds: Math.round(route.duration),
+        coordinates: coords,
+        summary: route.legs?.[0]?.summary || undefined,
+        profile,
+      };
     }
   } catch (err) {
     // Fall through to resilient synthetic interpolation

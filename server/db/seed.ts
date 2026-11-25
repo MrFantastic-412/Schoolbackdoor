@@ -1,6 +1,6 @@
-import { db, runInTransaction, syncTheBackdoorAdminIdentity, syncDefaultModeratorAccount } from './database';
+import { db, runInTransaction, syncTheBackdoorAdminIdentity, syncDefaultModeratorAccount } from './database.js';
 import crypto from 'node:crypto';
-import { hashPassword } from '../utils/security';
+import { hashPassword } from '../utils/security.js';
 
 export { hashPassword };
 
@@ -26,14 +26,14 @@ export function seedInitialData() {
 
     const insertUser = db.prepare(`
       INSERT INTO users (id, matric_number, email, username, password_hash, role, status, is_verified)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, NULL, ?, ?, ?, ?, 0)
     `);
 
-    insertUser.run('u-ayodele', 'CSC/20/8901', 'ao.balogun@futa.edu.ng', '@ayodele_ao', defaultStudentPassword, 'student', 'active', 1);
-    insertUser.run('u-kemi', 'CYS/21/3042', 'kemi.b@futa.edu.ng', '@kemi_b', defaultStudentPassword, 'student', 'active', 1);
-    insertUser.run('u-dami', 'SWE/21/5012', 'dami.fashola@futa.edu.ng', '@dami_soc', defaultStudentPassword, 'student', 'active', 1);
-    insertUser.run('u-chronicle', 'STAFF/SUG/004', 'press@futachronicle.ng', '@futachronicle', defaultStudentPassword, 'staff', 'active', 1);
-    insertUser.run('u-admin', 'ADMIN/001', 'admin@schoolbackdoor.app', '@THEBACKDOOR', adminPasswordHash, 'admin', 'active', 1);
+    insertUser.run('u-ayodele', 'CSC/20/8901', '@ayodele_ao', defaultStudentPassword, 'student', 'active');
+    insertUser.run('u-kemi', 'CYS/21/3042', '@kemi_b', defaultStudentPassword, 'student', 'active');
+    insertUser.run('u-dami', 'SWE/21/5012', '@dami_soc', defaultStudentPassword, 'student', 'active');
+    insertUser.run('u-chronicle', 'STAFF/SUG/004', '@futachronicle', defaultStudentPassword, 'staff', 'active');
+    insertUser.run('u-admin', 'ADMIN/001', '@THEBACKDOOR', adminPasswordHash, 'admin', 'active');
 
     // 2. Seed User Profiles
     const insertProfile = db.prepare(`

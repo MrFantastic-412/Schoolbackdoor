@@ -1,9 +1,9 @@
-import { db, runInTransaction } from '../db/database';
-import { cache } from '../utils/cache';
-import { mentionService } from './mentionService';
-import { notificationService } from './notificationService';
-import { fileService, PROTECTION_MODE_MAX_UPLOAD_BYTES } from './fileService';
-import { deletionService } from './deletionService';
+import { db, runInTransaction } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { mentionService } from './mentionService.js';
+import { notificationService } from './notificationService.js';
+import { fileService, PROTECTION_MODE_MAX_UPLOAD_BYTES } from './fileService.js';
+import { deletionService } from './deletionService.js';
 
 function assertNotBlockedOnPost(userId: string, postAuthorId: string, isAnonymous: number | boolean) {
   if (!userId || userId === postAuthorId || Boolean(isAnonymous)) return;

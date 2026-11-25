@@ -1,14 +1,15 @@
 import type { Request, Response, NextFunction } from 'express';
-import { db } from '../db/database';
-import { logger } from '../utils/logger';
-import { hashSessionToken, SESSION_POLICY } from '../utils/security';
+import { db } from '../db/database.js';
+import { logger } from '../utils/logger.js';
+import { hashSessionToken, SESSION_POLICY } from '../utils/security.js';
 
 export type UserRole = 'admin' | 'moderator' | 'staff' | 'student';
 
 export interface AuthenticatedUser {
   id: string;
   matric_number: string;
-  email: string;
+  username?: string;
+  email?: string | null;
   role: UserRole;
   status: 'active' | 'suspended' | 'pending_verification';
   restricted_until?: string | null;
@@ -138,7 +139,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
       const tokenHash = hashSessionToken(rawToken);
       const sessionRow = db.prepare(`
         SELECT s.token, s.id as session_id, s.expires_at, s.max_expires_at, s.revoked_at,
-               u.id, u.matric_number, u.email, u.role, u.status,
+               u.id, u.matric_number, u.username, u.email, u.role, u.status,
                u.account_restricted_until, u.restriction_reason,
                u.accepted_terms_version, u.last_reauthenticated_at
         FROM sessions s
@@ -157,7 +158,8 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
         resolvedUser = {
           id: sessionRow.id,
           matric_number: sessionRow.matric_number,
-          email: sessionRow.email,
+          username: sessionRow.username || undefined,
+          email: sessionRow.email || null,
           role: sessionRow.role as UserRole,
           status: sessionRow.status,
           restricted_until: restriction.restricted_until,
@@ -172,7 +174,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
     const hasRefreshCookie = Boolean(parseCookieValue(req.headers.cookie, 'sb_refresh'));
     if (!resolvedUser && !rawToken && !hasRefreshCookie && process.env.NODE_ENV !== 'production') {
       const defaultUser = db.prepare(`
-        SELECT id, matric_number, email, role, status, account_restricted_until, restriction_reason,
+        SELECT id, matric_number, username, email, role, status, account_restricted_until, restriction_reason,
                accepted_terms_version, last_reauthenticated_at
         FROM users
         WHERE id = 'u-ayodele'
@@ -183,7 +185,8 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
         resolvedUser = {
           id: defaultUser.id,
           matric_number: defaultUser.matric_number,
-          email: defaultUser.email,
+          username: defaultUser.username || undefined,
+          email: defaultUser.email || null,
           role: defaultUser.role as UserRole,
           status: defaultUser.status,
           restricted_until: restriction.restricted_until,

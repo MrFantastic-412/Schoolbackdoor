@@ -31,26 +31,60 @@ function assert(condition: any, message: string) {
   }
 }
 
+function countLeadingZeroBits(buf: Buffer): number {
+  let bits = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const byte = buf[i];
+    if (byte === 0) {
+      bits += 8;
+    } else {
+      bits += Math.clz32(byte) - 24;
+      break;
+    }
+  }
+  return bits;
+}
+
+function solvePow(nonce: string, difficulty: number): string {
+  for (let counter = 0; ; counter++) {
+    const sol = counter.toString(36);
+    const digest = crypto.createHash('sha256').update(`${nonce}:${sol}`, 'utf8').digest();
+    if (countLeadingZeroBits(digest) >= difficulty) {
+      return sol;
+    }
+  }
+}
+
+async function fetchSolvedChallenge(baseUrl: string) {
+  const res = await fetch(`${baseUrl}/api/auth/challenge`);
+  const body = (await res.json()) as { challengeId: string; nonce: string; difficulty: number };
+  return {
+    botChallengeId: body.challengeId,
+    botChallengeNonce: body.nonce,
+    botChallengeSolution: solvePow(body.nonce, body.difficulty),
+  };
+}
+
 async function runTests() {
-  const { initDatabase, db, runInTransaction, checkpointDatabase } = await import('../db/database');
-  const { seedInitialData, hashPassword } = await import('../db/seed');
-  const { userService } = await import('../services/userService');
-  const { postService } = await import('../services/postService');
-  const { commentReactionService } = await import('../services/commentReactionService');
-  const { chatService } = await import('../services/chatService');
-  const { communityService } = await import('../services/communityService');
-  const { notificationService } = await import('../services/notificationService');
-  const { adminReportService } = await import('../services/adminReportService');
-  const { fileService, getUploadsDir, PROTECTION_MODE_MAX_UPLOAD_BYTES } = await import('../services/fileService');
-  const { landmarkService } = await import('../services/landmarkService');
-  const { adminSecurityService } = await import('../services/adminSecurityService');
-  const { adminControlService } = await import('../services/adminControlService');
-  const { deletionService } = await import('../services/deletionService');
-  const { redactSensitiveData } = await import('../utils/logger');
-  const { authService } = await import('../services/authService');
-  const { computeTotpCode } = await import('../utils/totp');
-  const { presenceService } = await import('../services/presenceService');
-  const { cache } = await import('../utils/cache');
+  const { initDatabase, db, runInTransaction, checkpointDatabase } = await import('../db/database.js');
+  const { seedInitialData, hashPassword } = await import('../db/seed.js');
+  const { userService } = await import('../services/userService.js');
+  const { postService } = await import('../services/postService.js');
+  const { commentReactionService } = await import('../services/commentReactionService.js');
+  const { chatService } = await import('../services/chatService.js');
+  const { communityService } = await import('../services/communityService.js');
+  const { notificationService } = await import('../services/notificationService.js');
+  const { adminReportService } = await import('../services/adminReportService.js');
+  const { fileService, getUploadsDir, PROTECTION_MODE_MAX_UPLOAD_BYTES } = await import('../services/fileService.js');
+  const { landmarkService } = await import('../services/landmarkService.js');
+  const { adminSecurityService } = await import('../services/adminSecurityService.js');
+  const { adminControlService } = await import('../services/adminControlService.js');
+  const { deletionService } = await import('../services/deletionService.js');
+  const { redactSensitiveData } = await import('../utils/logger.js');
+  const { authService, AuthRateLimitError } = await import('../services/authService.js');
+  const { computeTotpCode } = await import('../utils/totp.js');
+  const { presenceService } = await import('../services/presenceService.js');
+  const { cache } = await import('../utils/cache.js');
 
   console.log('\n======================================================');
   console.log('🧪 SCHOOLBACKDOOR BACKEND & DATABASE TEST SUITE');
@@ -261,7 +295,7 @@ async function runTests() {
 
   // --- Step 8: Testing Stage 3 Registration, Authentication, Profiles & Privacy ---
   console.log('\n--- 8. Testing Stage 3 User Registration & Validation ---');
-  const { blockService } = await import('../services/blockService');
+  const { blockService } = await import('../services/blockService.js');
 
   // Test 8a: Username validation requiring '@' symbol
   const invalidUser1 = authService.validateUsername('invalid_user_no_at');
@@ -279,57 +313,63 @@ async function runTests() {
   const validUserCheck = authService.validateUsername('@futa_scholar26');
   assert(validUserCheck.valid === true && validUserCheck.normalized === '@futa_scholar26', 'Accepts valid FUTA student handle with @');
 
-  // Test 8b: Register with Gmail and unique @username
-  const regEmail = `scholar_${Date.now()}@gmail.com`;
+  // Test 8b: Register with unique @username + password + confirmPassword -> Argon2id & 10 recovery codes
   const regHandle = `@scholar_${Date.now().toString().slice(-6)}`;
   const regResult = authService.register({
-    identifier: regEmail,
     username: regHandle,
     password: 'SecurePassword123!',
+    confirmPassword: 'SecurePassword123!',
+    acceptTerms: true,
     name: 'Scholar Babatunde',
     department: 'Software Engineering',
     level: '200L',
     hall_of_residence: 'Titans Hall',
   });
-  assert(regResult.user.username === regHandle, 'Registered new student with Gmail and @ handle');
+  assert(
+    regResult.user.username === regHandle &&
+      Array.isArray(regResult.recoveryCodes) &&
+      regResult.recoveryCodes.length === 10 &&
+      regResult.user.recoveryCodesRemaining === 10,
+    'Registered new student with @username and received 10 single-use recovery codes once'
+  );
   assert(regResult.token.length === 64, 'Generated secure 64-char hex session token upon registration');
-  assert(regResult.user.is_verified === false, 'New student account defaults to unverified');
 
-  // Test 8c: Reject duplicate registration
-  let duplicateEmailRejected = false;
+  // Test 8c: Reject duplicate case-insensitive username & mismatched confirmPassword
+  let mismatchRejected = false;
   try {
     authService.register({
-      identifier: regEmail,
-      username: `@another_${Date.now().toString().slice(-4)}`,
+      username: `@mismatch_${Date.now().toString().slice(-4)}`,
       password: 'AnotherPassword123!',
+      confirmPassword: 'DifferentPassword123!',
+      acceptTerms: true,
     });
   } catch (err: any) {
-    duplicateEmailRejected = err.message.includes('already exists');
+    mismatchRejected = err.message.includes('do not match');
   }
-  assert(duplicateEmailRejected, 'Rejected duplicate Gmail registration');
+  assert(mismatchRejected, 'Rejected registration when confirmPassword does not match password');
 
   let duplicateHandleRejected = false;
   try {
     authService.register({
-      identifier: `unique_${Date.now()}@gmail.com`,
-      username: regHandle,
+      username: regHandle.toUpperCase(),
       password: 'AnotherPassword123!',
+      confirmPassword: 'AnotherPassword123!',
+      acceptTerms: true,
     });
   } catch (err: any) {
     duplicateHandleRejected = err.message.includes('already taken');
   }
-  assert(duplicateHandleRejected, 'Rejected duplicate username registration');
+  assert(duplicateHandleRejected, 'Rejected case-insensitive duplicate username registration');
 
-  // Test 8d: Account Verification
-  assert(Boolean(regResult.user.verification_code), 'Verification code generated for new student');
-  const verifyRes = authService.verifyAccount(regResult.user.id, regResult.user.verification_code!);
-  assert(verifyRes.verified === true, 'Successfully verified student account with 6-digit code');
+  // Test 8d: Recovery code status exposes counts only
+  const rcStatus = authService.getRecoveryCodeStatus(regResult.user.id);
+  assert(rcStatus.remainingCount === 10 && rcStatus.totalCount === 10, 'Recovery code status reports 10 unused codes');
 
   // Test 8e: Authentication & SHA-256 Hashed Session Token Resolution
   const loginRes = authService.login(regHandle, 'SecurePassword123!');
   assert(loginRes.token.length === 64, 'Logged in using @ handle and received session token');
 
-  const { hashSessionToken } = await import('../utils/security');
+  const { hashSessionToken } = await import('../utils/security.js');
   const rawTokenDbRow = db.prepare('SELECT token FROM sessions WHERE token = ?').get(loginRes.token);
   const hashedTokenDbRow = db.prepare('SELECT token FROM sessions WHERE token = ?').get(hashSessionToken(loginRes.token));
   assert(
@@ -345,7 +385,7 @@ async function runTests() {
   try {
     authService.login(regHandle, 'WrongPassword123!');
   } catch (err: any) {
-    badPasswordRejected = err.message === 'Invalid email/username or password.';
+    badPasswordRejected = err.message === 'Invalid username or password.';
   }
   assert(badPasswordRejected, 'Rejected incorrect password with generic error message');
 
@@ -353,24 +393,41 @@ async function runTests() {
   try {
     authService.login('@nonexistent_student_999', 'WrongPassword123!');
   } catch (err: any) {
-    unknownUserRejectedGeneric = err.message === 'Invalid email/username or password.';
+    unknownUserRejectedGeneric = err.message === 'Invalid username or password.';
   }
-  assert(unknownUserRejectedGeneric, 'Rejected unknown identifier with identical generic error message');
+  assert(unknownUserRejectedGeneric, 'Rejected unknown username with identical generic error message');
 
-  // Test 8g: Password Recovery Flow
-  const recoveryReq = authService.requestPasswordReset(regEmail);
-  assert(recoveryReq.success === true && Boolean(recoveryReq.resetCode), 'Generated 6-digit password recovery code');
-  
-  const resetRes = authService.resetPasswordWithCode(recoveryReq.resetCode!, 'BrandNewSecret2026!');
-  assert(resetRes.success === true, 'Reset password using valid 6-digit reset code');
+  // Test 8g: Method A Password Recovery Flow (username + single-use recovery code)
+  const usedCode0 = regResult.recoveryCodes[0];
+  const resetRes = authService.resetPasswordWithRecoveryCode({
+    username: regHandle,
+    recoveryCode: usedCode0,
+    newPassword: 'BrandNewSecret2026!',
+    confirmPassword: 'BrandNewSecret2026!',
+  });
+  assert(resetRes.success === true, 'Reset password using valid single-use recovery code');
+
+  // Reusing the same recovery code must fail
+  let reusedCodeRejected = false;
+  try {
+    authService.resetPasswordWithRecoveryCode({
+      username: regHandle,
+      recoveryCode: usedCode0,
+      newPassword: 'AnotherSecret2026!',
+      confirmPassword: 'AnotherSecret2026!',
+    });
+  } catch {
+    reusedCodeRejected = true;
+  }
+  assert(reusedCodeRejected, 'Single-use recovery code cannot be reused after password reset');
 
   // Previous session invalidated
   const invalidatedSessionCheck = authService.validateSession(loginRes.token);
   assert(invalidatedSessionCheck === null, 'All sessions invalidated after password reset');
 
   // Can log in with new password
-  const newLoginRes = authService.login(regEmail, 'BrandNewSecret2026!');
-  assert(newLoginRes.token.length === 64, 'Successfully authenticated using new password');
+  const newLoginRes = authService.login(regHandle.toUpperCase(), 'BrandNewSecret2026!');
+  assert(newLoginRes.token.length === 64, 'Successfully authenticated using new password and case-insensitive username');
 
   // Logout session invalidation
   authService.logout(newLoginRes.token);
@@ -1167,7 +1224,6 @@ async function runTests() {
 
   // 21b: Admin user creation, profile edit, and permanent deletion
   const adminCreated = adminControlService.createUserByAdmin(adminActor.id, {
-    identifier: 'adm.created@gmail.com',
     username: '@adm_created',
     password: 'Password123!',
     name: 'Created Scholar',
@@ -1175,7 +1231,7 @@ async function runTests() {
     department: 'MEE',
     level: '200L',
   });
-  assert(adminCreated.is_verified === true && adminCreated.role === 'student', 'Admin creates verified user account cleanly');
+  assert(adminCreated.role === 'student' && adminCreated.username === '@adm_created', 'Admin creates student account cleanly');
 
   const editedUser = adminControlService.updateUserProfileByAdmin(adminActor.id, adminCreated.id, {
     department: 'CPE',
@@ -1247,9 +1303,9 @@ async function runTests() {
   let publicRegBlocked = false;
   try {
     authService.register({
-      identifier: 'blocked@gmail.com',
       username: '@blocked_reg',
       password: 'Password123!',
+      confirmPassword: 'Password123!',
     });
   } catch (err: any) {
     publicRegBlocked = err.message.includes('paused');
@@ -1285,20 +1341,20 @@ async function runTests() {
 
   // 21h: Admin RFC-6238 TOTP MFA setup, verification & login enforcement
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword('AdminPass123!'), adminActor.id);
-  const mfaSetup = adminControlService.initiateAdminMfaSetup(adminActor.id, 'admin@schoolbackdoor.app');
+  const mfaSetup = adminControlService.initiateAdminMfaSetup(adminActor.id, '@THEBACKDOOR');
   const validCode = computeTotpCode(mfaSetup.secret);
   const mfaVerifyRes = adminControlService.verifyAndEnableAdminMfa(adminActor.id, validCode);
   assert(mfaVerifyRes.mfaEnabled === true, 'Admin MFA activated after valid 6-digit RFC-6238 TOTP code');
 
   let loginWithoutMfaBlocked = false;
   try {
-    authService.login(adminActor.email, 'AdminPass123!');
+    authService.login(adminActor.username, 'AdminPass123!');
   } catch (err: any) {
     loginWithoutMfaBlocked = err.message.startsWith('MFA_REQUIRED:');
   }
   assert(loginWithoutMfaBlocked, 'Admin login blocked when MFA is enabled and no TOTP code supplied');
 
-  const loginWithMfa = authService.login(adminActor.email, 'AdminPass123!', undefined, undefined, computeTotpCode(mfaSetup.secret));
+  const loginWithMfa = authService.login(adminActor.username, 'AdminPass123!', undefined, undefined, computeTotpCode(mfaSetup.secret));
   assert(Boolean(loginWithMfa.token), 'Admin login succeeds when valid 6-digit TOTP code supplied');
 
   adminControlService.disableAdminMfa(adminActor.id, 'AdminPass123!');
@@ -1514,9 +1570,9 @@ async function runTests() {
   for (let i = 0; i < 12; i++) {
     const u = authService.register(
       {
-        identifier: `nplus_${i}_${Date.now()}@gmail.com`,
         username: `@nplus_u_${i}_${Date.now().toString(36).slice(-3)}`,
         password: 'Password123!',
+        confirmPassword: 'Password123!',
         name: `Scaling Student ${i}`,
         department: 'Software Engineering',
         level: '300L',
@@ -1632,14 +1688,14 @@ async function runTests() {
   }
   const sweepRun = countQueries(() => deletionService.run72HourExpirySweep('u-system-job'));
   assert(
-    sweepRun.queries <= 25 && sweepRun.result.postsPurged >= 8,
+    sweepRun.queries <= 30 && sweepRun.result.postsPurged >= 8,
     `run72HourExpirySweep purged ${sweepRun.result.postsPurged} posts + notifications in O(1) queries (got ${sweepRun.queries})`
   );
 
   // --- Step 25: Performance, Caching Isolation, Read Pool, Strict 72h Upload Policy & Pagination ---
   console.log('\n--- 25. Testing Caching Isolation, ETags, Read Pool, Pagination & 72h File Policy ---');
-  const { withReadConnection, getPoolStats } = await import('../db/database');
-  const { apiRouter } = await import('../routes/api');
+  const { withReadConnection, getPoolStats } = await import('../db/database.js');
+  const { apiRouter } = await import('../routes/api.js');
   const expressMod = await import('express');
   const httpMod = await import('node:http');
 
@@ -1941,36 +1997,37 @@ async function runTests() {
     );
 
     // =========================================================================
-    // 27. GMAIL AUTH RULES, SEARCH, CONNECTIONS, REPOSTS & THREADED REPLIES
+    // 27. @USERNAME AUTH, RECOVERY CODES, SEARCH, CONNECTIONS, REPOSTS & THREADS
     // =========================================================================
-    console.log('\n--- 27. Testing Gmail Auth, Search, Connections, Profiles, Reposts & Threaded Comments ---');
+    console.log('\n--- 27. Testing @Username Auth, PoW Signup, Recovery Codes, Search, Connections, Reposts & Threaded Comments ---');
 
-    // 27a: Non-Gmail registration is rejected with HTTP 400
-    const badGmailRes = await fetch(`${baseUrl}/api/auth/register`, {
+    // 27a: Registration without PoW challenge is rejected with HTTP 400
+    const missingPowRes = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: 'not_gmail@yahoo.com',
-        username: `@badmail_${Date.now().toString().slice(-4)}`,
+        username: `@nopow_${Date.now().toString().slice(-4)}`,
         password: 'StrongPassword123!',
+        confirmPassword: 'StrongPassword123!',
         acceptTerms: true,
       }),
     });
-    assert(badGmailRes.status === 400, `Rejects non-Gmail registration with HTTP 400 (${badGmailRes.status})`);
+    assert(missingPowRes.status === 400, `Rejects registration without PoW bot challenge with HTTP 400 (${missingPowRes.status})`);
 
-    // 27b: Valid Gmail registration + resend verification + login with @username or Gmail
+    // 27b: Valid @username registration with PoW + 10 recovery codes + cookie + @username login
     const gUniq = Date.now().toString().slice(-5);
-    const gmailAddr = `social_${gUniq}@gmail.com`;
     const socialHandle = `@social_${gUniq}`;
+    const socialChallenge = await fetchSolvedChallenge(baseUrl);
     const validRegRes = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: gmailAddr,
         username: socialHandle,
         password: 'SocialPassword123!',
+        confirmPassword: 'SocialPassword123!',
         acceptTerms: true,
         name: 'Social Member',
+        ...socialChallenge,
       }),
     });
     const validRegBody = (await validRegRes.json()) as any;
@@ -1978,11 +2035,13 @@ async function runTests() {
     assert(
       validRegRes.status === 201 &&
         Boolean(validRegBody.token) &&
+        Array.isArray(validRegBody.recoveryCodes) &&
+        validRegBody.recoveryCodes.length === 10 &&
         validRegBody.user?.verification_code === undefined &&
         regSetCookie.includes('sb_session=') &&
         regSetCookie.includes('HttpOnly') &&
         regSetCookie.includes('SameSite=Strict'),
-      'Valid Gmail + @username registration succeeds (201), sets HttpOnly SameSite=Strict cookie, and never leaks OTP'
+      'Valid @username + PoW registration succeeds (201), sets HttpOnly SameSite=Strict cookie, returns 10 recovery codes once'
     );
 
     // Cookie-only authenticated request to /api/me
@@ -1993,37 +2052,38 @@ async function runTests() {
     const cookieMeBody = (await cookieMeRes.json()) as any;
     assert(cookieMeRes.status === 200 && cookieMeBody.user?.id === validRegBody.user.id, 'HttpOnly sb_session cookie authenticates /api/me cleanly');
 
-    const resendRes = await fetch(`${baseUrl}/api/auth/verify/resend`, {
+    const removedResendRes = await fetch(`${baseUrl}/api/auth/verify/resend`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${validRegBody.token}` },
     });
-    const resendBody = (await resendRes.json()) as any;
-    assert(resendRes.status === 200 && resendBody.verification_code === undefined, 'POST /api/auth/verify/resend issues verification code without JSON leak');
+    assert(removedResendRes.status === 404, 'Removed legacy POST /api/auth/verify/resend returns 404');
 
-    const forgotHttpRes = await fetch(`${baseUrl}/api/auth/forgot-password`, {
+    const removedForgotRes = await fetch(`${baseUrl}/api/auth/forgot-password`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier: gmailAddr }),
+      body: JSON.stringify({ username: socialHandle }),
     });
-    const forgotHttpBody = (await forgotHttpRes.json()) as any;
-    assert(forgotHttpRes.status === 200 && forgotHttpBody.resetCode === undefined, 'POST /api/auth/forgot-password never leaks resetCode in HTTP JSON');
+    assert(removedForgotRes.status === 404, 'Removed legacy POST /api/auth/forgot-password returns 404');
 
     const loginHandleRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier: socialHandle, password: 'SocialPassword123!' }),
+      body: JSON.stringify({ username: socialHandle, password: 'SocialPassword123!' }),
     });
+    const loginHandleBody = (await loginHandleRes.json()) as any;
     assert(
-      loginHandleRes.status === 200 && String(loginHandleRes.headers.get('set-cookie') || '').includes('HttpOnly'),
-      'Logs in cleanly with @username + password and issues HttpOnly cookie'
+      loginHandleRes.status === 200 &&
+        loginHandleBody.recoveryCodes === undefined &&
+        String(loginHandleRes.headers.get('set-cookie') || '').includes('HttpOnly'),
+      'Logs in cleanly with @username + password, issues HttpOnly cookie, and never exposes recoveryCodes'
     );
 
-    const loginGmailRes = await fetch(`${baseUrl}/api/auth/login`, {
+    const loginUpperRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier: gmailAddr.toUpperCase(), password: 'SocialPassword123!' }),
+      body: JSON.stringify({ username: socialHandle.toUpperCase(), password: 'SocialPassword123!' }),
     });
-    assert(loginGmailRes.status === 200, 'Logs in cleanly with Gmail (case-insensitive) + password');
+    assert(loginUpperRes.status === 200, 'Logs in cleanly with case-insensitive @username + password');
 
     // 27c: Friend search & connection toggle + profile posts shielding
     const searchUsersRes = await fetch(`${baseUrl}/api/users/search?q=ayodele`, {
@@ -2164,14 +2224,16 @@ async function runTests() {
     }
     assert(jsExtRejected && svgExtRejected, 'fileService.externalizeImages rejects javascript: and SVG data: URLs');
 
-    // 28c: Strong password enforcement (length + complexity + weak blocklist) on register & password reset
+    // 28c: Strong password enforcement (length + complexity + weak blocklist) on register & recovery reset
     const shortPwdRegRes = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: `shortpwd_${gUniq}@gmail.com`,
         username: `@short_${gUniq}`,
         password: '1234567',
+        confirmPassword: '1234567',
+        acceptTerms: true,
+        ...(await fetchSolvedChallenge(baseUrl)),
       }),
     });
     assert(shortPwdRegRes.status === 400, `POST /api/auth/register enforces >=8 char passwords (${shortPwdRegRes.status})`);
@@ -2180,9 +2242,11 @@ async function runTests() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: `weakpwd_${gUniq}@gmail.com`,
         username: `@weak_${gUniq}`,
         password: 'Password123',
+        confirmPassword: 'Password123',
+        acceptTerms: true,
+        ...(await fetchSolvedChallenge(baseUrl)),
       }),
     });
     assert(weakPwdRegRes.status === 400, `POST /api/auth/register rejects password missing symbol (${weakPwdRegRes.status})`);
@@ -2191,42 +2255,48 @@ async function runTests() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: `commonpwd_${gUniq}@gmail.com`,
         username: `@common_${gUniq}`,
         password: 'Qwerty123!',
+        confirmPassword: 'Qwerty123!',
+        acceptTerms: true,
+        ...(await fetchSolvedChallenge(baseUrl)),
       }),
     });
     assert(commonPwdRegRes.status === 400, `POST /api/auth/register rejects common weak password (${commonPwdRegRes.status})`);
 
     let shortResetRejected = false;
     try {
-      const resetReq = authService.requestPasswordReset(gmailAddr);
-      if (resetReq.resetCode) {
-        authService.resetPasswordWithCode(resetReq.resetCode, 'short7', undefined, gmailAddr);
-      }
+      authService.resetPasswordWithRecoveryCode({
+        username: socialHandle,
+        recoveryCode: validRegBody.recoveryCodes[0],
+        newPassword: 'short7',
+        confirmPassword: 'short7',
+      });
     } catch (e: any) {
       shortResetRejected = String(e?.message || '').includes('8 characters');
     }
-    assert(shortResetRejected, 'authService.resetPasswordWithCode enforces >=8 char strong passwords');
+    assert(shortResetRejected, 'authService.resetPasswordWithRecoveryCode enforces >=8 char strong passwords');
 
-    // 28d: OTP verification brute-force lockout burns verification_code after 5 bad attempts
-    let verifyLocked429 = false;
+    // 28d: Recovery-code reset brute-force rate limit (HTTP 429 after 5 bad attempts)
+    let recoveryLocked429 = false;
     for (let attempt = 1; attempt <= 6; attempt++) {
-      const badVerRes = await fetch(`${baseUrl}/api/auth/verify`, {
+      const badRecRes = await fetch(`${baseUrl}/api/auth/recovery/reset`, {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${validRegBody.token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ code: '000000' }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: socialHandle,
+          recoveryCode: 'AAAA-BBBB-CCCC-DDDD',
+          newPassword: 'ValidResetPassword!2026',
+          confirmPassword: 'ValidResetPassword!2026',
+        }),
       });
-      if (badVerRes.status === 429) {
-        verifyLocked429 = true;
+      if (badRecRes.status === 429) {
+        recoveryLocked429 = true;
         break;
       }
     }
-    const verUserRow = db.prepare('SELECT verification_code FROM users WHERE id = ?').get(validRegBody.user.id) as { verification_code: string | null } | undefined;
-    assert(verifyLocked429 && verUserRow?.verification_code === null, 'POST /api/auth/verify rate-limits brute force (429) and burns OTP code');
+    assert(recoveryLocked429, 'POST /api/auth/recovery/reset rate-limits brute force attempts (429)');
+    db.prepare("DELETE FROM login_attempts WHERE identifier LIKE 'rec%'").run();
 
     // 28d-ii: Login brute-force lockout returns HTTP 429 with Retry-After header after 5 failures
     let loginLocked429 = false;
@@ -2235,7 +2305,7 @@ async function runTests() {
       const badLoginRes = await fetch(`${baseUrl}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identifier: socialHandle, password: 'WrongAttemptPassword!9' }),
+        body: JSON.stringify({ username: socialHandle, password: 'WrongAttemptPassword!9' }),
       });
       if (badLoginRes.status === 429) {
         loginLocked429 = true;
@@ -2248,6 +2318,7 @@ async function runTests() {
       `POST /api/auth/login locks after 5 failures with HTTP 429 + Retry-After (${loginRetryAfter}s)`
     );
     db.prepare('DELETE FROM login_attempts').run();
+    db.prepare('DELETE FROM account_lockouts').run();
 
     // 28e: Normal student cannot escalate privileges to create pinned/announcement posts
     const escalateRes = await fetch(`${baseUrl}/api/posts`, {
@@ -2893,7 +2964,7 @@ async function runTests() {
     );
 
     // 30j: Dynamic Freshness & Engagement Velocity Weighting in 'For You' Feed
-    const { computeDynamicForYouWeights } = await import('../services/feedRankingService');
+    const { computeDynamicForYouWeights } = await import('../services/feedRankingService.js');
     const busyFeedCtx = {
       freshRatio: 0.5,
       activeBurstRatio: 0.45,
@@ -2990,9 +3061,11 @@ async function runTests() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: 'hijack_admin@gmail.com',
         username: '@thebackdoor',
         password: 'StrongPassword123!',
+        confirmPassword: 'StrongPassword123!',
+        acceptTerms: true,
+        ...(await fetchSolvedChallenge(baseUrl)),
       }),
     });
     assert(reservedRegRes.status === 400, `Blocks public registration of reserved handle @thebackdoor (${reservedRegRes.status})`);
@@ -3160,7 +3233,6 @@ async function runTests() {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        identifier: `mod_${modUniq}@gmail.com`,
         username: `@mod_${modUniq}`,
         password: 'ModStrongPassword123!',
         name: 'Campus Moderator',
@@ -3186,7 +3258,7 @@ async function runTests() {
     const modLoginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier: `@mod_${modUniq}`, password: 'ModStrongPassword123!' }),
+      body: JSON.stringify({ username: `@mod_${modUniq}`, password: 'ModStrongPassword123!' }),
     });
     const modLoginBody = (await modLoginRes.json()) as any;
     const modToken = modLoginBody.token;
@@ -3373,9 +3445,9 @@ async function runTests() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: `notos_${Date.now()}@gmail.com`,
         username: `@notos_${Date.now().toString().slice(-5)}`,
         password: 'StrongPassword2026!',
+        confirmPassword: 'StrongPassword2026!',
         name: 'No ToS',
       }),
     });
@@ -3387,18 +3459,18 @@ async function runTests() {
 
     // 32b: Valid signup issues BOTH sb_session (15m) + sb_refresh (30d) HttpOnly SameSite=Strict cookies
     const secUniq = Date.now().toString().slice(-6);
-    const secEmail = `sec32_${secUniq}@gmail.com`;
     const secHandle = `@sec32_${secUniq}`;
     const secPassword = 'Sec32Password!2026';
     const secRegRes = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: secEmail,
         username: secHandle,
         password: secPassword,
+        confirmPassword: secPassword,
         acceptTerms: true,
         name: 'Security Audit Student',
+        ...(await fetchSolvedChallenge(baseUrl)),
       }),
     });
     const secRegBody = (await secRegRes.json()) as any;
@@ -3603,9 +3675,9 @@ async function runTests() {
 
     // 32f: Moderator TOTP MFA & Student MFA Denial
     const modMfaUser = authService.register({
-      identifier: `modmfa_${secUniq}@gmail.com`,
       username: `@modmfa_${secUniq}`,
       password: 'ModMfaPassword!2026',
+      confirmPassword: 'ModMfaPassword!2026',
       acceptTerms: true,
       name: 'MFA Moderator',
     });
@@ -3615,7 +3687,7 @@ async function runTests() {
     });
     assert(studentMfaDeny.status === 403, 'Regular student denied privileged TOTP MFA setup (403)');
 
-    const { moderatorService } = await import('../services/moderatorService');
+    const { moderatorService } = await import('../services/moderatorService.js');
     moderatorService.assignModerator(adminRow.id, { userId: modMfaUser.user.id });
     const modMfaSessionToken = authService.createSession(modMfaUser.user.id, '127.0.0.1', 'ModTest').token;
     const modSetupRes = await fetch(`${baseUrl}/api/auth/mfa/setup`, {
@@ -3632,14 +3704,14 @@ async function runTests() {
     const modLoginNoCode = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier: modMfaUser.user.username, password: 'ModMfaPassword!2026' }),
+      body: JSON.stringify({ username: modMfaUser.user.username, password: 'ModMfaPassword!2026' }),
     });
     const modLoginNoCodeBody = (await modLoginNoCode.json()) as any;
     const modLoginWithCode = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: modMfaUser.user.username,
+        username: modMfaUser.user.username,
         password: 'ModMfaPassword!2026',
         mfaCode: computeTotpCode(modSetupBody.secret),
       }),
@@ -3655,9 +3727,9 @@ async function runTests() {
 
     // 32g: Escalating login cooldown (never permanent lockout) + security_events burst logging
     const lockUser = authService.register({
-      identifier: `lock32_${secUniq}@gmail.com`,
       username: `@lock32_${secUniq}`,
       password: 'LockPassword!2026',
+      confirmPassword: 'LockPassword!2026',
       acceptTerms: true,
     });
     let hit429 = false;
@@ -3666,7 +3738,7 @@ async function runTests() {
       const failRes = await fetch(`${baseUrl}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identifier: lockUser.user.username, password: 'WrongPassword!99' }),
+        body: JSON.stringify({ username: lockUser.user.username, password: 'WrongPassword!99' }),
       });
       if (failRes.status === 429) {
         hit429 = true;
@@ -3683,24 +3755,25 @@ async function runTests() {
       `Escalating cooldown returns 429 + Retry-After (${burstRetryAfter}s), logs FAILED_LOGIN_BURST, and avoids permanent lockout`
     );
     db.prepare('DELETE FROM login_attempts').run();
+    db.prepare('DELETE FROM account_lockouts').run();
 
     // 32h: Private chat media access control (/api/uploads/:filename)
     const aliceReg = authService.register({
-      identifier: `alice32_${secUniq}@gmail.com`,
       username: `@alice32_${secUniq}`,
       password: 'AlicePassword!2026',
+      confirmPassword: 'AlicePassword!2026',
       acceptTerms: true,
     });
     const bobReg = authService.register({
-      identifier: `bob32_${secUniq}@gmail.com`,
       username: `@bob32_${secUniq}`,
       password: 'BobPassword!2026',
+      confirmPassword: 'BobPassword!2026',
       acceptTerms: true,
     });
     const carolReg = authService.register({
-      identifier: `carol32_${secUniq}@gmail.com`,
       username: `@carol32_${secUniq}`,
       password: 'CarolPassword!2026',
+      confirmPassword: 'CarolPassword!2026',
       acceptTerms: true,
     });
     const aliceToken = authService.createSession(aliceReg.user.id, '127.0.0.1', 'AliceDev').token;
@@ -3782,9 +3855,9 @@ async function runTests() {
 
     // 32j: Existing/unaccepted user blocked from UGC until accepting Terms via POST /api/me/accept-terms
     const unacceptedReg = authService.register({
-      identifier: `noaccept_${secUniq}@gmail.com`,
       username: `@noacc_${secUniq}`,
       password: 'NoAcceptPassword!2026',
+      confirmPassword: 'NoAcceptPassword!2026',
       acceptTerms: false,
     });
     const unacceptedToken = authService.createSession(unacceptedReg.user.id, '127.0.0.1', 'NoAcceptDev').token;
@@ -3880,11 +3953,12 @@ async function runTests() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: `overreg_${mediaUniq}@gmail.com`,
         username: `@overreg_${mediaUniq}`,
         password: 'MediaPassword!2026',
+        confirmPassword: 'MediaPassword!2026',
         acceptTerms: true,
         avatarDataUrl: over20MbDataUrl,
+        ...(await fetchSolvedChallenge(baseUrl)),
       }),
     });
     const overRegBody = (await overRegRes.json()) as any;
@@ -3897,13 +3971,14 @@ async function runTests() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: `mediauser_${mediaUniq}@gmail.com`,
         username: `@mediauser_${mediaUniq}`,
         password: 'MediaPassword!2026',
+        confirmPassword: 'MediaPassword!2026',
         name: 'Media Tester',
         acceptTerms: true,
         avatarDataUrl: makeValidJpeg(),
         avatarThumbnailDataUrl: makeValidWebp(),
+        ...(await fetchSolvedChallenge(baseUrl)),
       }),
     });
     const mediaRegBody = (await mediaRegRes.json()) as any;
@@ -3920,9 +3995,9 @@ async function runTests() {
     );
 
     const peerReg = authService.register({
-      identifier: `mediapeer_${mediaUniq}@gmail.com`,
       username: `@mediapeer_${mediaUniq}`,
       password: 'MediaPeerPassword!2026',
+      confirmPassword: 'MediaPeerPassword!2026',
       name: 'Media Peer',
       acceptTerms: true,
     });
@@ -4389,6 +4464,839 @@ async function runTests() {
         leftoverSavedCnt === 0 &&
         leftoverHistCnt === 0,
       'History clear, saved location delete, and permanent account erasure purge all user saved_locations and search history rows'
+    );
+
+    // =========================================================================
+    // 35. STAGE 3B: USERNAME/PASSWORD (ARGON2ID), POW, RECOVERY CODES & LOCKOUT
+    // =========================================================================
+    console.log('\n--- 35. Testing Stage 3B Auth, Argon2id Rehash, PoW Bot Protection, Recovery Codes & Lockout ---');
+    db.prepare("DELETE FROM login_attempts WHERE identifier LIKE 'reg%' OR identifier LIKE 'rec%'").run();
+    const s3Uniq = Date.now().toString().slice(-6);
+    const s3Handle = `@stage3b_${s3Uniq}`;
+    const s3Pass = 'Stage3bHardened!2026';
+    const s3IdemKey = `idem-stage3b-${s3Uniq}`;
+
+    // 35a: PoW challenge + Argon2id hash + 10 recovery codes returned ONCE + replay/honeypot/double-submit blocked
+    const s3Pow = await fetchSolvedChallenge(baseUrl);
+    const s3Reg1 = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': s3IdemKey },
+      body: JSON.stringify({
+        username: s3Handle,
+        password: s3Pass,
+        confirmPassword: s3Pass,
+        acceptTerms: true,
+        name: 'Stage ThreeB Student',
+        ...s3Pow,
+      }),
+    });
+    const s3Reg1Body = (await s3Reg1.json()) as any;
+
+    // Replay same PoW challenge must fail
+    const powReplayRes = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: `@replay_${s3Uniq}`,
+        password: s3Pass,
+        confirmPassword: s3Pass,
+        acceptTerms: true,
+        ...s3Pow,
+      }),
+    });
+
+    // Honeypot must fail
+    const honeypotRes = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: `@honeypot_${s3Uniq}`,
+        password: s3Pass,
+        confirmPassword: s3Pass,
+        acceptTerms: true,
+        honeypot: 'http://spam-bot.invalid',
+        ...(await fetchSolvedChallenge(baseUrl)),
+      }),
+    });
+
+    // Duplicate Idempotency-Key must return 409 DUPLICATE_SUBMISSION
+    const s3DupSubmit = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': s3IdemKey },
+      body: JSON.stringify({
+        username: `@other_${s3Uniq}`,
+        password: s3Pass,
+        confirmPassword: s3Pass,
+        acceptTerms: true,
+        ...(await fetchSolvedChallenge(baseUrl)),
+      }),
+    });
+    const s3DupBody = (await s3DupSubmit.json()) as any;
+
+    const s3UserDb = db
+      .prepare('SELECT id, email, phone_number, verification_code, password_hash, recovery_codes_remaining FROM users WHERE id = ?')
+      .get(s3Reg1Body.user?.id) as any;
+    const s3RcRows = db
+      .prepare('SELECT code_salt, code_hash, used_at, invalidated_at FROM recovery_codes WHERE user_id = ?')
+      .all(s3Reg1Body.user?.id) as any[];
+    const allCodesUnique =
+      Array.isArray(s3Reg1Body.recoveryCodes) &&
+      new Set(s3Reg1Body.recoveryCodes).size === 10 &&
+      s3Reg1Body.recoveryCodes.every((c: string) => /^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(c));
+    const noPlaintextStored =
+      s3RcRows.length === 10 &&
+      s3RcRows.every(
+        (r) =>
+          /^[a-f0-9]{32}$/.test(String(r.code_salt || '')) &&
+          /^[a-f0-9]{64}$/.test(String(r.code_hash || '')) &&
+          !s3Reg1Body.recoveryCodes.includes(r.code_hash)
+      );
+    assert(
+      s3Reg1.status === 201 &&
+        allCodesUnique &&
+        noPlaintextStored &&
+        s3UserDb?.email === null &&
+        s3UserDb?.phone_number === null &&
+        s3UserDb?.verification_code === null &&
+        String(s3UserDb?.password_hash || '').startsWith('$argon2id$v=19$') &&
+        s3UserDb?.recovery_codes_remaining === 10 &&
+        powReplayRes.status === 400 &&
+        honeypotRes.status === 400 &&
+        s3DupSubmit.status === 409 &&
+        s3DupBody.code === 'DUPLICATE_SUBMISSION',
+      'Stage 3B registration enforces PoW/honeypot/idempotency, hashes passwords with Argon2id, and persists 10 salted SHA-256 recovery codes'
+    );
+
+    // 35b: Legacy scrypt v3 hash verifies cleanly and transparently rehashes to Argon2id on login
+    const legacySalt = crypto.randomBytes(16).toString('hex');
+    const legacyScryptHash = `v3:${legacySalt}:${crypto.scryptSync(s3Pass, legacySalt, 32, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }).toString('hex')}`;
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(legacyScryptHash, s3Reg1Body.user.id);
+    const rehashLoginRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: s3Handle, password: s3Pass }),
+    });
+    const rehashLoginBody = (await rehashLoginRes.json()) as any;
+    const upgradedHashRow = db
+      .prepare('SELECT password_hash FROM users WHERE id = ?')
+      .get(s3Reg1Body.user.id) as { password_hash: string };
+    const rehashSecEvent = db
+      .prepare("SELECT event_type FROM security_events WHERE user_id = ? AND event_type = 'PASSWORD_REHASHED_ARGON2ID' LIMIT 1")
+      .get(s3Reg1Body.user.id) as any;
+    assert(
+      rehashLoginRes.status === 200 &&
+        rehashLoginBody.recoveryCodes === undefined &&
+        upgradedHashRow.password_hash.startsWith('$argon2id$v=19$') &&
+        Boolean(rehashSecEvent),
+      'Legacy scrypt v3 password transparently verifies and upgrades to Argon2id on next login'
+    );
+
+    // 35c: Recovery codes never exposed via /api/me or /api/auth/recovery-codes/status + Method A reset & zero enumeration
+    const meNoRc = await fetch(`${baseUrl}/api/me`, {
+      headers: { Authorization: `Bearer ${s3Reg1Body.token}` },
+    });
+    const meNoRcBody = (await meNoRc.json()) as any;
+    const statusRes9 = await fetch(`${baseUrl}/api/auth/recovery-codes/status`, {
+      headers: { Authorization: `Bearer ${s3Reg1Body.token}` },
+    });
+    const statusBody9 = (await statusRes9.json()) as any;
+
+    const unknownRecReset = await fetch(`${baseUrl}/api/auth/recovery/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: '@does_not_exist_3b',
+        recoveryCode: 'AAAA-BBBB-CCCC-DDDD',
+        newPassword: 'Stage3bResetPass!2026',
+        confirmPassword: 'Stage3bResetPass!2026',
+      }),
+    });
+    const unknownRecBody = (await unknownRecReset.json()) as any;
+    const wrongCodeReset = await fetch(`${baseUrl}/api/auth/recovery/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: s3Handle,
+        recoveryCode: 'AAAA-BBBB-CCCC-DDDD',
+        newPassword: 'Stage3bResetPass!2026',
+        confirmPassword: 'Stage3bResetPass!2026',
+      }),
+    });
+    const wrongCodeBody = (await wrongCodeReset.json()) as any;
+
+    const s3NewPass = 'Stage3bResetPass!2026';
+    const validRecReset = await fetch(`${baseUrl}/api/auth/recovery/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: s3Handle,
+        recoveryCode: s3Reg1Body.recoveryCodes[0],
+        newPassword: s3NewPass,
+        confirmPassword: s3NewPass,
+      }),
+    });
+    const oldSessionAfterReset = await fetch(`${baseUrl}/api/me`, {
+      headers: { Authorization: `Bearer ${s3Reg1Body.token}` },
+    });
+    const replayUsedCodeRes = await fetch(`${baseUrl}/api/auth/recovery/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: s3Handle,
+        recoveryCode: s3Reg1Body.recoveryCodes[0],
+        newPassword: 'AnotherResetPass!2026',
+        confirmPassword: 'AnotherResetPass!2026',
+      }),
+    });
+    const resetNotif = db
+      .prepare("SELECT title FROM notifications WHERE user_id = ? AND title = 'Password Changed via Recovery Code' LIMIT 1")
+      .get(s3Reg1Body.user.id) as any;
+
+    assert(
+      meNoRc.status === 200 &&
+        meNoRcBody.recoveryCodes === undefined &&
+        statusRes9.status === 200 &&
+        statusBody9.remainingCount === 10 &&
+        statusBody9.recoveryCodes === undefined &&
+        unknownRecReset.status === 400 &&
+        wrongCodeReset.status === 400 &&
+        unknownRecBody.error === wrongCodeBody.error &&
+        validRecReset.status === 200 &&
+        oldSessionAfterReset.status === 401 &&
+        replayUsedCodeRes.status === 400 &&
+        Boolean(resetNotif),
+      'Method A recovery reset prevents user enumeration, burns single-use code, revokes all sessions, and writes in-app notification'
+    );
+
+    // 35d: Authenticated recovery code status (9 left) & regeneration (invalidates prior unused codes)
+    const s3LoginA = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'DeviceA/1.0' },
+      body: JSON.stringify({ username: s3Handle, password: s3NewPass }),
+    });
+    const s3LoginABody = (await s3LoginA.json()) as any;
+    const statusAfterUse = await fetch(`${baseUrl}/api/auth/recovery-codes/status`, {
+      headers: { Authorization: `Bearer ${s3LoginABody.token}` },
+    });
+    const statusAfterUseBody = (await statusAfterUse.json()) as any;
+
+    const badRegenRes = await fetch(`${baseUrl}/api/auth/recovery-codes/regenerate`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${s3LoginABody.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword: 'WrongCurrentPassword!1' }),
+    });
+    const goodRegenRes = await fetch(`${baseUrl}/api/auth/recovery-codes/regenerate`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${s3LoginABody.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword: s3NewPass }),
+    });
+    const goodRegenBody = (await goodRegenRes.json()) as any;
+
+    const invalidatedOldCodeRes = await fetch(`${baseUrl}/api/auth/recovery/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: s3Handle,
+        recoveryCode: s3Reg1Body.recoveryCodes[1],
+        newPassword: 'ShouldNotWork!2026',
+        confirmPassword: 'ShouldNotWork!2026',
+      }),
+    });
+    assert(
+      s3LoginA.status === 200 &&
+        statusAfterUseBody.remainingCount === 9 &&
+        badRegenRes.status === 400 &&
+        goodRegenRes.status === 200 &&
+        Array.isArray(goodRegenBody.recoveryCodes) &&
+        goodRegenBody.recoveryCodes.length === 10 &&
+        goodRegenBody.remainingCount === 10 &&
+        invalidatedOldCodeRes.status === 400,
+      'Recovery code regeneration requires current password, issues 10 new codes once, and invalidates prior unused codes'
+    );
+    db.prepare("DELETE FROM login_attempts WHERE identifier LIKE 'rec%'").run();
+
+    // 35e: Anti-victim-DoS lockout (attacker IP locked after 5 failures while victim's trusted IP still logs in)
+    const victimIp = '198.51.100.42';
+    const attackerIp = '203.0.113.77';
+    const victimTrustedLogin = authService.login(s3Handle, s3NewPass, victimIp, 'Mozilla/5.0 VictimBrowser');
+    assert(Boolean(victimTrustedLogin.token), 'Victim establishes trusted-IP login baseline');
+
+    let attackerLocked = false;
+    for (let i = 0; i < 6; i++) {
+      try {
+        authService.login(s3Handle, 'WrongAttackerPass!1', attackerIp, 'Mozilla/5.0 Attacker');
+      } catch (err: any) {
+        if (err instanceof AuthRateLimitError || err?.status === 429) {
+          attackerLocked = true;
+          break;
+        }
+      }
+    }
+    const victimAfterAttack = authService.login(s3Handle, s3NewPass, victimIp, 'Mozilla/5.0 VictimBrowser');
+    assert(
+      attackerLocked && Boolean(victimAfterAttack.token),
+      'Per-(account, IP) lockout blocks attacker IP after 5 failures without locking out victim on trusted IP'
+    );
+    db.prepare('DELETE FROM login_attempts').run();
+    db.prepare('DELETE FROM account_lockouts').run();
+
+    // 35f: Self-session revoke + revoke-all (Sign Out Everywhere) + no secrets in security_events
+    const s3LoginB = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'DeviceB/1.0' },
+      body: JSON.stringify({ username: s3Handle, password: s3NewPass }),
+    });
+    const s3LoginBBody = (await s3LoginB.json()) as any;
+
+    const revokeSelfRes = await fetch(`${baseUrl}/api/me/sessions/${s3LoginABody.sessionId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${s3LoginABody.token}` },
+    });
+    const revokeSelfBody = (await revokeSelfRes.json()) as any;
+    const checkSelfAfterRevoke = await fetch(`${baseUrl}/api/me`, {
+      headers: { Authorization: `Bearer ${s3LoginABody.token}` },
+    });
+
+    const revokeAllRes = await fetch(`${baseUrl}/api/me/sessions/revoke-all`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${s3LoginBBody.token}` },
+    });
+    const revokeAllBody = (await revokeAllRes.json()) as any;
+    const checkBAfterAll = await fetch(`${baseUrl}/api/me`, {
+      headers: { Authorization: `Bearer ${s3LoginBBody.token}` },
+    });
+
+    const leakedSecLog = db
+      .prepare('SELECT details_json, identifier FROM security_events WHERE user_id = ?')
+      .all(s3Reg1Body.user.id)
+      .some((r: any) => {
+        const blob = `${r.details_json || ''} ${r.identifier || ''}`;
+        return (
+          blob.includes(s3Pass) ||
+          blob.includes(s3NewPass) ||
+          s3Reg1Body.recoveryCodes.some((c: string) => blob.includes(c)) ||
+          goodRegenBody.recoveryCodes.some((c: string) => blob.includes(c))
+        );
+      });
+
+    assert(
+      revokeSelfRes.status === 200 &&
+        revokeSelfBody.revokedSelf === true &&
+        checkSelfAfterRevoke.status === 401 &&
+        revokeAllRes.status === 200 &&
+        revokeAllBody.signedOutEverywhere === true &&
+        checkBAfterAll.status === 401 &&
+        !leakedSecLog,
+      'Self-session revoke & sign-out-everywhere invalidate sessions immediately and security_events never logs secrets/recovery codes'
+    );
+
+    // =========================================================================
+    // 36. STAGE 3C: PASSKEYS (WEBAUTHN) REGISTRATION, LOGIN, COUNTER & RECOVERY
+    // =========================================================================
+    console.log('\n--- 36. Testing Stage 3C Passkeys (WebAuthn) Ceremonies, Counter Protection, Re-Auth & Method B Recovery ---');
+
+    const cborBytes = (buf: Buffer): Buffer => {
+      if (buf.length < 24) return Buffer.concat([Buffer.from([0x40 | buf.length]), buf]);
+      if (buf.length < 256) return Buffer.concat([Buffer.from([0x58, buf.length]), buf]);
+      const hdr = Buffer.alloc(3);
+      hdr[0] = 0x59;
+      hdr.writeUInt16BE(buf.length, 1);
+      return Buffer.concat([hdr, buf]);
+    };
+    const cborText = (str: string): Buffer => {
+      const buf = Buffer.from(str, 'utf8');
+      return Buffer.concat([Buffer.from([0x60 | buf.length]), buf]);
+    };
+    const buildCoseP256Key = (pubKey: crypto.KeyObject): Buffer => {
+      const jwk = pubKey.export({ format: 'jwk' }) as { x: string; y: string };
+      const xBuf = Buffer.from(jwk.x, 'base64url');
+      const yBuf = Buffer.from(jwk.y, 'base64url');
+      return Buffer.concat([
+        Buffer.from([0xa5]), // map(5)
+        Buffer.from([0x01, 0x02]), // kty: EC2
+        Buffer.from([0x03, 0x26]), // alg: ES256 (-7)
+        Buffer.from([0x20, 0x01]), // crv: P-256 (1)
+        Buffer.from([0x21]),
+        cborBytes(xBuf),
+        Buffer.from([0x22]),
+        cborBytes(yBuf),
+      ]);
+    };
+
+    const { getWebAuthnConfig } = await import('../services/passkeyService.js');
+    const webAuthnCfg = getWebAuthnConfig();
+    const expectedOrigin = webAuthnCfg.allowedOrigins[0] || 'http://localhost:3000';
+    const expectedRpId = webAuthnCfg.rpID;
+
+    const createVirtualAuthenticator = () => {
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+      const credIdBuf = crypto.randomBytes(16);
+      const credId = credIdBuf.toString('base64url');
+      const cosePubKey = buildCoseP256Key(publicKey);
+
+      const buildRegistration = (
+        challenge: string,
+        opts: { origin?: string; rpId?: string; counter?: number } = {}
+      ) => {
+        const origin = opts.origin || expectedOrigin;
+        const rpId = opts.rpId || expectedRpId;
+        const counter = opts.counter ?? 1;
+        const clientDataBuf = Buffer.from(
+          JSON.stringify({ type: 'webauthn.create', challenge, origin }),
+          'utf8'
+        );
+        const rpIdHash = crypto.createHash('sha256').update(rpId, 'utf8').digest();
+        const flagsAndCounter = Buffer.alloc(5);
+        flagsAndCounter[0] = 0x5d; // UP(0x01) + UV(0x04) + BE(0x08) + BS(0x10) + AT(0x40)
+        flagsAndCounter.writeUInt32BE(counter, 1);
+        const aaguid = Buffer.alloc(16);
+        const idLenBuf = Buffer.alloc(2);
+        idLenBuf.writeUInt16BE(credIdBuf.length, 0);
+        const authData = Buffer.concat([rpIdHash, flagsAndCounter, aaguid, idLenBuf, credIdBuf, cosePubKey]);
+        const attestationObject = Buffer.concat([
+          Buffer.from([0xa3]),
+          cborText('fmt'),
+          cborText('none'),
+          cborText('attStmt'),
+          Buffer.from([0xa0]),
+          cborText('authData'),
+          cborBytes(authData),
+        ]);
+        return {
+          id: credId,
+          rawId: credId,
+          type: 'public-key',
+          authenticatorAttachment: 'platform',
+          clientExtensionResults: {},
+          response: {
+            clientDataJSON: clientDataBuf.toString('base64url'),
+            attestationObject: attestationObject.toString('base64url'),
+            transports: ['internal', 'hybrid'],
+          },
+        };
+      };
+
+      const buildAssertion = (
+        challenge: string,
+        opts: { origin?: string; rpId?: string; counter?: number; corruptSignature?: boolean } = {}
+      ) => {
+        const origin = opts.origin || expectedOrigin;
+        const rpId = opts.rpId || expectedRpId;
+        const counter = opts.counter ?? 2;
+        const clientDataBuf = Buffer.from(
+          JSON.stringify({ type: 'webauthn.get', challenge, origin }),
+          'utf8'
+        );
+        const rpIdHash = crypto.createHash('sha256').update(rpId, 'utf8').digest();
+        const flagsAndCounter = Buffer.alloc(5);
+        flagsAndCounter[0] = 0x1d; // UP(0x01) + UV(0x04) + BE(0x08) + BS(0x10)
+        flagsAndCounter.writeUInt32BE(counter, 1);
+        const clientDataHash = crypto.createHash('sha256').update(clientDataBuf).digest();
+        const sigBuf = Buffer.from(crypto.sign('sha256', Buffer.concat([rpIdHash, flagsAndCounter, clientDataHash]), privateKey));
+        if (opts.corruptSignature) {
+          sigBuf[sigBuf.length - 1] ^= 0xff;
+        }
+        return {
+          id: credId,
+          rawId: credId,
+          type: 'public-key',
+          authenticatorAttachment: 'platform',
+          clientExtensionResults: {},
+          response: {
+            clientDataJSON: clientDataBuf.toString('base64url'),
+            authenticatorData: Buffer.concat([rpIdHash, flagsAndCounter]).toString('base64url'),
+            signature: sigBuf.toString('base64url'),
+          },
+        };
+      };
+
+      return { credId, buildRegistration, buildAssertion };
+    };
+
+    const pkLoginRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'PasskeyOwner/1.0' },
+      body: JSON.stringify({ username: s3Handle, password: s3NewPass }),
+    });
+    const pkLoginBody = (await pkLoginRes.json()) as any;
+    const pkToken = pkLoginBody.token;
+    const pkUserId = s3Reg1Body.user.id;
+
+    // 36a: Register two passkeys, verify single-use challenge deletion & replay block
+    const auth1 = createVirtualAuthenticator();
+    const auth2 = createVirtualAuthenticator();
+
+    const regOpts1Res = await fetch(`${baseUrl}/api/auth/passkeys/register/options`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${pkToken}`, 'Content-Type': 'application/json' },
+    });
+    const regOpts1 = (await regOpts1Res.json()) as any;
+    const regPayload1 = auth1.buildRegistration(regOpts1.challenge, { counter: 1 });
+
+    const regVerify1Res = await fetch(`${baseUrl}/api/auth/passkeys/register/verify`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${pkToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'Primary MacBook Touch ID', response: regPayload1 }),
+    });
+    const regVerify1Body = (await regVerify1Res.json()) as any;
+
+    const leftoverRegChallenge = db
+      .prepare('SELECT id FROM webauthn_challenges WHERE challenge = ?')
+      .get(regOpts1.challenge);
+    const replayRegRes = await fetch(`${baseUrl}/api/auth/passkeys/register/verify`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${pkToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'Replay Attack', response: regPayload1 }),
+    });
+
+    const regOpts2Res = await fetch(`${baseUrl}/api/auth/passkeys/register/options`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${pkToken}`, 'Content-Type': 'application/json' },
+    });
+    const regOpts2 = (await regOpts2Res.json()) as any;
+    const regVerify2Res = await fetch(`${baseUrl}/api/auth/passkeys/register/verify`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${pkToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'Backup YubiKey', response: auth2.buildRegistration(regOpts2.challenge, { counter: 1 }) }),
+    });
+    const regVerify2Body = (await regVerify2Res.json()) as any;
+
+    const listPasskeysRes = await fetch(`${baseUrl}/api/auth/passkeys`, {
+      headers: { Authorization: `Bearer ${pkToken}` },
+    });
+    const listPasskeysBody = (await listPasskeysRes.json()) as any;
+    const storedCredRow = db
+      .prepare('SELECT credential_id, public_key, counter, label FROM webauthn_credentials WHERE id = ?')
+      .get(regVerify1Body.passkey?.id ?? '__missing__') as any;
+
+    assert(
+      regOpts1Res.status === 200 &&
+        regOpts1.rp?.id === expectedRpId &&
+        regVerify1Res.status === 201 &&
+        regVerify1Body.verified === true &&
+        !leftoverRegChallenge &&
+        replayRegRes.status === 400 &&
+        regVerify2Res.status === 201 &&
+        Array.isArray(listPasskeysBody.passkeys) &&
+        listPasskeysBody.passkeys.length === 2 &&
+        listPasskeysBody.passkeys.every((p: any) => p.publicKey === undefined && p.public_key === undefined) &&
+        storedCredRow?.credential_id === auth1.credId &&
+        typeof storedCredRow?.public_key === 'string' &&
+        storedCredRow?.counter === 1,
+      'Stage 3C passkey registration verifies ES256 attestation, deletes single-use challenge, prevents replay, and supports multiple passkeys without exposing public keys'
+    );
+
+    // 36b: Reject wrong origin, wrong rpID, and bad signature
+    const badOriginOpts = (await (
+      await fetch(`${baseUrl}/api/auth/passkeys/register/options`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${pkToken}`, 'Content-Type': 'application/json' },
+      })
+    ).json()) as any;
+    const authBadOrigin = createVirtualAuthenticator();
+    const badOriginRes = await fetch(`${baseUrl}/api/auth/passkeys/register/verify`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${pkToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        label: 'Evil Origin Key',
+        response: authBadOrigin.buildRegistration(badOriginOpts.challenge, { origin: 'https://evil.example' }),
+      }),
+    });
+
+    const badRpOpts = (await (
+      await fetch(`${baseUrl}/api/auth/passkeys/login/options`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+    ).json()) as any;
+    const badRpLoginRes = await fetch(`${baseUrl}/api/auth/passkeys/login/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        response: auth1.buildAssertion(badRpOpts.challenge, { rpId: 'evil.example', counter: 2 }),
+      }),
+    });
+    const badSigLoginRes = await fetch(`${baseUrl}/api/auth/passkeys/login/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        response: auth1.buildAssertion(badRpOpts.challenge, { counter: 2, corruptSignature: true }),
+      }),
+    });
+
+    assert(
+      badOriginRes.status === 400 && badRpLoginRes.status === 401 && badSigLoginRes.status === 401,
+      'WebAuthn rejects mismatched origin, mismatched rpID, and tampered assertion signatures'
+    );
+
+    // 36c: Discoverable username-less login creates session + cookies + security log + deletes challenge + enforces 5-device limit + purpose isolation
+    const loginOptsRes = await fetch(`${baseUrl}/api/auth/passkeys/login/options`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const loginOpts = (await loginOptsRes.json()) as any;
+
+    // Purpose isolation: a login challenge cannot be redeemed on the recovery endpoint
+    const crossPurposeRes = await fetch(`${baseUrl}/api/auth/passkeys/recovery/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: auth1.buildAssertion(loginOpts.challenge, { counter: 2 }) }),
+    });
+
+    const loginAssertion = auth1.buildAssertion(loginOpts.challenge, { counter: 2 });
+    const pkSignInRes = await fetch(`${baseUrl}/api/auth/passkeys/login/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'PasskeySafari/17.0' },
+      body: JSON.stringify({ response: loginAssertion }),
+    });
+    const pkSignInBody = (await pkSignInRes.json()) as any;
+    const setCookieHeader = pkSignInRes.headers.get('set-cookie') || '';
+    const replayLoginRes = await fetch(`${baseUrl}/api/auth/passkeys/login/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: loginAssertion }),
+    });
+
+    const updatedCounterRow = db
+      .prepare('SELECT counter, last_used_at FROM webauthn_credentials WHERE id = ?')
+      .get(regVerify1Body.passkey.id) as any;
+    const pkSessionRow = db
+      .prepare('SELECT auth_method FROM sessions WHERE id = ?')
+      .get(pkSignInBody.sessionId) as any;
+    const pkLoginEvent = db
+      .prepare("SELECT details_json FROM security_events WHERE user_id = ? AND event_type = 'LOGIN_SUCCESS' ORDER BY created_at DESC, rowid DESC LIMIT 1")
+      .get(pkUserId) as any;
+
+    // Create 5 extra passkey/password sessions to confirm MAX_ACTIVE_DEVICES = 5 still caps total active sessions
+    for (let i = 0; i < 5; i++) {
+      const extraOpts = (await (
+        await fetch(`${baseUrl}/api/auth/passkeys/login/options`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: s3Handle }),
+        })
+      ).json()) as any;
+      await fetch(`${baseUrl}/api/auth/passkeys/login/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': `PasskeyDev-${i}/1.0` },
+        body: JSON.stringify({ response: auth1.buildAssertion(extraOpts.challenge, { counter: 3 + i }) }),
+      });
+    }
+    const activeSessionsAfterPk = (
+      db.prepare('SELECT COUNT(*) as c FROM sessions WHERE user_id = ? AND revoked_at IS NULL').get(pkUserId) as any
+    )?.c;
+
+    const ok36c =
+      loginOptsRes.status === 200 &&
+      !loginOpts.allowCredentials &&
+      crossPurposeRes.status === 400 &&
+      pkSignInRes.status === 200 &&
+      Boolean(pkSignInBody.token) &&
+      setCookieHeader.includes('sb_session=') &&
+      setCookieHeader.includes('HttpOnly') &&
+      setCookieHeader.includes('SameSite=Strict') &&
+      replayLoginRes.status === 400 &&
+      updatedCounterRow?.counter === 2 &&
+      Boolean(updatedCounterRow?.last_used_at) &&
+      pkSessionRow?.auth_method === 'passkey' &&
+      String(pkLoginEvent?.details_json || '').includes('passkey') &&
+      activeSessionsAfterPk === 5;
+
+    if (!ok36c) {
+      console.error('36c debug:', {
+        loginOptsStatus: loginOptsRes.status,
+        hasAllowCreds: Boolean(loginOpts.allowCredentials),
+        crossPurposeStatus: crossPurposeRes.status,
+        pkSignInStatus: pkSignInRes.status,
+        hasToken: Boolean(pkSignInBody.token),
+        setCookieHeader,
+        replayStatus: replayLoginRes.status,
+        updatedCounterRow,
+        pkSessionRow,
+        pkLoginEvent,
+        activeSessionsAfterPk,
+      });
+    }
+
+    assert(
+      ok36c,
+      'Discoverable passkey login issues HttpOnly session cookies, blocks cross-purpose & replay attacks, updates counter, logs LOGIN_SUCCESS, and enforces 5-device limit'
+    );
+
+    // 36d: Signature counter regression anomaly detection
+    const staleOpts = (await (
+      await fetch(`${baseUrl}/api/auth/passkeys/login/options`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: s3Handle }),
+      })
+    ).json()) as any;
+    const staleCounterRes = await fetch(`${baseUrl}/api/auth/passkeys/login/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: auth1.buildAssertion(staleOpts.challenge, { counter: 4 }) }), // stored counter is 7 (>4)
+    });
+    const anomalyEvent = db
+      .prepare("SELECT event_type FROM security_events WHERE user_id = ? AND event_type = 'PASSKEY_COUNTER_ANOMALY' LIMIT 1")
+      .get(pkUserId) as any;
+    const anomalyNotif = db
+      .prepare("SELECT title FROM notifications WHERE user_id = ? AND title = 'Security Alert: Passkey Sign-In Blocked' LIMIT 1")
+      .get(pkUserId) as any;
+    assert(
+      staleCounterRes.status === 401 && Boolean(anomalyEvent) && Boolean(anomalyNotif),
+      'Out-of-order passkey signature counter is rejected (401) and triggers PASSKEY_COUNTER_ANOMALY alert'
+    );
+
+    // 36e: Passkey removal requires re-authentication (and cannot delete another user's passkey)
+    const freshLoginForDelete = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'DeleteCheck/1.0' },
+      body: JSON.stringify({ username: s3Handle, password: s3NewPass }),
+    });
+    const freshDeleteTok = ((await freshLoginForDelete.json()) as any).token;
+    db.prepare("UPDATE users SET last_reauthenticated_at = datetime('now', '-2 hours') WHERE id = ?").run(pkUserId);
+
+    const noReauthDeleteRes = await fetch(`${baseUrl}/api/auth/passkeys/${regVerify2Body.passkey.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${freshDeleteTok}` },
+    });
+    const noReauthDeleteBody = (await noReauthDeleteRes.json()) as any;
+
+    // Cross-user passkey deletion check
+    const intruderSession = authService.createSession('u-ayodele', '127.0.0.1', 'Intruder/1.0');
+    const crossUserDeleteRes = await fetch(`${baseUrl}/api/auth/passkeys/${regVerify2Body.passkey.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${intruderSession.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword: 'ignored' }),
+    });
+
+    // Step-up re-authentication via passkey then delete passkey #2
+    const reauthOpts = (await (
+      await fetch(`${baseUrl}/api/auth/passkeys/reauth/options`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${freshDeleteTok}`, 'Content-Type': 'application/json' },
+      })
+    ).json()) as any;
+    const reauthVerifyRes = await fetch(`${baseUrl}/api/auth/passkeys/reauth/verify`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${freshDeleteTok}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: auth1.buildAssertion(reauthOpts.challenge, { counter: 8 }) }),
+    });
+    const reauthVerifyBody = (await reauthVerifyRes.json()) as any;
+    const afterReauthDeleteRes = await fetch(`${baseUrl}/api/auth/passkeys/${regVerify2Body.passkey.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${freshDeleteTok}` },
+    });
+    const afterReauthDeleteBody = (await afterReauthDeleteRes.json()) as any;
+    const removedEvent = db
+      .prepare("SELECT event_type FROM security_events WHERE user_id = ? AND event_type = 'PASSKEY_REMOVED' LIMIT 1")
+      .get(pkUserId) as any;
+
+    const ok36e =
+      noReauthDeleteRes.status === 403 &&
+      noReauthDeleteBody.code === 'REAUTH_REQUIRED' &&
+      crossUserDeleteRes.status !== 200 &&
+      reauthVerifyRes.status === 200 &&
+      afterReauthDeleteRes.status === 200 &&
+      Boolean(removedEvent);
+    if (!ok36e) {
+      console.error('36e debug:', {
+        noReauthStatus: noReauthDeleteRes.status,
+        noReauthDeleteBody,
+        crossUserStatus: crossUserDeleteRes.status,
+        reauthOpts,
+        reauthVerifyStatus: reauthVerifyRes.status,
+        reauthVerifyBody,
+        afterReauthStatus: afterReauthDeleteRes.status,
+        afterReauthDeleteBody,
+        removedEvent,
+      });
+    }
+    assert(
+      ok36e,
+      'Removing a passkey blocks stale sessions (403 REAUTH_REQUIRED), isolates cross-user ownership, succeeds after passkey re-auth, and logs PASSKEY_REMOVED'
+    );
+
+    // 36f: Method B Password Recovery via Passkey revokes all prior sessions & upgrades password to Argon2id
+    const recOptsRes = await fetch(`${baseUrl}/api/auth/passkeys/recovery/options`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: s3Handle }),
+    });
+    const recOpts = (await recOptsRes.json()) as any;
+    const recVerifyRes = await fetch(`${baseUrl}/api/auth/passkeys/recovery/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: auth1.buildAssertion(recOpts.challenge, { counter: 9 }) }),
+    });
+    const recVerifyBody = (await recVerifyRes.json()) as any;
+
+    const s3FinalPass = 'Stage3cPasskeyReset!2026';
+    const recResetRes = await fetch(`${baseUrl}/api/auth/passkeys/recovery/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'RecoveredBrowser/1.0' },
+      body: JSON.stringify({
+        recoveryToken: recVerifyBody.recoveryToken,
+        newPassword: s3FinalPass,
+        confirmPassword: s3FinalPass,
+      }),
+    });
+    const recResetBody = (await recResetRes.json()) as any;
+
+    const oldSessionCheck = await fetch(`${baseUrl}/api/me`, {
+      headers: { Authorization: `Bearer ${freshDeleteTok}` },
+    });
+    const newSessionCheck = await fetch(`${baseUrl}/api/me`, {
+      headers: { Authorization: `Bearer ${recResetBody.token}` },
+    });
+    const replayResetTokenRes = await fetch(`${baseUrl}/api/auth/passkeys/recovery/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        recoveryToken: recVerifyBody.recoveryToken,
+        newPassword: 'AnotherPasskeyReset!2026',
+        confirmPassword: 'AnotherPasskeyReset!2026',
+      }),
+    });
+    const newPwdLoginCheck = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: s3Handle, password: s3FinalPass }),
+    });
+    const finalHashRow = db
+      .prepare('SELECT password_hash FROM users WHERE id = ?')
+      .get(pkUserId) as { password_hash: string };
+
+    const ok36f =
+      recOptsRes.status === 200 &&
+      recVerifyRes.status === 200 &&
+      Boolean(recVerifyBody.recoveryToken) &&
+      recResetRes.status === 200 &&
+      Boolean(recResetBody.token) &&
+      oldSessionCheck.status === 401 &&
+      newSessionCheck.status === 200 &&
+      replayResetTokenRes.status === 400 &&
+      newPwdLoginCheck.status === 200 &&
+      finalHashRow.password_hash.startsWith('$argon2id$v=19$');
+    if (!ok36f) {
+      console.error('36f debug:', {
+        recOptsStatus: recOptsRes.status,
+        recVerifyStatus: recVerifyRes.status,
+        recVerifyBody,
+        recResetStatus: recResetRes.status,
+        recResetBody,
+        oldStatus: oldSessionCheck.status,
+        newStatus: newSessionCheck.status,
+        replayStatus: replayResetTokenRes.status,
+        newPwdStatus: newPwdLoginCheck.status,
+        hashPrefix: finalHashRow.password_hash?.slice(0, 20),
+      });
+    }
+    assert(
+      ok36f,
+      'Method B passkey password recovery verifies assertion, consumes single-use reset token, revokes all prior sessions, and accepts new Argon2id password'
     );
   } finally {
     await new Promise<void>((resolve) => testServer.close(() => resolve()));

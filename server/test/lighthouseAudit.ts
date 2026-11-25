@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { execFileSync, spawn } from 'node:child_process';
 
@@ -336,17 +337,42 @@ async function main() {
 
     // Register a student user to inspect authenticated private endpoint headers
     const uniq = Date.now();
+    const chalRes = await rawRequest(port, '/api/auth/challenge');
+    const chalJson = JSON.parse(chalRes.decodedText) as { challengeId: string; nonce: string; difficulty: number };
+    const countLeadingZeroBits = (buf: Buffer): number => {
+      let bits = 0;
+      for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === 0) bits += 8;
+        else {
+          bits += Math.clz32(buf[i]) - 24;
+          break;
+        }
+      }
+      return bits;
+    };
+    let powSol = '0';
+    for (let c = 0; ; c++) {
+      const s = c.toString(36);
+      const d = crypto.createHash('sha256').update(`${chalJson.nonce}:${s}`, 'utf8').digest();
+      if (countLeadingZeroBits(d) >= chalJson.difficulty) {
+        powSol = s;
+        break;
+      }
+    }
     const regRes = await rawRequest(port, '/api/auth/register', {
       method: 'POST',
       body: {
         name: 'Audit Student',
         username: `@audit_${uniq}`,
-        identifier: `audit_${uniq}@gmail.com`,
         department: 'Computer Science',
         level: '300L',
         hallOfResidence: 'Abiola Hall',
         password: 'StrongAuditPassword!99',
+        confirmPassword: 'StrongAuditPassword!99',
         acceptTerms: true,
+        botChallengeId: chalJson.challengeId,
+        botChallengeNonce: chalJson.nonce,
+        botChallengeSolution: powSol,
       },
     });
     if (regRes.status !== 201) {

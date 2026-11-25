@@ -1,10 +1,10 @@
-import { db } from '../db/database';
-import { cache } from '../utils/cache';
-import { presenceService } from './presenceService';
-import { fileService, PROTECTION_MODE_MAX_UPLOAD_BYTES } from './fileService';
-import { deletionService } from './deletionService';
+import { db } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { presenceService } from './presenceService.js';
+import { fileService, PROTECTION_MODE_MAX_UPLOAD_BYTES } from './fileService.js';
+import { deletionService } from './deletionService.js';
 
-import { escapeLikePattern } from '../utils/security';
+import { escapeLikePattern } from '../utils/security.js';
 
 export interface UserProfileRow {
   id: string;

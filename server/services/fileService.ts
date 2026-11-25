@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { db, withReadConnection, CACHE_DIR, TMP_DIR } from '../db/database';
-import { cache } from '../utils/cache';
-import { escapeLikePattern, sanitizeSafeUrl } from '../utils/security';
+import { db, DB_DIR, withReadConnection, CACHE_DIR, TMP_DIR } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { escapeLikePattern, sanitizeSafeUrl } from '../utils/security.js';
 
 const EPHEMERAL_MEDIA_TTL_MS = 72 * 60 * 60 * 1000;
 const SAFE_UPLOAD_FILENAME_REGEX = /^[a-zA-Z0-9_-]+\.(jpg|png|webp|avif)$/;
@@ -133,7 +133,7 @@ export interface FileServePolicy {
 export function getUploadsDir(): string {
   const dir = process.env.SCHOOLBACKDOOR_UPLOADS_DIR
     ? path.resolve(process.env.SCHOOLBACKDOOR_UPLOADS_DIR)
-    : path.resolve(process.cwd(), 'data', 'uploads');
+    : path.join(DB_DIR, 'uploads');
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }

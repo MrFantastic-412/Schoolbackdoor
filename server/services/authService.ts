@@ -1,34 +1,47 @@
 import crypto from 'node:crypto';
-import { db, runInTransaction } from '../db/database';
-import { AuthenticatedUser, parseTimestampMs } from '../middleware/auth';
-import { generateBase32Secret, computeTotpCode, verifyTotpToken } from '../utils/totp';
-import { fileService, PROTECTION_MODE_MAX_UPLOAD_BYTES } from './fileService';
-import { deletionService } from './deletionService';
+import { db, runInTransaction } from '../db/database.js';
+import { AuthenticatedUser, parseTimestampMs } from '../middleware/auth.js';
+import { generateBase32Secret, computeTotpCode, verifyTotpToken } from '../utils/totp.js';
+import { fileService, PROTECTION_MODE_MAX_UPLOAD_BYTES } from './fileService.js';
+import { deletionService } from './deletionService.js';
 import {
   hashPassword,
   verifyPassword,
   needsPasswordRehash,
+  equalizePasswordTiming,
   hashSessionToken,
   validateStrongPassword,
   sanitizeInputText,
-  generateNumericOtp,
+  generateRecoveryCodes,
+  normalizeRecoveryCode,
+  hashRecoveryCode,
+  verifyRecoveryCodeHash,
+  verifyPowSolution,
   checkRateLimit,
   recordRateLimitEvent,
   CURRENT_TERMS_VERSION,
   SESSION_POLICY,
   parseDeviceFromUserAgent,
   recordSecurityEvent,
-} from '../utils/security';
+  computeProgressiveDelayMs,
+} from '../utils/security.js';
 
 export { hashPassword, verifyPassword };
 
 const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes base window
 const ESCALATION_LOOKBACK_MS = 24 * 60 * 60 * 1000; // 24 hours escalation counter
 const MAX_FAILED_ATTEMPTS = 5;
+const MAX_IP_FAILED_ATTEMPTS = 15;
 const MAX_REGISTER_ATTEMPTS_PER_HOUR = 10;
-const MAX_RECOVERY_ATTEMPTS_PER_HOUR = 6;
-const MAX_RESET_FAILURES = 5;
-const SCRYPT_EQUALIZER_OPTS = { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 } as const;
+const MAX_CHALLENGE_ISSUES_PER_HOUR = 30;
+const MAX_RECOVERY_ATTEMPTS_PER_15M = 5;
+const MAX_RECOVERY_IP_ATTEMPTS_PER_15M = 10;
+const BOT_CHALLENGE_TTL_MINUTES = 5;
+const BOT_POW_DIFFICULTY = Math.min(20, Math.max(8, Number(process.env.BOT_POW_DIFFICULTY) || 14));
+const DUMMY_RECOVERY_SALT = '00112233445566778899aabbccddeeff';
+const DUMMY_RECOVERY_HASH = '0'.repeat(64);
+const GENERIC_LOGIN_ERROR = 'Invalid username or password.';
+const GENERIC_RECOVERY_ERROR = 'Invalid username or recovery code. Please check your details and try again.';
 
 export class AuthRateLimitError extends Error {
   status = 429;
@@ -42,10 +55,9 @@ export class AuthRateLimitError extends Error {
 }
 
 export interface RegisterInput {
-  identifier?: string; // Gmail address (or email field)
-  email?: string;      // Gmail address
-  username: string;    // must start with @ and follow alphanumeric/underscore rules
+  username: string;
   password: string;
+  confirmPassword?: string;
   name?: string;
   department?: string;
   level?: string;
@@ -56,6 +68,12 @@ export interface RegisterInput {
   avatarUrl?: string;
   acceptTerms?: boolean;
   userAgent?: string;
+  idempotencyKey?: string;
+  botChallengeId?: string;
+  botChallengeNonce?: string;
+  botChallengeSolution?: string;
+  honeypot?: string;
+  requireBotChallenge?: boolean;
 }
 
 function insertSecurityNotification(userId: string, title: string, body: string, link = '/?tab=settings') {
@@ -75,9 +93,15 @@ function insertSecurityNotification(userId: string, title: string, body: string,
   }
 }
 
+function equalizeRecoveryTiming(codeNormalized: string) {
+  for (let i = 0; i < 10; i++) {
+    verifyRecoveryCodeHash(codeNormalized || 'AAAA0000BBBB1111', DUMMY_RECOVERY_SALT, DUMMY_RECOVERY_HASH);
+  }
+}
+
 export const authService = {
   /**
-   * Validates username ensuring it complies with the required symbol (@) and formatting rules
+   * Validates @username format (must start with @, 3-25 chars, letters/numbers/underscores, not reserved).
    */
   validateUsername(rawUsername: string): { valid: boolean; normalized: string; error?: string } {
     let username = String(rawUsername || '').trim();
@@ -118,52 +142,162 @@ export const authService = {
   },
 
   /**
-   * Validates a Gmail address cleanly (case-insensitive normalization)
+   * Issues a privacy-preserving Proof-of-Work challenge stored in SQLite (requires zero personal data).
    */
-  validateGmail(rawEmail: string): { valid: boolean; normalized: string; error?: string } {
-    const email = String(rawEmail || '').trim().toLowerCase();
-    if (!email) {
-      return { valid: false, normalized: '', error: 'A valid Gmail address is required.' };
+  issueRegistrationChallenge(ipAddress?: string) {
+    if (!checkRateLimit(`reg_chal:${ipAddress || 'unknown'}`, MAX_CHALLENGE_ISSUES_PER_HOUR, 60 * 60 * 1000, ipAddress)) {
+      throw new AuthRateLimitError('Too many signup challenge requests. Please wait before trying again.', 3600);
     }
-    const localPart = email.split('@')[0] || '';
-    if (
-      email.length > 254 ||
-      localPart.startsWith('.') ||
-      localPart.endsWith('.') ||
-      localPart.includes('..') ||
-      !/^[a-z0-9._%+-]+@gmail\.com$/.test(email)
-    ) {
-      return {
-        valid: false,
-        normalized: '',
-        error: 'Please provide a valid Gmail address (e.g. yourname@gmail.com).',
-      };
+    recordRateLimitEvent(`reg_chal:${ipAddress || 'unknown'}`, false, ipAddress);
+
+    try {
+      db.prepare("DELETE FROM bot_challenges WHERE datetime(expires_at) <= datetime('now') OR used_at IS NOT NULL").run();
+    } catch {
+      // non-fatal cleanup
     }
-    return { valid: true, normalized: email };
+
+    const challengeId = `pow-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const expiresAt = new Date(Date.now() + BOT_CHALLENGE_TTL_MINUTES * 60 * 1000).toISOString();
+
+    db.prepare(`
+      INSERT INTO bot_challenges (id, purpose, nonce, difficulty, ip_address, expires_at)
+      VALUES (?, 'register', ?, ?, ?, ?)
+    `).run(challengeId, nonce, BOT_POW_DIFFICULTY, ipAddress || null, expiresAt);
+
+    return {
+      challengeId,
+      nonce,
+      difficulty: BOT_POW_DIFFICULTY,
+      expiresAt,
+    };
   },
 
   /**
-   * Escalating temporary cooldown rate limiter (per identifier and per IP, never permanent lockout).
-   * Base threshold: 5 failures in 15 min -> 15 min cooldown; repeated bursts escalate to 30m -> 60m -> 180m cap.
+   * Verifies and atomically consumes a single-use Proof-of-Work challenge.
+   */
+  verifyAndConsumeRegistrationChallenge(
+    challengeId: string | undefined,
+    nonce: string | undefined,
+    solution: string | undefined,
+    ipAddress?: string
+  ) {
+    const cleanId = String(challengeId || '').trim();
+    const cleanNonce = String(nonce || '').trim();
+    const cleanSolution = String(solution || '').trim();
+
+    if (!cleanId || !cleanNonce || !cleanSolution) {
+      recordSecurityEvent({
+        eventType: 'BOT_CHALLENGE_FAILED',
+        severity: 'warning',
+        ipAddress,
+        details: { reason: 'missing_challenge_fields' },
+      });
+      throw new Error('Verification check expired or missing. Please refresh and submit again.');
+    }
+
+    const row = db.prepare(`
+      SELECT id, nonce, difficulty, expires_at, used_at
+      FROM bot_challenges
+      WHERE id = ? AND nonce = ?
+      LIMIT 1
+    `).get(cleanId, cleanNonce) as
+      | { id: string; nonce: string; difficulty: number; expires_at: string; used_at: string | null }
+      | undefined;
+
+    if (!row || row.used_at) {
+      recordSecurityEvent({
+        eventType: 'BOT_CHALLENGE_FAILED',
+        severity: 'warning',
+        ipAddress,
+        details: { reason: row ? 'challenge_replayed' : 'challenge_not_found' },
+      });
+      throw new Error('Signup verification check expired or already used. Please try again.');
+    }
+
+    const expMs = parseTimestampMs(row.expires_at);
+    if (Number.isFinite(expMs) && expMs <= Date.now()) {
+      db.prepare('UPDATE bot_challenges SET used_at = CURRENT_TIMESTAMP WHERE id = ?').run(row.id);
+      throw new Error('Signup verification check expired. Please submit again.');
+    }
+
+    if (!verifyPowSolution(row.nonce, cleanSolution, row.difficulty)) {
+      recordSecurityEvent({
+        eventType: 'BOT_CHALLENGE_FAILED',
+        severity: 'warning',
+        ipAddress,
+        details: { reason: 'invalid_pow_solution' },
+      });
+      throw new Error('Automated signup verification failed. Please retry.');
+    }
+
+    const consumed = db.prepare(`
+      UPDATE bot_challenges
+      SET used_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND used_at IS NULL
+    `).run(row.id);
+
+    if (Number(consumed.changes || 0) !== 1) {
+      throw new Error('Signup verification check already used. Please retry.');
+    }
+  },
+
+  /**
+   * Resolves normalized @username/handle aliases for shared-DB rate-limit tracking.
+   */
+  resolveLoginAliases(identifier: string): { userId: string | null; aliases: string[] } {
+    const trimmed = String(identifier || '').trim().toLowerCase();
+    const withoutAt = trimmed.replace(/^@/, '');
+    const withAt = trimmed.startsWith('@') ? trimmed : `@${trimmed}`;
+    const aliasSet = new Set<string>([trimmed, withoutAt, withAt].filter(Boolean));
+
+    const matched = db.prepare(`
+      SELECT u.id, u.username, pr.handle
+      FROM users u
+      LEFT JOIN user_profiles pr ON pr.user_id = u.id
+      WHERE LOWER(COALESCE(u.username, '')) IN (?, ?)
+         OR LOWER(COALESCE(pr.handle, '')) IN (?, ?)
+      LIMIT 1
+    `).get(trimmed, withAt, trimmed, withAt) as
+      | { id: string; username: string | null; handle: string | null }
+      | undefined;
+
+    if (matched) {
+      aliasSet.add(`acct:${matched.id}`.toLowerCase());
+      if (matched.username) {
+        aliasSet.add(matched.username.toLowerCase());
+        aliasSet.add(matched.username.replace(/^@/, '').toLowerCase());
+      }
+      if (matched.handle) {
+        aliasSet.add(matched.handle.toLowerCase());
+        aliasSet.add(matched.handle.replace(/^@/, '').toLowerCase());
+      }
+    }
+
+    return { userId: matched?.id || null, aliases: Array.from(aliasSet) };
+  },
+
+  /**
+   * Shared-DB escalating temporary cooldown rate limiter (per-IP checked first, then per-(account, IP)).
+   * Designed so an attacker cannot permanently lock out a victim:
+   * - All cooldowns are temporary (15m -> 30m -> 60m -> 180m max cap).
+   * - Per-IP limits catch brute-force / credential stuffing before affecting other IPs.
+   * - Distributed spray across >=4 IPs throttles ONLY untrusted IPs; known legitimate IPs/devices can still sign in.
    */
   getLoginRateLimitStatus(identifier: string, ipAddress?: string): {
     allowed: boolean;
     retryAfterSeconds: number;
     failureCount24h: number;
+    recentPairFailures: number;
+    progressiveDelayMs: number;
+    scope: 'ok' | 'ip' | 'pair' | 'spray';
   } {
     const shortWindowStart = new Date(Date.now() - RATE_LIMIT_WINDOW_MS).toISOString().replace('T', ' ').slice(0, 19);
     const escalationWindowStart = new Date(Date.now() - ESCALATION_LOOKBACK_MS).toISOString().replace('T', ' ').slice(0, 19);
+    const { userId, aliases } = this.resolveLoginAliases(identifier);
+    const placeholders = aliases.map(() => '?').join(', ');
 
-    const idShort = db
-      .prepare(`
-        SELECT COUNT(*) as failed_count, MIN(attempted_at) as oldest_at, MAX(attempted_at) as latest_at
-        FROM login_attempts
-        WHERE LOWER(identifier) = LOWER(?)
-          AND success = 0
-          AND datetime(attempted_at) >= datetime(?)
-      `)
-      .get(identifier, shortWindowStart) as { failed_count: number; oldest_at: string | null; latest_at: string | null } | undefined;
-
+    // 1. Check Per-IP limits FIRST
     const ipShort = ipAddress
       ? (db
           .prepare(`
@@ -173,22 +307,10 @@ export const authService = {
               AND success = 0
               AND datetime(attempted_at) >= datetime(?)
           `)
-          .get(ipAddress, shortWindowStart) as { failed_count: number; oldest_at: string | null; latest_at: string | null } | undefined)
+          .get(ipAddress, shortWindowStart) as
+          | { failed_count: number; oldest_at: string | null; latest_at: string | null }
+          | undefined)
       : undefined;
-
-    const idLong = db
-      .prepare(`
-        SELECT COUNT(*) as failed_count, MAX(attempted_at) as latest_at
-        FROM login_attempts
-        WHERE LOWER(identifier) = LOWER(?)
-          AND success = 0
-          AND datetime(attempted_at) >= datetime(?)
-          AND attempted_at > COALESCE((
-            SELECT MAX(attempted_at) FROM login_attempts
-            WHERE LOWER(identifier) = LOWER(?) AND success = 1
-          ), '1970-01-01')
-      `)
-      .get(identifier, escalationWindowStart, identifier) as { failed_count: number; latest_at: string | null } | undefined;
 
     const ipLongCount = ipAddress
       ? ((db
@@ -206,61 +328,277 @@ export const authService = {
           .get(ipAddress, escalationWindowStart, ipAddress) as { failed_count: number } | undefined)?.failed_count ?? 0)
       : 0;
 
-    const failureCount24h = Math.max(idLong?.failed_count ?? 0, ipLongCount);
-    const idShortBlocked = (idShort?.failed_count ?? 0) >= MAX_FAILED_ATTEMPTS;
-    const ipShortBlocked = (ipShort?.failed_count ?? 0) >= MAX_FAILED_ATTEMPTS;
+    if ((ipShort?.failed_count ?? 0) >= MAX_IP_FAILED_ATTEMPTS) {
+      const parsedMs = parseTimestampMs(ipShort?.oldest_at);
+      const retryAfterSeconds =
+        Number.isFinite(parsedMs) && parsedMs > 0
+          ? Math.max(1, Math.ceil((parsedMs + RATE_LIMIT_WINDOW_MS - Date.now()) / 1000))
+          : Math.ceil(RATE_LIMIT_WINDOW_MS / 1000);
+      return {
+        allowed: false,
+        retryAfterSeconds,
+        failureCount24h: Math.max(ipShort?.failed_count ?? 0, ipLongCount),
+        recentPairFailures: ipShort?.failed_count ?? 0,
+        progressiveDelayMs: 2500,
+        scope: 'ip',
+      };
+    }
 
-    // Escalated cooldown schedule (capped at 180 minutes, never permanent)
+    // 2. Check Per-(Account, IP) failures + account_lockouts table
+    const pairShort = ipAddress
+      ? (db
+          .prepare(`
+            SELECT COUNT(*) as failed_count, MIN(attempted_at) as oldest_at, MAX(attempted_at) as latest_at
+            FROM login_attempts
+            WHERE LOWER(identifier) IN (${placeholders})
+              AND ip_address = ?
+              AND success = 0
+              AND datetime(attempted_at) >= datetime(?)
+          `)
+          .get(...aliases, ipAddress, shortWindowStart) as
+          | { failed_count: number; oldest_at: string | null; latest_at: string | null }
+          | undefined)
+      : (db
+          .prepare(`
+            SELECT COUNT(*) as failed_count, MIN(attempted_at) as oldest_at, MAX(attempted_at) as latest_at
+            FROM login_attempts
+            WHERE LOWER(identifier) IN (${placeholders})
+              AND success = 0
+              AND datetime(attempted_at) >= datetime(?)
+          `)
+          .get(...aliases, shortWindowStart) as
+          | { failed_count: number; oldest_at: string | null; latest_at: string | null }
+          | undefined);
+
+    const pairLong = ipAddress
+      ? (db
+          .prepare(`
+            SELECT COUNT(*) as failed_count, MAX(attempted_at) as latest_at
+            FROM login_attempts
+            WHERE LOWER(identifier) IN (${placeholders})
+              AND ip_address = ?
+              AND success = 0
+              AND datetime(attempted_at) >= datetime(?)
+              AND attempted_at > COALESCE((
+                SELECT MAX(attempted_at) FROM login_attempts
+                WHERE LOWER(identifier) IN (${placeholders}) AND ip_address = ? AND success = 1
+              ), '1970-01-01')
+          `)
+          .get(...aliases, ipAddress, escalationWindowStart, ...aliases, ipAddress) as
+          | { failed_count: number; latest_at: string | null }
+          | undefined)
+      : (db
+          .prepare(`
+            SELECT COUNT(*) as failed_count, MAX(attempted_at) as latest_at
+            FROM login_attempts
+            WHERE LOWER(identifier) IN (${placeholders})
+              AND success = 0
+              AND datetime(attempted_at) >= datetime(?)
+              AND attempted_at > COALESCE((
+                SELECT MAX(attempted_at) FROM login_attempts
+                WHERE LOWER(identifier) IN (${placeholders}) AND success = 1
+              ), '1970-01-01')
+          `)
+          .get(...aliases, escalationWindowStart, ...aliases) as
+          | { failed_count: number; latest_at: string | null }
+          | undefined);
+
+    // Check explicit shared account_lockouts table scoped to (account, IP)
+    const pairKey = `${userId ? `u:${userId}` : `id:${aliases[0] || 'unknown'}`}|ip:${ipAddress || 'unknown'}`;
+    const lockoutRow = db
+      .prepare('SELECT failed_count, locked_until FROM account_lockouts WHERE account_key = ?')
+      .get(pairKey) as { failed_count: number; locked_until: string | null } | undefined;
+
+    if (lockoutRow?.locked_until) {
+      const lockedUntilMs = parseTimestampMs(lockoutRow.locked_until);
+      if (Number.isFinite(lockedUntilMs) && lockedUntilMs > Date.now()) {
+        return {
+          allowed: false,
+          retryAfterSeconds: Math.max(1, Math.ceil((lockedUntilMs - Date.now()) / 1000)),
+          failureCount24h: Math.max(pairLong?.failed_count ?? 0, lockoutRow.failed_count || 0),
+          recentPairFailures: pairShort?.failed_count ?? 0,
+          progressiveDelayMs: computeProgressiveDelayMs(pairShort?.failed_count ?? 0),
+          scope: 'pair',
+        };
+      }
+    }
+
+    // 3. Anti-victim-DoS distributed spray check: throttle ONLY untrusted IPs
+    if (ipAddress) {
+      const globalAccountSpray = db
+        .prepare(`
+          SELECT COUNT(*) as failed_count, COUNT(DISTINCT COALESCE(ip_address, 'unknown')) as ip_count, MAX(attempted_at) as latest_at
+          FROM login_attempts
+          WHERE LOWER(identifier) IN (${placeholders})
+            AND success = 0
+            AND datetime(attempted_at) >= datetime(?)
+        `)
+        .get(...aliases, shortWindowStart) as
+        | { failed_count: number; ip_count: number; latest_at: string | null }
+        | undefined;
+
+      if ((globalAccountSpray?.ip_count ?? 0) >= 4 && (globalAccountSpray?.failed_count ?? 0) >= MAX_IP_FAILED_ATTEMPTS) {
+        const knownSuccessFromIp = db
+          .prepare(`
+            SELECT 1 FROM login_attempts
+            WHERE LOWER(identifier) IN (${placeholders}) AND ip_address = ? AND success = 1
+            LIMIT 1
+          `)
+          .get(...aliases, ipAddress);
+        const knownSessionIp = userId
+          ? db
+              .prepare(`
+                SELECT 1 FROM sessions
+                WHERE user_id = ? AND ip_address = ? AND is_suspicious = 0
+                LIMIT 1
+              `)
+              .get(userId, ipAddress)
+          : undefined;
+
+        if (!knownSuccessFromIp && !knownSessionIp) {
+          const latestMs = parseTimestampMs(globalAccountSpray?.latest_at);
+          const retryAfterSeconds =
+            Number.isFinite(latestMs) && latestMs + RATE_LIMIT_WINDOW_MS > Date.now()
+              ? Math.max(1, Math.ceil((latestMs + RATE_LIMIT_WINDOW_MS - Date.now()) / 1000))
+              : Math.ceil(RATE_LIMIT_WINDOW_MS / 1000);
+          return {
+            allowed: false,
+            retryAfterSeconds,
+            failureCount24h: Math.max(pairLong?.failed_count ?? 0, ipLongCount),
+            recentPairFailures: pairShort?.failed_count ?? 0,
+            progressiveDelayMs: 2500,
+            scope: 'spray',
+          };
+        }
+      }
+    }
+
+    const recentPairFailures = pairShort?.failed_count ?? 0;
+    const failureCount24h = Math.max(pairLong?.failed_count ?? 0, ipLongCount);
+    const pairShortBlocked = recentPairFailures >= MAX_FAILED_ATTEMPTS;
+
     let cooldownMs = RATE_LIMIT_WINDOW_MS;
     if (failureCount24h >= 16) cooldownMs = 180 * 60 * 1000;
     else if (failureCount24h >= 12) cooldownMs = 60 * 60 * 1000;
     else if (failureCount24h >= 8) cooldownMs = 30 * 60 * 1000;
 
-    // Check active escalated cooldown based on latest failed attempt when >= 8 failures occurred
-    if (failureCount24h >= 8) {
-      const latestRef = idLong?.latest_at || ipShort?.latest_at;
-      const latestMs = parseTimestampMs(latestRef);
+    if (failureCount24h >= 8 && (pairShortBlocked || (pairLong?.failed_count ?? 0) >= 8)) {
+      const latestMs = parseTimestampMs(pairLong?.latest_at);
       if (Number.isFinite(latestMs) && latestMs + cooldownMs > Date.now()) {
         return {
           allowed: false,
           retryAfterSeconds: Math.max(1, Math.ceil((latestMs + cooldownMs - Date.now()) / 1000)),
           failureCount24h,
+          recentPairFailures,
+          progressiveDelayMs: computeProgressiveDelayMs(recentPairFailures),
+          scope: 'pair',
         };
       }
     }
 
-    if (!idShortBlocked && !ipShortBlocked) {
-      return { allowed: true, retryAfterSeconds: 0, failureCount24h };
+    if (!pairShortBlocked) {
+      return {
+        allowed: true,
+        retryAfterSeconds: 0,
+        failureCount24h,
+        recentPairFailures,
+        progressiveDelayMs: computeProgressiveDelayMs(recentPairFailures),
+        scope: 'ok',
+      };
     }
 
-    const refAt = idShortBlocked ? idShort?.oldest_at : ipShort?.oldest_at;
-    const parsedMs = parseTimestampMs(refAt);
-    const retryAfterSeconds = Number.isFinite(parsedMs) && parsedMs > 0
-      ? Math.max(1, Math.ceil((parsedMs + cooldownMs - Date.now()) / 1000))
-      : Math.ceil(cooldownMs / 1000);
+    const parsedMs = parseTimestampMs(pairShort?.oldest_at);
+    const retryAfterSeconds =
+      Number.isFinite(parsedMs) && parsedMs > 0
+        ? Math.max(1, Math.ceil((parsedMs + cooldownMs - Date.now()) / 1000))
+        : Math.ceil(cooldownMs / 1000);
 
-    return { allowed: false, retryAfterSeconds, failureCount24h };
+    return {
+      allowed: false,
+      retryAfterSeconds,
+      failureCount24h,
+      recentPairFailures,
+      progressiveDelayMs: computeProgressiveDelayMs(recentPairFailures),
+      scope: 'pair',
+    };
   },
 
   checkLoginRateLimit(identifier: string, ipAddress?: string): boolean {
     return this.getLoginRateLimitStatus(identifier, ipAddress).allowed;
   },
 
-  recordLoginAttempt(identifier: string, success: boolean, ipAddress?: string) {
+  recordLoginAttempt(identifier: string, success: boolean, ipAddress?: string, userId?: string | null) {
+    const normalizedId = String(identifier || '').trim().toLowerCase().slice(0, 254);
     db.prepare(`
       INSERT INTO login_attempts (id, identifier, ip_address, success)
       VALUES (?, ?, ?, ?)
-    `).run(`att-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`, identifier, ipAddress || null, success ? 1 : 0);
+    `).run(
+      `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      normalizedId,
+      ipAddress || null,
+      success ? 1 : 0
+    );
+
+    const pairKey = `${userId ? `u:${userId}` : `id:${normalizedId || 'unknown'}`}|ip:${ipAddress || 'unknown'}`;
+    try {
+      if (success) {
+        db.prepare('DELETE FROM account_lockouts WHERE account_key = ?').run(pairKey);
+      } else {
+        const existing = db
+          .prepare('SELECT failed_count FROM account_lockouts WHERE account_key = ?')
+          .get(pairKey) as { failed_count: number } | undefined;
+        const nextCount = (existing?.failed_count ?? 0) + 1;
+        let lockedUntil: string | null = null;
+        if (nextCount >= MAX_FAILED_ATTEMPTS) {
+          let cooldownMs = RATE_LIMIT_WINDOW_MS;
+          if (nextCount >= 16) cooldownMs = 180 * 60 * 1000;
+          else if (nextCount >= 12) cooldownMs = 60 * 60 * 1000;
+          else if (nextCount >= 8) cooldownMs = 30 * 60 * 1000;
+          lockedUntil = new Date(Date.now() + cooldownMs).toISOString();
+        }
+        db.prepare(`
+          INSERT INTO account_lockouts (account_key, user_id, failed_count, first_failed_at, last_failed_at, locked_until, updated_at)
+          VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP)
+          ON CONFLICT(account_key) DO UPDATE SET
+            user_id = COALESCE(excluded.user_id, account_lockouts.user_id),
+            failed_count = excluded.failed_count,
+            last_failed_at = CURRENT_TIMESTAMP,
+            locked_until = excluded.locked_until,
+            updated_at = CURRENT_TIMESTAMP
+        `).run(pairKey, userId || null, nextCount, lockedUntil);
+      }
+    } catch {
+      // non-fatal lockout cache update
+    }
   },
 
   /**
-   * Register a new account using a unique @username and valid Gmail address
+   * Register a new account with @username, password + confirmPassword (Argon2id),
+   * privacy-preserving PoW bot protection, double-submit protection, and 10 single-use recovery codes.
    */
   register(input: RegisterInput, ipAddress?: string, bypassRegistrationLock = false) {
     if (!bypassRegistrationLock) {
+      if (typeof input.honeypot === 'string' && input.honeypot.trim().length > 0) {
+        recordSecurityEvent({
+          eventType: 'BOT_CHALLENGE_FAILED',
+          severity: 'warning',
+          ipAddress,
+          userAgent: input.userAgent,
+          details: { reason: 'honeypot_triggered' },
+        });
+        throw new Error('Signup verification failed.');
+      }
+
       if (!checkRateLimit(`reg:${ipAddress || 'unknown'}`, MAX_REGISTER_ATTEMPTS_PER_HOUR, 60 * 60 * 1000, ipAddress)) {
+        recordSecurityEvent({
+          eventType: 'REGISTRATION_RATE_LIMITED',
+          severity: 'warning',
+          ipAddress,
+          userAgent: input.userAgent,
+        });
         throw new AuthRateLimitError('Too many registration attempts. Please wait before creating another account.', 3600);
       }
+
       try {
         const regSetting = db
           .prepare("SELECT value FROM website_settings WHERE key = 'allow_new_registrations'")
@@ -273,31 +611,53 @@ export const authService = {
           throw err;
         }
       }
+
+      if (input.requireBotChallenge) {
+        this.verifyAndConsumeRegistrationChallenge(
+          input.botChallengeId,
+          input.botChallengeNonce,
+          input.botChallengeSolution,
+          ipAddress
+        );
+      }
     }
 
-    const { password } = input;
-    const rawEmailInput = input.email ?? input.identifier ?? '';
-
+    const { password, confirmPassword } = input;
     const usernameValidation = this.validateUsername(input.username);
     if (!usernameValidation.valid) {
       throw new Error(usernameValidation.error || 'Invalid username.');
     }
     const normalizedUsername = usernameValidation.normalized;
 
-    const gmailValidation = this.validateGmail(rawEmailInput);
-    if (!gmailValidation.valid) {
-      throw new Error(gmailValidation.error || 'Please provide a valid Gmail address (e.g. yourname@gmail.com).');
+    if (confirmPassword !== undefined && password !== confirmPassword) {
+      throw new Error('Password and confirm password do not match.');
     }
-    const email = gmailValidation.normalized;
 
-    const pwdCheck = validateStrongPassword(password, [normalizedUsername, email.split('@')[0]]);
+    const pwdCheck = validateStrongPassword(password, [normalizedUsername]);
     if (!pwdCheck.valid) {
       throw new Error(pwdCheck.error || 'Password does not meet security requirements.');
     }
 
-    const existingEmail = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)').get(email);
-    if (existingEmail) {
-      throw new Error('An account with this Gmail address already exists.');
+    const cleanIdempotencyKey =
+      typeof input.idempotencyKey === 'string' && input.idempotencyKey.trim()
+        ? sanitizeInputText(input.idempotencyKey, 128)
+        : '';
+
+    if (cleanIdempotencyKey) {
+      try {
+        db.prepare("DELETE FROM registration_idempotency WHERE datetime(expires_at) <= datetime('now')").run();
+        const dupSubmission = db
+          .prepare("SELECT user_id FROM registration_idempotency WHERE idempotency_key = ? AND datetime(expires_at) > datetime('now')")
+          .get(cleanIdempotencyKey) as { user_id: string } | undefined;
+        if (dupSubmission) {
+          const dupErr: any = new Error('Duplicate signup submission detected. Please sign in or check your details.');
+          dupErr.status = 409;
+          dupErr.code = 'DUPLICATE_SUBMISSION';
+          throw dupErr;
+        }
+      } catch (err: any) {
+        if (err?.code === 'DUPLICATE_SUBMISSION') throw err;
+      }
     }
 
     const existingHandle = db
@@ -307,7 +667,10 @@ export const authService = {
       .prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)')
       .get(normalizedUsername);
     if (existingHandle || existingUserHandle) {
-      throw new Error('This username is already taken. Please choose another.');
+      const dupErr: any = new Error('This username is already taken. Please choose another.');
+      dupErr.status = 409;
+      dupErr.code = 'USERNAME_TAKEN';
+      throw dupErr;
     }
 
     if (!bypassRegistrationLock) {
@@ -317,7 +680,7 @@ export const authService = {
     const acceptedTermsAt = input.acceptTerms ? new Date().toISOString() : null;
     const acceptedTermsVersion = input.acceptTerms ? CURRENT_TERMS_VERSION : null;
 
-    const userId = `u-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
+    const userId = `u-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
     const rawAvatarInput = (input.avatarDataUrl || input.avatarUrl || '').trim();
     let savedAvatar: { avatarUrl: string; avatarThumbUrl: string } | null = null;
     if (rawAvatarInput) {
@@ -330,33 +693,58 @@ export const authService = {
     try {
       return runInTransaction(() => {
         const passwordHash = hashPassword(password);
-        const verificationCode = generateNumericOtp(6);
+        const recoveryCodes = generateRecoveryCodes(10);
         const matricNumber =
-          sanitizeInputText(input.matric_number, 40) || `MEMBER-${new Date().getFullYear()}-${crypto.randomInt(1000, 10000)}`;
+          sanitizeInputText(input.matric_number, 40) ||
+          `MEMBER-${new Date().getFullYear()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 
         db.prepare(`
           INSERT INTO users (
             id, matric_number, email, phone_number, username, password_hash,
-            role, status, is_verified, verification_code, accepted_terms_at, accepted_terms_version, last_reauthenticated_at
-          ) VALUES (?, ?, ?, NULL, ?, ?, 'student', 'active', 0, ?, ?, ?, CURRENT_TIMESTAMP)
+            role, status, is_verified, verification_code,
+            accepted_terms_at, accepted_terms_version, last_reauthenticated_at,
+            recovery_codes_generated_at, recovery_codes_remaining
+          ) VALUES (?, ?, NULL, NULL, ?, ?, 'student', 'active', 0, NULL, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
         `).run(
           userId,
           matricNumber,
-          email,
           normalizedUsername,
           passwordHash,
-          verificationCode,
           acceptedTermsAt,
-          acceptedTermsVersion
+          acceptedTermsVersion,
+          recoveryCodes.length
         );
 
+        const insertRecovery = db.prepare(`
+          INSERT INTO recovery_codes (id, user_id, code_salt, code_hash)
+          VALUES (?, ?, ?, ?)
+        `);
+        for (const plainCode of recoveryCodes) {
+          const normalizedCode = normalizeRecoveryCode(plainCode);
+          const { salt, hash } = hashRecoveryCode(normalizedCode);
+          insertRecovery.run(
+            `rc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+            userId,
+            salt,
+            hash
+          );
+        }
+
+        if (cleanIdempotencyKey) {
+          db.prepare(`
+            INSERT INTO registration_idempotency (idempotency_key, user_id, expires_at)
+            VALUES (?, ?, datetime('now', '+10 minutes'))
+          `).run(cleanIdempotencyKey, userId);
+        }
+
         const name = sanitizeInputText(input.name, 60) || normalizedUsername.replace('@', '');
-        const initials = name
-          .split(/\s+/)
-          .map((p) => p[0])
-          .slice(0, 2)
-          .join('')
-          .toUpperCase() || 'SB';
+        const initials =
+          name
+            .split(/\s+/)
+            .map((p) => p[0])
+            .slice(0, 2)
+            .join('')
+            .toUpperCase() || 'SB';
 
         const department = sanitizeInputText(input.department, 80) || 'Student Community';
         const level = sanitizeInputText(input.level, 30) || 'Member';
@@ -385,20 +773,37 @@ export const authService = {
           savedAvatar?.avatarThumbUrl || null
         );
 
-        const session = this.createSession(userId, ipAddress, input.userAgent);
+        const session = this.createSession(userId, ipAddress, input.userAgent, 'password');
+
+        recordSecurityEvent({
+          userId,
+          eventType: 'ACCOUNT_REGISTERED',
+          severity: 'info',
+          identifier: normalizedUsername,
+          ipAddress,
+          userAgent: input.userAgent,
+          deviceName: session.deviceName,
+        });
+        recordSecurityEvent({
+          userId,
+          eventType: 'RECOVERY_CODES_GENERATED',
+          severity: 'info',
+          identifier: normalizedUsername,
+          ipAddress,
+          userAgent: input.userAgent,
+          details: { count: recoveryCodes.length },
+        });
 
         return {
           user: {
             id: userId,
             matric_number: matricNumber,
-            email,
-            phone_number: '',
             username: normalizedUsername,
             role: 'student',
             status: 'active',
             is_verified: false,
             acceptedTermsVersion,
-            ...(process.env.NODE_ENV !== 'production' ? { verification_code: verificationCode } : {}),
+            recoveryCodesRemaining: recoveryCodes.length,
           },
           profile: {
             id: `p-${userId}`,
@@ -428,28 +833,43 @@ export const authService = {
           refreshToken: session.refreshToken,
           sessionId: session.sessionId,
           expiresAt: session.expiresAt,
+          recoveryCodes, // Returned ONCE during registration
         };
       });
-    } catch (err) {
+    } catch (err: any) {
       if (savedAvatar) {
         fileService.unlinkIfUnreferenced([
           ...fileService.extractUploadFilenames(savedAvatar.avatarUrl),
           ...fileService.extractUploadFilenames(savedAvatar.avatarThumbUrl),
         ]);
       }
+      const msg = String(err?.message || '');
+      if (msg.includes('UNIQUE constraint failed')) {
+        if (msg.includes('username') || msg.includes('handle')) {
+          const dup: any = new Error('This username is already taken. Please choose another.');
+          dup.status = 409;
+          throw dup;
+        }
+        if (msg.includes('idempotency_key')) {
+          const dup: any = new Error('Duplicate signup submission detected. Please sign in or check your details.');
+          dup.status = 409;
+          throw dup;
+        }
+      }
       throw err;
     }
   },
 
   /**
-   * Authenticate user using @username or Gmail/email + password with escalating rate limit & MFA guard
+   * Authenticate user strictly by @username + password (Argon2id with transparent scrypt->Argon2id upgrade).
+   * Constant-timing dummy KDF on unknown username and generic errors prevent enumeration.
    */
   login(identifier: string, password: string, ipAddress?: string, userAgent?: string, mfaCode?: string) {
     if (!identifier || !password) {
-      throw new Error('Please provide your username or Gmail address and password.');
+      throw new Error('Please provide your @username and password.');
     }
 
-    const trimmedId = identifier.trim().slice(0, 254);
+    const trimmedId = identifier.trim().slice(0, 64);
     const handleCandidate = trimmedId.startsWith('@') ? trimmedId : `@${trimmedId}`;
 
     const rateLimit = this.getLoginRateLimitStatus(trimmedId, ipAddress);
@@ -460,53 +880,80 @@ export const authService = {
         identifier: trimmedId,
         ipAddress,
         userAgent,
-        details: { retryAfterSeconds: rateLimit.retryAfterSeconds, failureCount24h: rateLimit.failureCount24h },
+        details: {
+          scope: rateLimit.scope,
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+          failureCount24h: rateLimit.failureCount24h,
+        },
       });
       throw new AuthRateLimitError(
-        `Too many failed login attempts. Account temporarily locked. Try again in ${Math.ceil(rateLimit.retryAfterSeconds / 60)} minute(s).`,
+        `Too many failed login attempts. Try again in ${Math.ceil(rateLimit.retryAfterSeconds / 60)} minute(s).`,
         rateLimit.retryAfterSeconds
       );
     }
 
     if (typeof password !== 'string' || password.length > 128) {
+      equalizePasswordTiming('invalid');
       this.recordLoginAttempt(trimmedId, false, ipAddress);
-      throw new Error('Invalid email/username or password.');
+      recordSecurityEvent({
+        eventType: 'LOGIN_FAILED',
+        severity: 'warning',
+        identifier: trimmedId,
+        ipAddress,
+        userAgent,
+      });
+      const err: any = new Error(GENERIC_LOGIN_ERROR);
+      err.progressiveDelayMs = rateLimit.progressiveDelayMs;
+      throw err;
     }
 
     const userRow: any = db.prepare(`
       SELECT u.*, pr.handle, pr.name
       FROM users u
       LEFT JOIN user_profiles pr ON pr.user_id = u.id
-      WHERE LOWER(u.email) = LOWER(?)
-         OR u.phone_number = ?
-         OR LOWER(COALESCE(u.username, '')) = LOWER(?)
+      WHERE LOWER(COALESCE(u.username, '')) = LOWER(?)
          OR LOWER(COALESCE(u.username, '')) = LOWER(?)
          OR LOWER(COALESCE(pr.handle, '')) = LOWER(?)
          OR LOWER(COALESCE(pr.handle, '')) = LOWER(?)
-    `).get(trimmedId, trimmedId, trimmedId, handleCandidate, trimmedId, handleCandidate);
+      LIMIT 1
+    `).get(trimmedId, handleCandidate, trimmedId, handleCandidate);
 
     if (!userRow) {
-      try {
-        crypto.scryptSync(password, 'dummy_timing_equalizer_salt', 32, SCRYPT_EQUALIZER_OPTS);
-      } catch {
-        // ignore
-      }
+      equalizePasswordTiming(password);
       this.recordLoginAttempt(trimmedId, false, ipAddress);
-      throw new Error('Invalid email/username or password.');
+      const updatedRl = this.getLoginRateLimitStatus(trimmedId, ipAddress);
+      recordSecurityEvent({
+        eventType: 'LOGIN_FAILED',
+        severity: 'info',
+        identifier: trimmedId,
+        ipAddress,
+        userAgent,
+      });
+      const err: any = new Error(GENERIC_LOGIN_ERROR);
+      err.progressiveDelayMs = updatedRl.progressiveDelayMs;
+      throw err;
     }
 
     if (!verifyPassword(password, userRow.password_hash)) {
-      this.recordLoginAttempt(trimmedId, false, ipAddress);
+      this.recordLoginAttempt(trimmedId, false, ipAddress, userRow.id);
       const updatedRl = this.getLoginRateLimitStatus(trimmedId, ipAddress);
+      recordSecurityEvent({
+        userId: userRow.id,
+        eventType: 'LOGIN_FAILED',
+        severity: 'warning',
+        identifier: userRow.username || trimmedId,
+        ipAddress,
+        userAgent,
+      });
       if (!updatedRl.allowed) {
         recordSecurityEvent({
           userId: userRow.id,
           eventType: 'FAILED_LOGIN_BURST',
           severity: 'high',
-          identifier: trimmedId,
+          identifier: userRow.username || trimmedId,
           ipAddress,
           userAgent,
-          details: { failureCount24h: updatedRl.failureCount24h },
+          details: { failureCount24h: updatedRl.failureCount24h, scope: updatedRl.scope },
         });
         insertSecurityNotification(
           userRow.id,
@@ -514,7 +961,9 @@ export const authService = {
           'Multiple incorrect password attempts were blocked on your account. If this was not you, change your password in Settings.'
         );
       }
-      throw new Error('Invalid email/username or password.');
+      const err: any = new Error(GENERIC_LOGIN_ERROR);
+      err.progressiveDelayMs = updatedRl.progressiveDelayMs;
+      throw err;
     }
 
     if (userRow.status === 'suspended') {
@@ -527,6 +976,14 @@ export const authService = {
           hashPassword(password),
           userRow.id
         );
+        recordSecurityEvent({
+          userId: userRow.id,
+          eventType: 'PASSWORD_REHASHED_ARGON2ID',
+          severity: 'info',
+          identifier: userRow.username || trimmedId,
+          ipAddress,
+          userAgent,
+        });
       } catch {
         // non-fatal migration upgrade
       }
@@ -538,12 +995,12 @@ export const authService = {
         throw new Error('MFA_REQUIRED: Enter the 6-digit authenticator code for this account.');
       }
       if (!verifyTotpToken(userRow.mfa_secret, mfaCode)) {
-        this.recordLoginAttempt(trimmedId, false, ipAddress);
+        this.recordLoginAttempt(trimmedId, false, ipAddress, userRow.id);
         recordSecurityEvent({
           userId: userRow.id,
           eventType: 'MFA_VERIFICATION_FAILED',
           severity: 'warning',
-          identifier: trimmedId,
+          identifier: userRow.username || trimmedId,
           ipAddress,
           userAgent,
         });
@@ -551,17 +1008,26 @@ export const authService = {
       }
     }
 
-    this.recordLoginAttempt(trimmedId, true, ipAddress);
+    this.recordLoginAttempt(trimmedId, true, ipAddress, userRow.id);
     db.prepare('UPDATE users SET last_reauthenticated_at = CURRENT_TIMESTAMP WHERE id = ?').run(userRow.id);
 
-    const session = this.createSession(userRow.id, ipAddress, userAgent);
+    const session = this.createSession(userIdRow(userRow), ipAddress, userAgent, 'password');
+
+    recordSecurityEvent({
+      userId: userRow.id,
+      eventType: 'LOGIN_SUCCESS',
+      severity: 'info',
+      identifier: userRow.username || userRow.handle,
+      ipAddress,
+      userAgent,
+      deviceName: session.deviceName,
+      details: { authMethod: 'password' },
+    });
 
     return {
       user: {
         id: userRow.id,
         matric_number: userRow.matric_number,
-        email: userRow.email,
-        phone_number: userRow.phone_number || '',
         username: userRow.username || userRow.handle,
         role: userRow.role,
         status: userRow.status,
@@ -579,11 +1045,11 @@ export const authService = {
 
   /**
    * Multi-device session management:
-   * - Supports concurrent active devices up to MAX_ACTIVE_DEVICES (default 5), evicting the oldest active device when exceeded.
+   * - Supports concurrent active devices up to MAX_ACTIVE_DEVICES (5), evicting the oldest active device when exceeded.
    * - Issues short-lived 15-minute access token + rotating 30-day sliding refresh token with a 90-day hard session ceiling.
    * - Stores ONLY SHA-256 hashes in SQLite.
    */
-  createSession(userId: string, ipAddress?: string, userAgent?: string) {
+  createSession(userId: string, ipAddress?: string, userAgent?: string, authMethod: 'password' | 'passkey' | 'recovery_code' = 'password') {
     const token = crypto.randomBytes(32).toString('hex');
     const tokenHash = hashSessionToken(token);
     const refreshToken = crypto.randomBytes(32).toString('hex');
@@ -597,7 +1063,6 @@ export const authService = {
 
     const { deviceName, deviceType } = parseDeviceFromUserAgent(userAgent);
 
-    // Check active sessions and historical devices BEFORE inserting
     const existingActive = db.prepare(`
       SELECT token, id, device_name, ip_address, created_at, last_active_at
       FROM sessions
@@ -615,7 +1080,6 @@ export const authService = {
       last_active_at: string | null;
     }>;
 
-    // Evict oldest device session(s) if user already has >= maxActiveDevices
     if (existingActive.length >= SESSION_POLICY.maxActiveDevices) {
       const overflowCount = existingActive.length - SESSION_POLICY.maxActiveDevices + 1;
       const toEvict = existingActive.slice(0, overflowCount);
@@ -642,7 +1106,6 @@ export const authService = {
       });
     }
 
-    // Detect login from an unfamiliar device / different IP when prior sessions exist
     const priorKnown = db.prepare(`
       SELECT device_name, ip_address
       FROM sessions
@@ -659,8 +1122,8 @@ export const authService = {
       INSERT INTO sessions (
         token, id, user_id, ip_address, user_agent, device_name, device_type,
         last_active_at, refresh_token_hash, refresh_expires_at, max_expires_at,
-        expires_at, is_suspicious
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
+        expires_at, is_suspicious, auth_method
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?)
     `).run(
       tokenHash,
       sessionId,
@@ -673,7 +1136,8 @@ export const authService = {
       refreshExpiresAt,
       maxExpiresAt,
       expiresAt,
-      isSuspicious
+      isSuspicious,
+      authMethod
     );
 
     if (hasPriorSessions && (!seenExactDevice || isSuspicious)) {
@@ -705,10 +1169,6 @@ export const authService = {
     };
   },
 
-  /**
-   * Rotates a valid refresh token into a fresh 15m access token + new 30d sliding refresh token.
-   * Rejects revoked/replayed tokens and immediately revokes all active sessions for the user on reuse detection.
-   */
   refreshSession(rawRefreshToken: string, ipAddress?: string, userAgent?: string) {
     const cleanRefresh = String(rawRefreshToken || '').trim();
     if (!cleanRefresh) {
@@ -717,7 +1177,7 @@ export const authService = {
 
     const refreshHash = hashSessionToken(cleanRefresh);
     const row = db.prepare(`
-      SELECT s.*, u.status, u.role, u.matric_number, u.email, u.accepted_terms_version
+      SELECT s.*, u.status, u.role, u.matric_number, u.email, u.username, u.accepted_terms_version
       FROM sessions s
       JOIN users u ON u.id = s.user_id
       WHERE s.refresh_token_hash = ?
@@ -733,7 +1193,6 @@ export const authService = {
       throw new Error('Invalid or expired session refresh token.');
     }
 
-    // Reuse detection: any replay of an already-rotated or revoked refresh token revokes ALL active user sessions
     if (row.revoked_at) {
       db.prepare(`
         UPDATE sessions
@@ -798,7 +1257,6 @@ export const authService = {
     const tombstoneId = `${stableSessionId}-rot-${crypto.randomBytes(2).toString('hex')}`;
 
     runInTransaction(() => {
-      // Preserve old refresh_token_hash on a revoked tombstone row so replays trigger reuse detection
       db.prepare(`
         UPDATE sessions
         SET id = ?,
@@ -811,8 +1269,8 @@ export const authService = {
         INSERT INTO sessions (
           token, id, user_id, ip_address, user_agent, device_name, device_type,
           last_active_at, refresh_token_hash, refresh_expires_at, max_expires_at,
-          expires_at, is_suspicious, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?)
+          expires_at, is_suspicious, auth_method, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         newAccessHash,
         stableSessionId,
@@ -826,6 +1284,7 @@ export const authService = {
         maxExpiresAtIso,
         newAccessExpiresAt,
         row.is_suspicious ? 1 : 0,
+        row.auth_method || 'password',
         row.created_at
       );
     });
@@ -840,7 +1299,8 @@ export const authService = {
       user: {
         id: row.user_id,
         matric_number: row.matric_number,
-        email: row.email,
+        username: row.username,
+        email: row.email || undefined,
         role: row.role,
         status: row.status,
         acceptedTermsVersion: row.accepted_terms_version || null,
@@ -854,7 +1314,7 @@ export const authService = {
 
     const row = db.prepare(`
       SELECT s.token, s.expires_at, s.max_expires_at, s.revoked_at,
-             u.id, u.matric_number, u.email, u.role, u.status, u.accepted_terms_version, u.last_reauthenticated_at
+             u.id, u.matric_number, u.email, u.username, u.role, u.status, u.accepted_terms_version, u.last_reauthenticated_at
       FROM sessions s
       JOIN users u ON u.id = s.user_id
       WHERE s.token = ?
@@ -878,7 +1338,8 @@ export const authService = {
     return {
       id: row.id,
       matric_number: row.matric_number,
-      email: row.email,
+      email: row.email || '',
+      username: row.username || undefined,
       role: row.role,
       status: row.status,
       acceptedTermsVersion: row.accepted_terms_version || null,
@@ -886,25 +1347,35 @@ export const authService = {
     };
   },
 
-  logout(token: string) {
+  logout(token: string, ipAddress?: string) {
     if (token) {
       const tokenHash = hashSessionToken(token);
+      const existing = db.prepare('SELECT id, user_id, device_name FROM sessions WHERE token = ? AND revoked_at IS NULL').get(tokenHash) as
+        | { id: string | null; user_id: string; device_name: string | null }
+        | undefined;
       db.prepare(`
         UPDATE sessions
         SET revoked_at = CURRENT_TIMESTAMP,
             revoked_reason = 'logout'
         WHERE token = ? AND revoked_at IS NULL
       `).run(tokenHash);
+      if (existing) {
+        recordSecurityEvent({
+          userId: existing.user_id,
+          eventType: 'USER_LOGOUT_SESSION',
+          severity: 'info',
+          ipAddress,
+          deviceName: existing.device_name,
+          details: { sessionId: existing.id },
+        });
+      }
     }
     return { success: true };
   },
 
-  /**
-   * Lists active devices/sessions for a user (never returns token hashes).
-   */
   getUserSessions(userId: string, currentTokenHash?: string) {
     const rows = db.prepare(`
-      SELECT id, token, device_name, device_type, ip_address, last_active_at, created_at, expires_at, refresh_expires_at, max_expires_at, is_suspicious
+      SELECT id, token, device_name, device_type, ip_address, last_active_at, created_at, expires_at, refresh_expires_at, max_expires_at, is_suspicious, auth_method
       FROM sessions
       WHERE user_id = ?
         AND revoked_at IS NULL
@@ -920,6 +1391,7 @@ export const authService = {
       ipAddress: r.ip_address ? String(r.ip_address) : 'unknown',
       isCurrent: Boolean(currentTokenHash && r.token === currentTokenHash),
       isSuspicious: Boolean(r.is_suspicious),
+      authMethod: r.auth_method || 'password',
       lastActiveAt: r.last_active_at || r.created_at,
       createdAt: r.created_at,
       expiresAt: r.refresh_expires_at || r.expires_at,
@@ -927,7 +1399,7 @@ export const authService = {
     }));
   },
 
-  revokeUserSession(userId: string, sessionId: string) {
+  revokeUserSession(userId: string, sessionId: string, currentTokenHash?: string) {
     const cleanId = sanitizeInputText(sessionId, 80);
     if (!cleanId) {
       throw new Error('Session ID is required.');
@@ -942,6 +1414,8 @@ export const authService = {
       throw new Error('Active device session not found.');
     }
 
+    const revokedSelf = Boolean(currentTokenHash && target.token === currentTokenHash);
+
     db.prepare(`
       UPDATE sessions
       SET revoked_at = CURRENT_TIMESTAMP,
@@ -954,10 +1428,10 @@ export const authService = {
       eventType: 'USER_REVOKED_SESSION',
       severity: 'info',
       deviceName: target.device_name,
-      details: { sessionId: cleanId },
+      details: { sessionId: cleanId, revokedSelf },
     });
 
-    return { success: true, revokedSessionId: cleanId };
+    return { success: true, revokedSessionId: cleanId, revokedSelf };
   },
 
   revokeOtherUserSessions(userId: string, currentTokenHash?: string) {
@@ -986,9 +1460,26 @@ export const authService = {
     return { success: true, revokedCount };
   },
 
-  /**
-   * Re-authenticates current user password before sensitive security actions.
-   */
+  revokeAllUserSessions(userId: string, ipAddress?: string) {
+    const res = db.prepare(`
+      UPDATE sessions
+      SET revoked_at = CURRENT_TIMESTAMP,
+          revoked_reason = 'user_revoked_everywhere'
+      WHERE user_id = ? AND revoked_at IS NULL
+    `).run(userId);
+
+    const revokedCount = Number(res.changes || 0);
+    recordSecurityEvent({
+      userId,
+      eventType: 'USER_REVOKED_ALL_SESSIONS',
+      severity: 'info',
+      ipAddress,
+      details: { revokedCount },
+    });
+
+    return { success: true, revokedCount };
+  },
+
   reauthenticate(userId: string, password: string, ipAddress?: string) {
     const bucketKey = `reauth:${userId}`;
     if (!checkRateLimit(bucketKey, MAX_FAILED_ATTEMPTS, RATE_LIMIT_WINDOW_MS, ipAddress)) {
@@ -1008,17 +1499,14 @@ export const authService = {
     return { success: true, reauthenticatedAt: new Date().toISOString() };
   },
 
-  /**
-   * Changes authenticated user's password and revokes all other active device sessions.
-   */
   changePassword(userId: string, currentPassword: string, newPassword: string, currentTokenHash?: string, ipAddress?: string) {
     const bucketKey = `pwchange:${userId}`;
     if (!checkRateLimit(bucketKey, MAX_FAILED_ATTEMPTS, RATE_LIMIT_WINDOW_MS, ipAddress)) {
       throw new AuthRateLimitError('Too many failed password change attempts. Please wait 15 minutes.', 900);
     }
 
-    const user = db.prepare('SELECT id, email, username, password_hash FROM users WHERE id = ?').get(userId) as
-      | { id: string; email: string; username: string | null; password_hash: string }
+    const user = db.prepare('SELECT id, username, password_hash FROM users WHERE id = ?').get(userId) as
+      | { id: string; username: string | null; password_hash: string }
       | undefined;
     if (!user) throw new Error('Account not found.');
 
@@ -1031,7 +1519,7 @@ export const authService = {
       throw new Error('New password must differ from your current password.');
     }
 
-    const pwdCheck = validateStrongPassword(newPassword, [user.username || '', user.email.split('@')[0]]);
+    const pwdCheck = validateStrongPassword(newPassword, [user.username || '']);
     if (!pwdCheck.valid) {
       throw new Error(pwdCheck.error || 'New password does not meet security requirements.');
     }
@@ -1082,6 +1570,315 @@ export const authService = {
     });
   },
 
+  /**
+   * Returns only the remaining unused recovery code count & generation timestamp — NEVER returns codes or hashes.
+   */
+  getRecoveryCodeStatus(userId: string): { remainingCount: number; totalCount: number; generatedAt: string | null } {
+    const countRow = db
+      .prepare('SELECT COUNT(*) as c FROM recovery_codes WHERE user_id = ? AND used_at IS NULL AND invalidated_at IS NULL')
+      .get(userId) as { c: number } | undefined;
+    const userRow = db
+      .prepare('SELECT recovery_codes_generated_at FROM users WHERE id = ?')
+      .get(userId) as { recovery_codes_generated_at: string | null } | undefined;
+
+    return {
+      remainingCount: Number(countRow?.c ?? 0),
+      totalCount: 10,
+      generatedAt: userRow?.recovery_codes_generated_at || null,
+    };
+  },
+
+  /**
+   * Regenerates 10 fresh single-use recovery codes after verifying current password.
+   * Immediately invalidates all previous unused codes and returns plaintext codes ONCE.
+   */
+  regenerateRecoveryCodes(userId: string, currentPassword: string, ipAddress?: string, userAgent?: string) {
+    const bucketKey = `regen:${userId}`;
+    if (!checkRateLimit(bucketKey, MAX_FAILED_ATTEMPTS, RATE_LIMIT_WINDOW_MS, ipAddress)) {
+      throw new AuthRateLimitError('Too many recovery code regeneration attempts. Please wait 15 minutes.', 900);
+    }
+
+    const user = db.prepare('SELECT id, username, password_hash FROM users WHERE id = ?').get(userId) as
+      | { id: string; username: string | null; password_hash: string }
+      | undefined;
+    if (!user) {
+      throw new Error('Account not found.');
+    }
+
+    if (!currentPassword || typeof currentPassword !== 'string' || currentPassword.length > 128 || !verifyPassword(currentPassword, user.password_hash)) {
+      recordRateLimitEvent(bucketKey, false, ipAddress);
+      recordSecurityEvent({
+        userId,
+        eventType: 'RECOVERY_CODE_REGEN_FAILED',
+        severity: 'warning',
+        identifier: user.username,
+        ipAddress,
+        userAgent,
+      });
+      throw new Error('Incorrect password. Enter your current password to regenerate recovery codes.');
+    }
+
+    recordRateLimitEvent(bucketKey, true, ipAddress);
+    const plainCodes = generateRecoveryCodes(10);
+    const generatedAt = new Date().toISOString();
+
+    return runInTransaction(() => {
+      db.prepare(`
+        UPDATE recovery_codes
+        SET invalidated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ? AND used_at IS NULL AND invalidated_at IS NULL
+      `).run(userId);
+
+      const insertStmt = db.prepare(`
+        INSERT INTO recovery_codes (id, user_id, code_salt, code_hash)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const code of plainCodes) {
+        const normalized = normalizeRecoveryCode(code);
+        const { salt, hash } = hashRecoveryCode(normalized);
+        insertStmt.run(
+          `rc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+          userId,
+          salt,
+          hash
+        );
+      }
+
+      db.prepare(`
+        UPDATE users
+        SET recovery_codes_generated_at = ?,
+            recovery_codes_remaining = ?,
+            last_reauthenticated_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(generatedAt, plainCodes.length, userId);
+
+      recordSecurityEvent({
+        userId,
+        eventType: 'RECOVERY_CODES_REGENERATED',
+        severity: 'info',
+        identifier: user.username,
+        ipAddress,
+        userAgent,
+        details: { count: plainCodes.length },
+      });
+
+      insertSecurityNotification(
+        userId,
+        'Recovery Codes Regenerated',
+        'A fresh set of 10 single-use recovery codes was generated for your account. Any earlier unused codes are now invalid.'
+      );
+
+      return {
+        success: true,
+        recoveryCodes: plainCodes,
+        remainingCount: plainCodes.length,
+        totalCount: 10,
+        generatedAt,
+      };
+    });
+  },
+
+  /**
+   * Method A Password Reset: @username + one unused recovery code -> set new password.
+   * - Username alone never allows a reset.
+   * - Rate-limited per-IP and per-(account, IP).
+   * - Identical generic response & constant-time work for unknown usernames vs invalid codes (zero enumeration).
+   * - Immediately invalidates used code, revokes ALL active sessions, logs security events, and writes an in-app notice.
+   */
+  resetPasswordWithRecoveryCode(input: {
+    username: string;
+    recoveryCode: string;
+    newPassword: string;
+    confirmPassword?: string;
+    ipAddress?: string;
+    userAgent?: string;
+  }) {
+    const rawUsername = String(input.username || '').trim();
+    const rawCode = String(input.recoveryCode || '').trim();
+    const newPassword = String(input.newPassword || '');
+    const confirmPassword = input.confirmPassword;
+    const ipAddress = input.ipAddress;
+
+    if (!rawUsername || !rawCode) {
+      throw new Error('Username and recovery code are both required.');
+    }
+
+    const normalizedHandle = (rawUsername.startsWith('@') ? rawUsername : `@${rawUsername}`).toLowerCase();
+    const ipBucket = `rec_ip:${ipAddress || 'unknown'}`;
+    const pairBucket = `rec:${normalizedHandle}`;
+
+    // Check per-IP limit first, then per-(account, IP)
+    if (!checkRateLimit(ipBucket, MAX_RECOVERY_IP_ATTEMPTS_PER_15M, RATE_LIMIT_WINDOW_MS, ipAddress)) {
+      recordSecurityEvent({
+        eventType: 'RECOVERY_RATE_LIMITED',
+        severity: 'warning',
+        identifier: normalizedHandle,
+        ipAddress,
+        userAgent: input.userAgent,
+        details: { scope: 'ip' },
+      });
+      throw new AuthRateLimitError('Too many recovery attempts from this network. Please wait 15 minutes before trying again.', 900);
+    }
+    if (!checkRateLimit(pairBucket, MAX_RECOVERY_ATTEMPTS_PER_15M, RATE_LIMIT_WINDOW_MS, ipAddress)) {
+      recordSecurityEvent({
+        eventType: 'RECOVERY_RATE_LIMITED',
+        severity: 'warning',
+        identifier: normalizedHandle,
+        ipAddress,
+        userAgent: input.userAgent,
+        details: { scope: 'account_pair' },
+      });
+      throw new AuthRateLimitError('Too many failed recovery attempts. Please wait 15 minutes before trying again.', 900);
+    }
+
+    if (confirmPassword !== undefined && newPassword !== confirmPassword) {
+      throw new Error('New password and confirmation password do not match.');
+    }
+
+    const pwdCheck = validateStrongPassword(newPassword, [normalizedHandle]);
+    if (!pwdCheck.valid) {
+      throw new Error(pwdCheck.error || 'New password does not meet security requirements.');
+    }
+
+    const normalizedCode = normalizeRecoveryCode(rawCode);
+    const user = db.prepare(`
+      SELECT u.id, u.username, u.status, pr.handle
+      FROM users u
+      LEFT JOIN user_profiles pr ON pr.user_id = u.id
+      WHERE LOWER(COALESCE(u.username, '')) = ?
+         OR LOWER(COALESCE(pr.handle, '')) = ?
+      LIMIT 1
+    `).get(normalizedHandle, normalizedHandle) as
+      | { id: string; username: string | null; status: string; handle: string | null }
+      | undefined;
+
+    if (!user || !normalizedCode || normalizedCode.length < 8) {
+      equalizeRecoveryTiming(normalizedCode);
+      equalizePasswordTiming(newPassword);
+      recordRateLimitEvent(ipBucket, false, ipAddress);
+      recordRateLimitEvent(pairBucket, false, ipAddress);
+      recordSecurityEvent({
+        eventType: 'RECOVERY_CODE_FAILED',
+        severity: 'warning',
+        identifier: normalizedHandle,
+        ipAddress,
+        userAgent: input.userAgent,
+      });
+      throw new Error(GENERIC_RECOVERY_ERROR);
+    }
+
+    const activeCodes = db.prepare(`
+      SELECT id, code_salt, code_hash
+      FROM recovery_codes
+      WHERE user_id = ?
+        AND used_at IS NULL
+        AND invalidated_at IS NULL
+      ORDER BY created_at ASC
+    `).all(user.id) as Array<{ id: string; code_salt: string; code_hash: string }>;
+
+    // Check all active hashes without early return to equalize timing
+    let matchedRowId: string | null = null;
+    for (const row of activeCodes) {
+      const ok = verifyRecoveryCodeHash(normalizedCode, row.code_salt, row.code_hash);
+      if (ok && !matchedRowId) {
+        matchedRowId = row.id;
+      }
+    }
+
+    if (!matchedRowId) {
+      // Pad constant-time work when account has fewer than 10 codes remaining
+      for (let i = activeCodes.length; i < 10; i++) {
+        verifyRecoveryCodeHash(normalizedCode, DUMMY_RECOVERY_SALT, DUMMY_RECOVERY_HASH);
+      }
+      equalizePasswordTiming(newPassword);
+      recordRateLimitEvent(ipBucket, false, ipAddress);
+      recordRateLimitEvent(pairBucket, false, ipAddress);
+      recordSecurityEvent({
+        userId: user.id,
+        eventType: 'RECOVERY_CODE_FAILED',
+        severity: 'warning',
+        identifier: user.username || normalizedHandle,
+        ipAddress,
+        userAgent: input.userAgent,
+      });
+      throw new Error(GENERIC_RECOVERY_ERROR);
+    }
+
+    if (user.status === 'suspended') {
+      throw new Error('This account has been suspended by moderation.');
+    }
+
+    return runInTransaction(() => {
+      const consumeRes = db.prepare(`
+        UPDATE recovery_codes
+        SET used_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND user_id = ? AND used_at IS NULL AND invalidated_at IS NULL
+      `).run(matchedRowId, user.id);
+
+      if (Number(consumeRes.changes || 0) !== 1) {
+        throw new Error(GENERIC_RECOVERY_ERROR);
+      }
+
+      const passwordHash = hashPassword(newPassword);
+      const remainingRow = db
+        .prepare('SELECT COUNT(*) as c FROM recovery_codes WHERE user_id = ? AND used_at IS NULL AND invalidated_at IS NULL')
+        .get(user.id) as { c: number } | undefined;
+      const remainingCount = Number(remainingRow?.c ?? 0);
+
+      db.prepare(`
+        UPDATE users
+        SET password_hash = ?,
+            recovery_codes_remaining = ?,
+            last_reauthenticated_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(passwordHash, remainingCount, user.id);
+
+      const revokedRes = db.prepare(`
+        UPDATE sessions
+        SET revoked_at = CURRENT_TIMESTAMP,
+            revoked_reason = 'password_reset_recovery_code'
+        WHERE user_id = ? AND revoked_at IS NULL
+      `).run(user.id);
+
+      db.prepare('DELETE FROM account_lockouts WHERE user_id = ?').run(user.id);
+
+      recordRateLimitEvent(ipBucket, true, ipAddress);
+      recordRateLimitEvent(pairBucket, true, ipAddress);
+
+      recordSecurityEvent({
+        userId: user.id,
+        eventType: 'RECOVERY_CODE_USED',
+        severity: 'warning',
+        identifier: user.username || normalizedHandle,
+        ipAddress,
+        userAgent: input.userAgent,
+        details: { remainingCodes: remainingCount },
+      });
+      recordSecurityEvent({
+        userId: user.id,
+        eventType: 'PASSWORD_RESET_COMPLETED',
+        severity: 'warning',
+        identifier: user.username || normalizedHandle,
+        ipAddress,
+        userAgent: input.userAgent,
+        details: { method: 'recovery_code', revokedSessions: Number(revokedRes.changes || 0) },
+      });
+
+      insertSecurityNotification(
+        user.id,
+        'Password Changed via Recovery Code',
+        `A single-use recovery code was used to reset your password and all ${Number(revokedRes.changes || 0)} active session(s) were signed out. You have ${remainingCount} unused recovery code(s) left.`
+      );
+
+      return {
+        success: true,
+        message: 'Your password has been updated and all active sessions have been signed out. Please sign in with your new password.',
+      };
+    });
+  },
+
   acceptTerms(userId: string) {
     db.prepare(`
       UPDATE users
@@ -1098,9 +1895,6 @@ export const authService = {
     };
   },
 
-  /**
-   * Generic TOTP MFA management for privileged roles (Admin & Moderator)
-   */
   getMfaStatus(userId: string) {
     const row = db.prepare('SELECT mfa_enabled FROM users WHERE id = ?').get(userId) as { mfa_enabled?: number } | undefined;
     return { mfaEnabled: Boolean(row?.mfa_enabled) };
@@ -1156,241 +1950,8 @@ export const authService = {
     });
     return { success: true, mfaEnabled: false };
   },
-
-  /**
-   * Account Verification (with OTP brute-force rate limit & code burn after 5 failures)
-   */
-  verifyAccount(userId: string, code: string, ipAddress?: string) {
-    const bucketKey = `verify:${userId}`;
-    if (!checkRateLimit(bucketKey, MAX_FAILED_ATTEMPTS, RATE_LIMIT_WINDOW_MS, ipAddress)) {
-      throw new Error('Too many failed verification attempts. Please wait 15 minutes or request a new code.');
-    }
-
-    const user = db.prepare(`
-      SELECT verification_code, is_verified FROM users WHERE id = ?
-    `).get(userId) as { verification_code: string | null; is_verified: number } | undefined;
-
-    if (!user) throw new Error('User not found.');
-    if (user.is_verified) {
-      return { success: true, verified: true };
-    }
-
-    const providedBuf = Buffer.from(String(code || '').trim(), 'utf8');
-    const expectedBuf = Buffer.from(String(user.verification_code || ''), 'utf8');
-    if (
-      expectedBuf.length === 0 ||
-      providedBuf.length !== expectedBuf.length ||
-      !crypto.timingSafeEqual(providedBuf, expectedBuf)
-    ) {
-      recordRateLimitEvent(bucketKey, false, ipAddress);
-      if (!checkRateLimit(bucketKey, MAX_FAILED_ATTEMPTS, RATE_LIMIT_WINDOW_MS, ipAddress)) {
-        db.prepare('UPDATE users SET verification_code = NULL WHERE id = ?').run(userId);
-      }
-      throw new Error('Invalid verification code.');
-    }
-
-    recordRateLimitEvent(bucketKey, true, ipAddress);
-
-    db.prepare(`
-      UPDATE users SET is_verified = 1, verification_code = NULL WHERE id = ?
-    `).run(userId);
-
-    db.prepare(`
-      UPDATE user_profiles SET verified = 1 WHERE user_id = ?
-    `).run(userId);
-
-    return { success: true, verified: true };
-  },
-
-  resendVerificationCode(userId: string, ipAddress?: string) {
-    if (!checkRateLimit(`verify_resend:${userId}`, 5, 60 * 60 * 1000, ipAddress)) {
-      throw new Error('Too many verification code requests. Please wait before requesting another code.');
-    }
-    const user = db.prepare('SELECT id, email, is_verified FROM users WHERE id = ?').get(userId) as
-      | { id: string; email: string; is_verified: number }
-      | undefined;
-    if (!user) throw new Error('User not found.');
-    if (user.is_verified) {
-      return { success: true, verified: true, message: 'Email address is already verified.' };
-    }
-    recordRateLimitEvent(`verify_resend:${userId}`, false, ipAddress);
-    const verificationCode = generateNumericOtp(6);
-    db.prepare('UPDATE users SET verification_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
-      verificationCode,
-      userId
-    );
-    return {
-      success: true,
-      verified: false,
-      ...(process.env.NODE_ENV !== 'production' ? { verification_code: verificationCode } : {}),
-      message: `A fresh 6-digit verification code has been prepared for ${user.email}.`,
-    };
-  },
-
-  /**
-   * Password Recovery Flow (equalized work for unknown accounts + safe rate limits)
-   */
-  requestPasswordReset(identifier: string, ipAddress?: string) {
-    const trimmed = String(identifier || '').trim();
-    if (!trimmed) {
-      throw new Error('Username or Gmail address is required.');
-    }
-    const handleCandidate = trimmed.startsWith('@') ? trimmed : `@${trimmed}`;
-    if (!checkRateLimit(`forgot:${trimmed.toLowerCase()}`, MAX_RECOVERY_ATTEMPTS_PER_HOUR, 60 * 60 * 1000, ipAddress)) {
-      throw new Error('Too many password recovery requests. Please wait before trying again.');
-    }
-    recordRateLimitEvent(`forgot:${trimmed.toLowerCase()}`, false, ipAddress);
-
-    const user = db.prepare(`
-      SELECT u.id, u.email, u.phone_number, pr.name
-      FROM users u
-      LEFT JOIN user_profiles pr ON pr.user_id = u.id
-      WHERE LOWER(u.email) = LOWER(?)
-         OR u.phone_number = ?
-         OR LOWER(COALESCE(u.username, '')) = LOWER(?)
-         OR LOWER(COALESCE(pr.handle, '')) = LOWER(?)
-         OR LOWER(COALESCE(pr.handle, '')) = LOWER(?)
-    `).get(trimmed, trimmed, trimmed, trimmed, handleCandidate) as any;
-
-    if (!user) {
-      return {
-        success: true,
-        message: 'If an account matches that username or Gmail address, recovery instructions have been prepared.',
-      };
-    }
-
-    const resetCode = generateNumericOtp(6);
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-
-    db.prepare(`UPDATE password_resets SET is_used = 1 WHERE user_id = ? AND is_used = 0`).run(user.id);
-
-    db.prepare(`
-      INSERT INTO password_resets (id, user_id, reset_code, expires_at, is_used, failed_attempts)
-      VALUES (?, ?, ?, ?, 0, 0)
-    `).run(`rst-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`, user.id, resetCode, expiresAt);
-
-    recordSecurityEvent({
-      userId: user.id,
-      eventType: 'PASSWORD_RESET_REQUESTED',
-      severity: 'info',
-      identifier: trimmed,
-      ipAddress,
-    });
-
-    return {
-      success: true,
-      ...(process.env.NODE_ENV !== 'production' ? { resetCode } : {}),
-      message: 'Password reset code generated. Check your registered Gmail recovery instructions to complete reset.',
-    };
-  },
-
-  resetPasswordWithCode(resetCode: string, newPassword: string, ipAddress?: string, identifier?: string) {
-    if (!checkRateLimit(`reset:${ipAddress || 'unknown'}`, MAX_RESET_FAILURES, RATE_LIMIT_WINDOW_MS, ipAddress)) {
-      throw new AuthRateLimitError('Too many password reset attempts. Please wait 15 minutes before trying again.', 900);
-    }
-
-    const pwdCheck = validateStrongPassword(newPassword, identifier ? [identifier] : []);
-    if (!pwdCheck.valid) {
-      throw new Error(pwdCheck.error || 'New password does not meet security requirements.');
-    }
-
-    const cleanCode = String(resetCode || '').trim();
-    if (!/^\d{6}$/.test(cleanCode)) {
-      recordRateLimitEvent(`reset:${ipAddress || 'unknown'}`, false, ipAddress);
-      throw new Error('Invalid or expired password reset code.');
-    }
-
-    let scopedUserId: string | null = null;
-    if (identifier && identifier.trim()) {
-      const trimmed = identifier.trim();
-      const handleCandidate = trimmed.startsWith('@') ? trimmed : `@${trimmed}`;
-      const targetUser = db.prepare(`
-        SELECT u.id
-        FROM users u
-        LEFT JOIN user_profiles pr ON pr.user_id = u.id
-        WHERE LOWER(u.email) = LOWER(?)
-           OR LOWER(COALESCE(u.username, '')) = LOWER(?)
-           OR LOWER(COALESCE(pr.handle, '')) = LOWER(?)
-           OR LOWER(COALESCE(pr.handle, '')) = LOWER(?)
-        LIMIT 1
-      `).get(trimmed, trimmed, trimmed, handleCandidate) as { id: string } | undefined;
-      scopedUserId = targetUser?.id || null;
-    }
-
-    const activeRows = (scopedUserId
-      ? db.prepare(`
-          SELECT * FROM password_resets
-          WHERE user_id = ? AND is_used = 0
-          ORDER BY created_at DESC
-          LIMIT 10
-        `).all(scopedUserId)
-      : db.prepare(`
-          SELECT * FROM password_resets
-          WHERE is_used = 0
-          ORDER BY created_at DESC
-          LIMIT 100
-        `).all()) as any[];
-
-    const providedBuf = Buffer.from(cleanCode, 'utf8');
-    const resetRow = activeRows.find((r) => {
-      const expectedBuf = Buffer.from(String(r.reset_code || ''), 'utf8');
-      return expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(providedBuf, expectedBuf);
-    });
-
-    if (!resetRow) {
-      if (scopedUserId) {
-        db.prepare(`
-          UPDATE password_resets
-          SET failed_attempts = COALESCE(failed_attempts, 0) + 1,
-              is_used = CASE WHEN COALESCE(failed_attempts, 0) + 1 >= ? THEN 1 ELSE is_used END
-          WHERE user_id = ? AND is_used = 0
-        `).run(MAX_RESET_FAILURES, scopedUserId);
-      }
-      recordRateLimitEvent(`reset:${ipAddress || 'unknown'}`, false, ipAddress);
-      throw new Error('Invalid or expired password reset code.');
-    }
-
-    if (Number(resetRow.failed_attempts || 0) >= MAX_RESET_FAILURES) {
-      db.prepare('UPDATE password_resets SET is_used = 1 WHERE id = ?').run(resetRow.id);
-      throw new Error('Password reset code invalidated due to too many failed attempts. Please request a new one.');
-    }
-
-    if (new Date(resetRow.expires_at) < new Date()) {
-      throw new Error('Password reset code has expired. Please request a new one.');
-    }
-
-    return runInTransaction(() => {
-      const passwordHash = hashPassword(newPassword);
-
-      db.prepare(`
-        UPDATE users
-        SET password_hash = ?,
-            last_reauthenticated_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(passwordHash, resetRow.user_id);
-
-      db.prepare(`
-        UPDATE password_resets
-        SET is_used = 1
-        WHERE id = ?
-      `).run(resetRow.id);
-
-      db.prepare(`
-        UPDATE sessions
-        SET revoked_at = CURRENT_TIMESTAMP,
-            revoked_reason = 'password_reset'
-        WHERE user_id = ? AND revoked_at IS NULL
-      `).run(resetRow.user_id);
-
-      recordSecurityEvent({
-        userId: resetRow.user_id,
-        eventType: 'PASSWORD_RESET_COMPLETED',
-        severity: 'warning',
-        ipAddress,
-      });
-
-      return { success: true, message: 'Password has been successfully updated. Please sign in with your new password.' };
-    });
-  },
 };
+
+function userIdRow(row: { id: string }): string {
+  return row.id;
+}

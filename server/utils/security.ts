@@ -1,8 +1,21 @@
 import crypto from 'node:crypto';
-import { db } from '../db/database';
+import { argon2id } from '@noble/hashes/argon2.js';
+import { db } from '../db/database.js';
 
 const LEGACY_STATIC_SALT = 'futa_salt_2026';
 const SCRYPT_PARAMS = { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 } as const;
+const ARGON2ID_PARAMS = { m: 19456, t: 2, p: 1, dkLen: 32 } as const;
+const DUMMY_ARGON2_SALT = Buffer.from('0123456789abcdef', 'utf8');
+const RECOVERY_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Unambiguous 32-char alphabet (no 0/O/1/I/L)
+
+function encodeBase64NoPad(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString('base64').replace(/=+$/, '');
+}
+
+function decodeBase64NoPad(b64: string): Buffer {
+  const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+  return Buffer.from(padded, 'base64');
+}
 
 const COMMON_WEAK_PASSWORDS = new Set([
   'password',
@@ -30,22 +43,69 @@ const COMMON_WEAK_PASSWORDS = new Set([
 ]);
 
 /**
- * Per-user random 16-byte salted scrypt password hash with high work factors (v3:<saltHex>:<hashHex>).
+ * Argon2id password hash in standard PHC string format:
+ * $argon2id$v=19$m=19456,t=2,p=1$<salt_b64>$<hash_b64>
  */
 export function hashPassword(password: string): string {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(password, salt, 32, SCRYPT_PARAMS).toString('hex');
-  return `v3:${salt}:${derived}`;
+  const salt = crypto.randomBytes(16);
+  const derived = argon2id(Buffer.from(password, 'utf8'), salt, ARGON2ID_PARAMS);
+  return `$argon2id$v=19$m=${ARGON2ID_PARAMS.m},t=${ARGON2ID_PARAMS.t},p=${ARGON2ID_PARAMS.p}$${encodeBase64NoPad(salt)}$${encodeBase64NoPad(derived)}`;
 }
 
 /**
- * Constant-time password verification supporting v3 high-work-factor scrypt,
- * legacy v2 scrypt, and static-salted hashes (for seamless migration on next login).
+ * Timing equalizer for unknown usernames so invalid username and invalid password
+ * responses perform equivalent Argon2id KDF work.
+ */
+export function equalizePasswordTiming(password: string): void {
+  try {
+    argon2id(Buffer.from(String(password || 'equalizer'), 'utf8'), DUMMY_ARGON2_SALT, ARGON2ID_PARAMS);
+  } catch {
+    // non-fatal
+  }
+}
+
+/**
+ * Constant-time password verification supporting Argon2id PHC strings,
+ * legacy v3/v2 scrypt hashes, and legacy static-salted hashes (for seamless rehash on login).
  */
 export function verifyPassword(password: string, storedHash: string | null | undefined): boolean {
   if (!password || !storedHash) return false;
 
   try {
+    if (storedHash.startsWith('$argon2id$')) {
+      const parts = storedHash.split('$');
+      // ['', 'argon2id', 'v=19', 'm=...,t=...,p=...', '<salt>', '<hash>']
+      if (parts.length !== 6) return false;
+      const versionPart = parts[2];
+      const paramPart = parts[3];
+      const saltB64 = parts[4];
+      const hashB64 = parts[5];
+      if (versionPart !== 'v=19' || !saltB64 || !hashB64) return false;
+
+      const paramMap: Record<string, number> = {};
+      for (const kv of paramPart.split(',')) {
+        const [k, v] = kv.split('=');
+        if (!k || !v) return false;
+        paramMap[k] = Number(v);
+      }
+      const m = paramMap.m;
+      const t = paramMap.t;
+      const p = paramMap.p;
+      if (!Number.isInteger(m) || !Number.isInteger(t) || !Number.isInteger(p) || m < 4096 || t < 1 || p < 1 || m > 262144 || t > 16 || p > 8) {
+        return false;
+      }
+
+      const saltBuf = decodeBase64NoPad(saltB64);
+      const expectedBuf = decodeBase64NoPad(hashB64);
+      if (saltBuf.length < 8 || expectedBuf.length < 16) return false;
+
+      const actual = Buffer.from(
+        argon2id(Buffer.from(password, 'utf8'), saltBuf, { m, t, p, dkLen: expectedBuf.length })
+      );
+      if (actual.length !== expectedBuf.length) return false;
+      return crypto.timingSafeEqual(actual, expectedBuf);
+    }
+
     if (storedHash.startsWith('v3:') || storedHash.startsWith('v2:')) {
       const parts = storedHash.split(':');
       if (parts.length !== 3) return false;
@@ -60,7 +120,7 @@ export function verifyPassword(password: string, storedHash: string | null | und
       return crypto.timingSafeEqual(actualBuf, expectedBuf);
     }
 
-    // Legacy hash compatibility (verified with timingSafeEqual, rehashed on login)
+    // Legacy hash compatibility (verified with timingSafeEqual, rehashed to Argon2id on login)
     const expectedBuf = Buffer.from(storedHash, 'hex');
     if (expectedBuf.length !== 32) return false;
     const actualBuf = crypto.scryptSync(password, LEGACY_STATIC_SALT, 32);
@@ -71,7 +131,82 @@ export function verifyPassword(password: string, storedHash: string | null | und
 }
 
 export function needsPasswordRehash(storedHash: string | null | undefined): boolean {
-  return Boolean(storedHash && !storedHash.startsWith('v3:'));
+  return Boolean(storedHash && !storedHash.startsWith('$argon2id$'));
+}
+
+/**
+ * Generates N unique single-use recovery codes with 80 bits of CSPRNG entropy each (16 Base32 chars: XXXX-XXXX-XXXX-XXXX).
+ */
+export function generateRecoveryCodes(count = 10): string[] {
+  const codes = new Set<string>();
+  while (codes.size < count) {
+    const bytes = crypto.randomBytes(16);
+    let raw = '';
+    for (let i = 0; i < 16; i++) {
+      raw += RECOVERY_ALPHABET[bytes[i] & 31];
+    }
+    const formatted = `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}`;
+    codes.add(formatted);
+  }
+  return Array.from(codes);
+}
+
+export function normalizeRecoveryCode(rawCode: unknown): string {
+  return String(rawCode || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .trim();
+}
+
+export function hashRecoveryCode(normalizedCode: string, providedSalt?: string): { salt: string; hash: string } {
+  const salt = providedSalt || crypto.randomBytes(16).toString('hex');
+  const hash = crypto
+    .createHash('sha256')
+    .update(`sb_recovery_v1:${salt}:${normalizedCode}`, 'utf8')
+    .digest('hex');
+  return { salt, hash };
+}
+
+export function verifyRecoveryCodeHash(normalizedCode: string, salt: string, expectedHash: string): boolean {
+  if (!normalizedCode || !salt || !expectedHash) return false;
+  try {
+    const actual = crypto
+      .createHash('sha256')
+      .update(`sb_recovery_v1:${salt}:${normalizedCode}`, 'utf8')
+      .digest();
+    const expected = Buffer.from(expectedHash, 'hex');
+    if (actual.length !== expected.length) return false;
+    return crypto.timingSafeEqual(actual, expected);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verifies privacy-preserving SHA-256 Proof-of-Work challenge solution (leading zero bits >= difficulty).
+ */
+export function countLeadingZeroBits(buf: Buffer): number {
+  let bits = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const byte = buf[i];
+    if (byte === 0) {
+      bits += 8;
+    } else {
+      bits += Math.clz32(byte) - 24;
+      break;
+    }
+  }
+  return bits;
+}
+
+export function verifyPowSolution(nonce: string, solution: string, difficulty: number): boolean {
+  if (!nonce || !solution || !Number.isInteger(difficulty) || difficulty < 1 || difficulty > 28) {
+    return false;
+  }
+  const cleanSolution = String(solution).trim();
+  if (!cleanSolution || cleanSolution.length > 64) return false;
+  const digest = crypto.createHash('sha256').update(`${nonce}:${cleanSolution}`, 'utf8').digest();
+  return countLeadingZeroBits(digest) >= difficulty;
 }
 
 /**
@@ -118,7 +253,7 @@ export function validateStrongPassword(
   for (const term of disallowedTerms) {
     const cleanTerm = String(term || '').replace(/^@/, '').trim().toLowerCase();
     if (cleanTerm.length >= 4 && lower.includes(cleanTerm)) {
-      return { valid: false, error: 'Password cannot contain your username or email.' };
+      return { valid: false, error: 'Password cannot contain your username.' };
     }
   }
 
@@ -346,6 +481,12 @@ export function parseDeviceFromUserAgent(userAgent?: string | null): {
   };
 }
 
+export function computeProgressiveDelayMs(failureCount: number): number {
+  if (failureCount <= 2) return 0;
+  if (failureCount === 3) return 1000;
+  return 2500;
+}
+
 export function recordSecurityEvent(params: {
   userId?: string | null;
   eventType: string;
@@ -364,19 +505,42 @@ export function recordSecurityEvent(params: {
       if (!exists) safeUserId = null;
     }
 
+    const redactValue = (val: unknown): unknown => {
+      if (typeof val !== 'string') return val;
+      return val
+        .replace(/Bearer\s+[a-zA-Z0-9._-]+/gi, 'Bearer [REDACTED]')
+        .replace(/\b[a-f0-9]{48,}\b/gi, '[REDACTED_TOKEN]');
+    };
+
     // Never log sensitive keys into details_json
     let sanitizedDetails: string | null = null;
     if (params.details) {
       const clean: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(params.details)) {
         const lk = k.toLowerCase();
-        if (lk.includes('password') || lk.includes('token') || lk.includes('secret') || lk.includes('code') || lk.includes('otp')) {
+        if (
+          lk.includes('password') ||
+          lk.includes('token') ||
+          lk.includes('secret') ||
+          lk.includes('code') ||
+          lk.includes('otp') ||
+          lk.includes('hash') ||
+          lk.includes('salt') ||
+          lk.includes('cookie') ||
+          lk.includes('auth') ||
+          lk.includes('reset') ||
+          lk.includes('verif')
+        ) {
           continue;
         }
-        clean[k] = v;
+        clean[k] = redactValue(v);
       }
       sanitizedDetails = JSON.stringify(clean);
     }
+
+    const safeIdentifier = params.identifier
+      ? sanitizeInputText(String(redactValue(params.identifier)), 120)
+      : null;
 
     db.prepare(`
       INSERT INTO security_events (
@@ -387,7 +551,7 @@ export function recordSecurityEvent(params: {
       safeUserId,
       sanitizeInputText(params.eventType, 64) || 'SECURITY_EVENT',
       params.severity || 'info',
-      params.identifier ? sanitizeInputText(params.identifier, 120) : null,
+      safeIdentifier,
       params.ipAddress ? sanitizeInputText(params.ipAddress, 64) : null,
       params.userAgent ? sanitizeInputText(params.userAgent, 220) : null,
       params.deviceName ? sanitizeInputText(params.deviceName, 80) : null,

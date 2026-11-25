@@ -1,12 +1,38 @@
 import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { SqliteConnectionPool } from './pool';
-import { hashPassword, verifyPassword } from '../utils/security';
+import { fileURLToPath } from 'node:url';
+import { SqliteConnectionPool } from './pool.js';
+import { hashPassword, verifyPassword } from '../utils/security.js';
 
-// Allow isolated database path for load testing or staging without touching production data
-const DEFAULT_DB_DIR = path.resolve(process.cwd(), 'data');
+const __dbFilename = fileURLToPath(import.meta.url);
+const __dbDirname = path.dirname(__dbFilename);
+
+function isDirWritable(targetDir: string): boolean {
+  try {
+    fs.accessSync(targetDir, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const isServerlessRuntime = Boolean(
+  process.env.VERCEL ||
+    process.env.VERCEL_ENV ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.NETLIFY
+);
+
+// Use local ./data on writable Node servers, and fall back to os.tmpdir() on read-only serverless bundles (/var/task)
+const localDataDir = path.resolve(process.cwd(), 'data');
+const DEFAULT_DB_DIR =
+  isServerlessRuntime || (!fs.existsSync(localDataDir) && !isDirWritable(process.cwd()))
+    ? path.join(os.tmpdir(), 'schoolbackdoor-data')
+    : localDataDir;
+
 export const DB_FILE = process.env.SCHOOLBACKDOOR_DB_PATH
   ? path.resolve(process.env.SCHOOLBACKDOOR_DB_PATH)
   : path.join(DEFAULT_DB_DIR, 'schoolbackdoor.db');
@@ -23,7 +49,13 @@ export const CACHE_DIR = process.env.SCHOOLBACKDOOR_CACHE_DIR
 export const LOGS_DIR = process.env.SCHOOLBACKDOOR_LOGS_DIR
   ? path.resolve(process.env.SCHOOLBACKDOOR_LOGS_DIR)
   : path.join(DB_DIR, 'logs');
-const SCHEMA_FILE = path.resolve(process.cwd(), 'server', 'db', 'schema.sql');
+
+const SCHEMA_CANDIDATES = [
+  path.resolve(__dbDirname, 'schema.sql'),
+  path.resolve(process.cwd(), 'server', 'db', 'schema.sql'),
+  path.resolve('/var/task', 'server', 'db', 'schema.sql'),
+];
+const SCHEMA_FILE = SCHEMA_CANDIDATES.find((candidate) => fs.existsSync(candidate)) || SCHEMA_CANDIDATES[0];
 
 // Ensure data runtime folders exist cleanly
 for (const dir of [DB_DIR, BACKUP_DIR, TMP_DIR, CACHE_DIR, LOGS_DIR]) {
@@ -181,6 +213,81 @@ export function initDatabase() {
     safeAddColumn('users', 'accepted_terms_at DATETIME');
     safeAddColumn('users', 'accepted_terms_version TEXT');
     safeAddColumn('users', 'last_reauthenticated_at DATETIME');
+    safeAddColumn('users', 'recovery_codes_generated_at DATETIME');
+    safeAddColumn('users', 'recovery_codes_remaining INTEGER DEFAULT 0');
+
+    // Stage 3B non-destructive migration: make legacy users.email nullable while preserving all existing rows & hashes
+    try {
+      const userCols = db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string; notnull: number }>;
+      const emailCol = userCols.find((c) => c.name === 'email');
+      if (emailCol && emailCol.notnull === 1) {
+        db.exec('PRAGMA foreign_keys = OFF;');
+        try {
+          runInTransaction(() => {
+            db.exec(`
+              CREATE TABLE users_stage3b_migrated (
+                id TEXT PRIMARY KEY,
+                matric_number TEXT UNIQUE NOT NULL,
+                email TEXT,
+                phone_number TEXT,
+                username TEXT,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'student' CHECK(role IN ('student', 'staff', 'admin', 'moderator')),
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'pending_verification')),
+                is_verified INTEGER DEFAULT 0,
+                verification_code TEXT,
+                suspension_reason TEXT,
+                suspended_until DATETIME,
+                suspended_by TEXT,
+                last_active_at DATETIME,
+                mfa_enabled INTEGER DEFAULT 0,
+                mfa_secret TEXT,
+                account_restricted_until DATETIME,
+                restriction_reason TEXT,
+                restricted_by TEXT,
+                warnings_count INTEGER DEFAULT 0,
+                accepted_terms_at DATETIME,
+                accepted_terms_version TEXT,
+                last_reauthenticated_at DATETIME,
+                recovery_codes_generated_at DATETIME,
+                recovery_codes_remaining INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+              );
+            `);
+            db.exec(`
+              INSERT INTO users_stage3b_migrated (
+                id, matric_number, email, phone_number, username, password_hash,
+                role, status, is_verified, verification_code,
+                suspension_reason, suspended_until, suspended_by, last_active_at,
+                mfa_enabled, mfa_secret, account_restricted_until, restriction_reason,
+                restricted_by, warnings_count, accepted_terms_at, accepted_terms_version,
+                last_reauthenticated_at, recovery_codes_generated_at, recovery_codes_remaining,
+                created_at, updated_at
+              )
+              SELECT
+                id, matric_number, email, phone_number, username, password_hash,
+                role, status, COALESCE(is_verified, 0), verification_code,
+                suspension_reason, suspended_until, suspended_by, last_active_at,
+                COALESCE(mfa_enabled, 0), mfa_secret, account_restricted_until, restriction_reason,
+                restricted_by, COALESCE(warnings_count, 0), accepted_terms_at, accepted_terms_version,
+                last_reauthenticated_at, recovery_codes_generated_at, COALESCE(recovery_codes_remaining, 0),
+                created_at, updated_at
+              FROM users;
+            `);
+            db.exec('DROP TABLE users;');
+            db.exec('ALTER TABLE users_stage3b_migrated RENAME TO users;');
+            db.exec('CREATE INDEX IF NOT EXISTS idx_users_matric ON users(matric_number);');
+            db.exec('CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);');
+          });
+        } finally {
+          db.exec('PRAGMA foreign_keys = ON;');
+        }
+      }
+    } catch {
+      // Non-fatal if already migrated
+    }
+
     safeAddColumn('sessions', 'id TEXT');
     safeAddColumn('sessions', 'device_name TEXT');
     safeAddColumn('sessions', "device_type TEXT DEFAULT 'desktop'");
@@ -191,6 +298,7 @@ export function initDatabase() {
     safeAddColumn('sessions', 'revoked_at DATETIME');
     safeAddColumn('sessions', 'revoked_reason TEXT');
     safeAddColumn('sessions', 'is_suspicious INTEGER DEFAULT 0');
+    safeAddColumn('sessions', "auth_method TEXT DEFAULT 'password'");
     safeAddColumn('user_profiles', 'location_sharing_enabled INTEGER DEFAULT 0');
     safeAddColumn('user_profiles', 'preferred_location_area TEXT');
 
@@ -228,6 +336,7 @@ export function initDatabase() {
     safeAddColumn('subscriptions', "channel TEXT DEFAULT 'moniepoint'");
 
     safeAddColumn('password_resets', 'failed_attempts INTEGER DEFAULT 0');
+    safeAddColumn('password_resets', 'reset_code_hash TEXT');
     safeAddColumn('reports', 'assigned_to TEXT');
     safeAddColumn('reports', 'escalated_to_admin INTEGER DEFAULT 0');
     safeAddColumn('reports', 'escalation_reason TEXT');
@@ -735,7 +844,41 @@ export function initDatabase() {
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
         UNIQUE(user_id, dedupe_key)
       );
+
+      CREATE TABLE IF NOT EXISTS email_verifications (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        email TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        token_hash TEXT UNIQUE NOT NULL,
+        expires_at DATETIME NOT NULL,
+        used_at DATETIME,
+        failed_attempts INTEGER NOT NULL DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS registration_idempotency (
+        idempotency_key TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        expires_at DATETIME NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS passkey_recovery_tokens (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        token_hash TEXT UNIQUE NOT NULL,
+        credential_id TEXT NOT NULL,
+        expires_at DATETIME NOT NULL,
+        used_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
     `);
+
+    safeAddColumn('webauthn_challenges', "purpose TEXT NOT NULL DEFAULT 'login'");
 
     // Performance Indexes for Feed, Messaging, Expiry Sweeps, Activity Analytics & Presence
     const indexes = [
@@ -791,6 +934,23 @@ export function initDatabase() {
       'CREATE INDEX IF NOT EXISTS idx_saved_locations_user_pinned ON saved_locations(user_id, is_pinned DESC, updated_at DESC);',
       'CREATE INDEX IF NOT EXISTS idx_saved_locations_user_used ON saved_locations(user_id, COALESCE(last_used_at, updated_at) DESC);',
       'CREATE INDEX IF NOT EXISTS idx_loc_history_user_recent ON location_search_history(user_id, searched_at DESC);',
+      'CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_lookup ON login_attempts(ip_address, attempted_at);',
+      'CREATE INDEX IF NOT EXISTS idx_email_verif_user ON email_verifications(user_id, created_at DESC);',
+      'CREATE INDEX IF NOT EXISTS idx_email_verif_token ON email_verifications(token_hash);',
+      'CREATE INDEX IF NOT EXISTS idx_email_verif_code ON email_verifications(user_id, code_hash);',
+      'CREATE INDEX IF NOT EXISTS idx_password_resets_hash ON password_resets(reset_code_hash, is_used);',
+      'CREATE INDEX IF NOT EXISTS idx_recovery_codes_active ON recovery_codes(user_id, used_at, invalidated_at);',
+      'CREATE INDEX IF NOT EXISTS idx_recovery_codes_hash ON recovery_codes(code_hash);',
+      'CREATE INDEX IF NOT EXISTS idx_account_lockouts_user ON account_lockouts(user_id);',
+      'CREATE INDEX IF NOT EXISTS idx_bot_challenges_expires ON bot_challenges(expires_at);',
+      'CREATE INDEX IF NOT EXISTS idx_webauthn_creds_user ON webauthn_credentials(user_id);',
+      'CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_expires ON webauthn_challenges(expires_at);',
+      'CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_purpose ON webauthn_challenges(challenge, ceremony_type, purpose);',
+      'CREATE INDEX IF NOT EXISTS idx_passkey_recovery_expires ON passkey_recovery_tokens(expires_at);',
+      'DROP INDEX IF EXISTS idx_users_email_lower;',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users(LOWER(email)) WHERE email IS NOT NULL;',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username)) WHERE username IS NOT NULL;',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_handle_lower ON user_profiles(LOWER(handle));',
     ];
 
     for (const sql of indexes) {
@@ -866,10 +1026,8 @@ export function syncTheBackdoorAdminIdentity() {
       UPDATE users
       SET matric_number = 'ADMIN/001',
           username = '@THEBACKDOOR',
-          email = 'admin@schoolbackdoor.app',
           role = 'admin',
           status = 'active',
-          is_verified = 1,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(adminRow.id);
@@ -926,7 +1084,7 @@ export function syncDefaultModeratorAccount() {
       const modId = 'u-mod';
       db.prepare(`
         INSERT INTO users (id, matric_number, email, username, password_hash, role, status, is_verified, accepted_terms_version, accepted_terms_at)
-        VALUES (?, 'MOD/001', 'moderator@schoolbackdoor.app', '@campus_mod', ?, 'moderator', 'active', 1, '2026.11', CURRENT_TIMESTAMP)
+        VALUES (?, 'MOD/001', NULL, '@campus_mod', ?, 'moderator', 'active', 0, '2026.11', CURRENT_TIMESTAMP)
       `).run(modId, modHash);
 
       db.prepare(`

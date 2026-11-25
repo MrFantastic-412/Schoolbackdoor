@@ -1,8 +1,8 @@
-import { db } from '../db/database';
-import { cache } from '../utils/cache';
-import { sseManager } from '../realtime/sseManager';
-import { adminSecurityService } from './adminSecurityService';
-import { notificationService } from './notificationService';
+import { db } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { sseManager } from '../realtime/sseManager.js';
+import { adminSecurityService } from './adminSecurityService.js';
+import { notificationService } from './notificationService.js';
 
 export const adminReportService = {
   createReport(reporterId: string, input: {

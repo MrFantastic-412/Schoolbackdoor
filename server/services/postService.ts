@@ -1,20 +1,20 @@
-import { db, runInTransaction, withReadConnection } from '../db/database';
-import { cache } from '../utils/cache';
-import { landmarkService } from './landmarkService';
-import { fileService } from './fileService';
-import { deletionService } from './deletionService';
-import { mentionService } from './mentionService';
-import { validateLocationInput } from '../utils/security';
+import { db, runInTransaction, withReadConnection } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { landmarkService } from './landmarkService.js';
+import { fileService } from './fileService.js';
+import { deletionService } from './deletionService.js';
+import { mentionService } from './mentionService.js';
+import { validateLocationInput } from '../utils/security.js';
 import {
   FeedCategory,
   feedRankingService,
   normalizeFeedCategory,
-} from './feedRankingService';
+} from './feedRankingService.js';
 import {
   LocationFilterKey,
   inferPostLocation,
   isValidLocationFilter,
-} from './locationTaxonomy';
+} from './locationTaxonomy.js';
 
 export const POST_EPHEMERAL_TTL_MS = 72 * 60 * 60 * 1000;
 

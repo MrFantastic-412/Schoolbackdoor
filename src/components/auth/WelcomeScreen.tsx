@@ -253,10 +253,10 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
                   <div className="p-4 rounded-2xl glass-subtle space-y-1.5">
                     <ShieldCheck className="w-4 h-4 text-[#C4718E] dark:text-[#E5A4BA]" />
                     <div className="font-serif font-bold text-sm text-[#171613] dark:text-[#F5EFE3]">
-                      Simple Gmail &amp; @Handle Auth
+                      Private @Handle Auth
                     </div>
                     <p className="text-[#82796F] dark:text-[#A89F95] leading-relaxed">
-                      Sign up in seconds with your unique @username and Gmail address, backed by scrypt hashing.
+                      Sign up in seconds with just your @username, Argon2id password protection, and single-use recovery codes.
                     </p>
                   </div>
                   <div className="p-4 rounded-2xl glass-subtle space-y-1.5">

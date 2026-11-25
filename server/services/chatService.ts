@@ -1,16 +1,16 @@
-import { db, runInTransaction } from '../db/database';
-import { blockService } from './blockService';
-import { sseManager } from '../realtime/sseManager';
-import { presenceService } from './presenceService';
-import { fileService } from './fileService';
-import { notificationService } from './notificationService';
-import { mentionService } from './mentionService';
+import { db, runInTransaction } from '../db/database.js';
+import { blockService } from './blockService.js';
+import { sseManager } from '../realtime/sseManager.js';
+import { presenceService } from './presenceService.js';
+import { fileService } from './fileService.js';
+import { notificationService } from './notificationService.js';
+import { mentionService } from './mentionService.js';
 import {
   extractMentionHandles,
   formatMentionSnippet,
   ResolvedMention,
-} from '../utils/mentions';
-import { escapeLikePattern, validateLocationInput } from '../utils/security';
+} from '../utils/mentions.js';
+import { escapeLikePattern, validateLocationInput } from '../utils/security.js';
 
 export interface SendMessageInput {
   text?: string;

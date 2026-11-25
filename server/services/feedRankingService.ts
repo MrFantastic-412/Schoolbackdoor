@@ -1,13 +1,13 @@
 import crypto from 'node:crypto';
-import { db, runInTransaction, withReadConnection } from '../db/database';
-import { cache } from '../utils/cache';
+import { db, runInTransaction, withReadConnection } from '../db/database.js';
+import { cache } from '../utils/cache.js';
 import {
   CampusAreaKey,
   LocationFilterKey,
   computeLocationRelevanceScore,
   inferPostLocation,
   normalizeAreaKey,
-} from './locationTaxonomy';
+} from './locationTaxonomy.js';
 
 export type FeedCategory = 'for_you' | 'nearby' | 'latest' | 'trending';
 

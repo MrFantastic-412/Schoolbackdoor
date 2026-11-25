@@ -1,6 +1,6 @@
-import { db, runInTransaction, withReadConnection } from '../db/database';
-import { cache } from '../utils/cache';
-import { escapeLikePattern } from '../utils/security';
+import { db, runInTransaction, withReadConnection } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { escapeLikePattern } from '../utils/security.js';
 
 export interface LandmarkRecord {
   id: string;

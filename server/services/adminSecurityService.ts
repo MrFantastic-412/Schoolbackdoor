@@ -12,13 +12,13 @@ import {
   DB_DIR,
   BACKUP_DIR,
   TMP_DIR,
-} from '../db/database';
-import { UserRole } from '../middleware/auth';
-import { presenceService } from './presenceService';
-import { sseManager } from '../realtime/sseManager';
-import { cache } from '../utils/cache';
-import { fileService } from './fileService';
-import { deletionService } from './deletionService';
+} from '../db/database.js';
+import { UserRole } from '../middleware/auth.js';
+import { presenceService } from './presenceService.js';
+import { sseManager } from '../realtime/sseManager.js';
+import { cache } from '../utils/cache.js';
+import { fileService } from './fileService.js';
+import { deletionService } from './deletionService.js';
 
 // Ensure backups directory exists
 if (!fs.existsSync(BACKUP_DIR)) {

@@ -1,6 +1,6 @@
-import { db, withReadConnection } from '../db/database';
-import { sseManager } from '../realtime/sseManager';
-import { extractMentionHandles, formatMentionSnippet } from '../utils/mentions';
+import { db, withReadConnection } from '../db/database.js';
+import { sseManager } from '../realtime/sseManager.js';
+import { extractMentionHandles, formatMentionSnippet } from '../utils/mentions.js';
 
 export type NotificationType =
   | 'like'

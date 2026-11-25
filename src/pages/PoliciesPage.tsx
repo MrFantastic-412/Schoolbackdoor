@@ -205,7 +205,7 @@ export const PoliciesPage: React.FC<PoliciesPageProps> = ({
                   <p>We collect only what is needed to run your account cleanly:</p>
                   <ul className="list-disc pl-5 mt-1.5 space-y-1 text-xs">
                     <li>
-                      <strong className="text-[#171613] dark:text-[#F5EFE3]">Account Credentials:</strong> Unique username handle (<code>@username</code>), Gmail address (used for verification and password recovery), and salted <code>scrypt</code> password hash.
+                      <strong className="text-[#171613] dark:text-[#F5EFE3]">Account Credentials:</strong> Unique username handle (<code>@username</code>), Argon2id password hash, optional WebAuthn passkeys, and hashed single-use recovery codes.
                     </li>
                     <li>
                       <strong className="text-[#171613] dark:text-[#F5EFE3]">Optional Profile Details:</strong> Display name, biography, department, academic level, hostel/area, and avatar color choice.
@@ -215,7 +215,7 @@ export const PoliciesPage: React.FC<PoliciesPageProps> = ({
                     </li>
                   </ul>
                   <p className="mt-1.5 text-xs text-[#82796F] dark:text-[#A89F95]">
-                    We never store plaintext passwords, never sell personal data to advertisers, and never expose your Gmail address publicly on your profile or posts.
+                    We never store plaintext passwords, never sell personal data to advertisers, and never collect email addresses, phone numbers, or messaging handles for sign-in.
                   </p>
                 </div>
 
@@ -265,7 +265,7 @@ export const PoliciesPage: React.FC<PoliciesPageProps> = ({
                     1. Account Registration, Age Requirement (17+/18+) &amp; Eligibility
                   </h3>
                   <p>
-                    Registration requires confirming you are at least <strong>17+ / 18+</strong> years old, accepting these Terms &amp; Community Guidelines, a unique <code>@username</code>, a valid Gmail address (<code>@gmail.com</code>), and a strong password. You may sign in with either your <code>@username</code> or registered Gmail address. Because Schoolbackdoor is an independent social network, you do not need official university portal authorization to participate.
+                    Registration requires confirming you are at least <strong>17+ / 18+</strong> years old, accepting these Terms &amp; Community Guidelines, choosing a unique <code>@username</code>, and setting a strong password. You receive 10 single-use recovery codes at registration for offline account recovery. Because Schoolbackdoor is an independent social network, you do not need official university portal authorization or an email address to participate.
                   </p>
                 </div>
 
@@ -379,7 +379,7 @@ export const PoliciesPage: React.FC<PoliciesPageProps> = ({
                     1. Data Collection &amp; Multi-Device Session Security
                   </h3>
                   <p>
-                    Account records, social connections, and active content are stored on secured application servers with salted <code>scrypt</code> password hashing, SHA-256 hashed session tokens, <strong>15-minute access cookies</strong>, rotating <strong>30-day inactivity refresh tokens</strong>, a <strong>90-day hard session lifetime</strong>, and up to <strong>5 concurrent signed-in devices</strong>. We never expose raw database identifiers, personal emails, or private direct messages to unauthorized users.
+                    Account records, social connections, and active content are stored on secured application servers with Argon2id password hashing, SHA-256 hashed session tokens, <strong>15-minute access cookies</strong>, rotating <strong>30-day inactivity refresh tokens</strong>, a <strong>90-day hard session lifetime</strong>, and up to <strong>5 concurrent signed-in devices</strong>. We never expose raw database identifiers or private direct messages to unauthorized users.
                   </p>
                 </div>
 
@@ -406,7 +406,7 @@ export const PoliciesPage: React.FC<PoliciesPageProps> = ({
                     You can delete your account permanently at any time inside <strong>Settings → Data &amp; NDPA</strong> or via the public web deletion page at <a href="/account-deletion" target="_blank" rel="noopener noreferrer" className="underline font-semibold text-[#C4718E]">/account-deletion</a>:
                   </p>
                   <ul className="list-disc pl-5 mt-1.5 space-y-1 text-xs">
-                    <li>Your user profile, username, Gmail, password hash, and all active device sessions are erased immediately after password verification.</li>
+                    <li>Your user profile, @username, recovery codes, password hash, and all active device sessions are erased immediately after password verification.</li>
                     <li>All authored posts, replies, likes, reposts, connections, and chat histories are cascaded and deleted.</li>
                     <li>A cryptographic SHA-256 tombstone ensures disaster-recovery snapshots (rotated after <strong>14 days</strong>) never restore your deleted account.</li>
                   </ul>
@@ -567,9 +567,9 @@ export const PoliciesPage: React.FC<PoliciesPageProps> = ({
                     </p>
                   </div>
                   <div className="p-3.5 rounded-xl glass-subtle">
-                    <strong className="text-[#171613] dark:text-[#F5EFE3] block mb-1">Gmail Verification & Recovery</strong>
+                    <strong className="text-[#171613] dark:text-[#F5EFE3] block mb-1">Recovery Codes &amp; Account Lockout</strong>
                     <p className="text-[#82796F] dark:text-[#A89F95]">
-                      6-digit codes issued instantly; manual account recovery requests handled within <strong className="text-[#171613] dark:text-[#F5EFE3]">12 hours</strong>.
+                      Use any unused single-use recovery code to reset your password anytime. If you lose your password, passkey, and all recovery codes, support cannot recover the account.
                     </p>
                   </div>
                   <div className="p-3.5 rounded-xl glass-subtle">

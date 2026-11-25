@@ -1,11 +1,11 @@
-import { db, withReadConnection } from '../db/database';
-import { notificationService } from './notificationService';
+import { db, withReadConnection } from '../db/database.js';
+import { notificationService } from './notificationService.js';
 import {
   extractMentionHandles,
   formatMentionSnippet,
   ResolvedMention,
-} from '../utils/mentions';
-import { escapeLikePattern } from '../utils/security';
+} from '../utils/mentions.js';
+import { escapeLikePattern } from '../utils/security.js';
 
 export type MentionSourceType = 'post' | 'comment' | 'msg';
 

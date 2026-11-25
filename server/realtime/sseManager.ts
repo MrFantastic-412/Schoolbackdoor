@@ -1,6 +1,6 @@
 import { Response } from 'express';
-import { db } from '../db/database';
-import { presenceService, OnlinePresenceSummary } from '../services/presenceService';
+import { db } from '../db/database.js';
+import { presenceService, OnlinePresenceSummary } from '../services/presenceService.js';
 
 interface SseConnectionEntry {
   res: Response;

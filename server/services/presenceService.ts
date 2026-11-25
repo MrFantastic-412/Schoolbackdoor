@@ -1,5 +1,5 @@
-import { db, runInTransaction } from '../db/database';
-import { cache } from '../utils/cache';
+import { db, runInTransaction } from '../db/database.js';
+import { cache } from '../utils/cache.js';
 
 // Sliding presence window (90 seconds covers 45s heartbeat interval + network jitter)
 export const PRESENCE_TTL_SECONDS = 90;

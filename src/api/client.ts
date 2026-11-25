@@ -49,6 +49,7 @@ import {
   PaymentRecordsResponse,
   SavedLocation,
   LocationSearchHistoryItem,
+  PasskeySummary,
 } from '../types';
 
 const API_BASE = '/api';
@@ -127,6 +128,63 @@ scrubLegacyStoredTokens();
 
 const rawFetch = globalThis.fetch.bind(globalThis);
 
+function isJsonContentType(contentType: string | null): boolean {
+  if (!contentType) return false;
+  const normalized = contentType.toLowerCase();
+  return normalized.includes('application/json') || normalized.includes('+json') || normalized.includes('text/json');
+}
+
+async function readJsonSafely<T = any>(
+  res: Response
+): Promise<{ isJson: boolean; data: T | null; rawText: string }> {
+  const ct = res.headers.get('content-type');
+  const rawText = await res.text().catch(() => '');
+  if (!rawText.trim()) {
+    return { isJson: isJsonContentType(ct), data: null, rawText };
+  }
+  if (ct && !isJsonContentType(ct)) {
+    return { isJson: false, data: null, rawText };
+  }
+  try {
+    return { isJson: true, data: JSON.parse(rawText) as T, rawText };
+  } catch {
+    return { isJson: false, data: null, rawText };
+  }
+}
+
+async function parseJsonOrThrow<T = any>(res: Response, fallbackError: string): Promise<T> {
+  const { isJson, data, rawText } = await readJsonSafely<any>(res);
+  if (!res.ok) {
+    const serverMsg =
+      (isJson && data && typeof data.error === 'string' && data.error) ||
+      (isJson && data && typeof data.message === 'string' && data.message) ||
+      '';
+    const textHint =
+      !serverMsg && rawText.trim() && !rawText.trim().startsWith('<') && rawText.trim().length < 180
+        ? `${fallbackError} (${rawText.trim()})`
+        : fallbackError;
+    const err: any = new Error(serverMsg || textHint);
+    err.status = res.status;
+    if (isJson && data) {
+      if (data.code) err.code = data.code;
+      if (data.mfaRequired !== undefined) err.mfaRequired = Boolean(data.mfaRequired);
+      if (data.retryAfterSeconds !== undefined) err.retryAfterSeconds = data.retryAfterSeconds;
+    }
+    throw err;
+  }
+  if (!isJson || data === null) {
+    throw new Error(`${fallbackError} (Unexpected non-JSON response from server.)`);
+  }
+  return data as T;
+}
+
+async function parseJsonOrFallback<T>(res: Response, fallbackValue: T): Promise<T> {
+  if (!res.ok) return fallbackValue;
+  const { isJson, data } = await readJsonSafely<T>(res);
+  if (!isJson || data === null) return fallbackValue;
+  return data;
+}
+
 async function refreshAccessToken(): Promise<boolean> {
   if (Date.now() < noRefreshCooldownUntil) return false;
   if (refreshPromise) return refreshPromise;
@@ -143,7 +201,10 @@ async function refreshAccessToken(): Promise<boolean> {
         noRefreshCooldownUntil = Date.now() + 2500;
         return false;
       }
-      const data = await res.json().catch(() => ({}));
+      const { isJson, data } = await readJsonSafely<any>(res);
+      if (!isJson || !data) {
+        return false;
+      }
       if (data?.token) {
         inMemoryAuthToken = data.token;
       }
@@ -163,10 +224,12 @@ async function refreshAccessToken(): Promise<boolean> {
 const SKIP_REFRESH_PATHS = [
   '/auth/login',
   '/auth/register',
+  '/auth/challenge',
   '/auth/refresh',
   '/auth/logout',
-  '/auth/forgot-password',
-  '/auth/reset-password',
+  '/auth/recovery/reset',
+  '/auth/passkeys/login',
+  '/auth/passkeys/recovery',
 ];
 
 async function fetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
@@ -258,21 +321,35 @@ export const api = {
   // --- Diagnostics ---
   async getHealth() {
     const res = await fetch(`${API_BASE}/health`);
-    return res.json();
+    return parseJsonOrThrow(res, "Unable to load health diagnostics.");
   },
 
   async getStats() {
     const res = await fetch(`${API_BASE}/stats`);
-    return res.json();
+    return parseJsonOrThrow(res, "Unable to load platform statistics.");
   },
 
   // --- Authentication ---
+  async getBotChallenge(): Promise<{
+    challengeId: string;
+    nonce: string;
+    difficulty: number;
+    expiresAt: string;
+  }> {
+    const res = await fetch(`${API_BASE}/auth/challenge`);
+    return parseJsonOrThrow(res, 'Unable to initialize signup security check.');
+  },
+
   async register(data: {
-    identifier?: string;
-    email?: string;
     username: string;
     password: string;
+    confirmPassword: string;
     acceptTerms: boolean;
+    idempotencyKey?: string;
+    botChallengeId: string;
+    botChallengeNonce: string;
+    botChallengeSolution: string;
+    honeypot?: string;
     name?: string;
     department?: string;
     level?: string;
@@ -282,18 +359,16 @@ export const api = {
     avatarThumbnailDataUrl?: string;
     avatarUrl?: string;
   }) {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (data.idempotencyKey) {
+      headers['Idempotency-Key'] = data.idempotencyKey;
+    }
     const res = await fetch(`${API_BASE}/auth/register`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) {
-      const err: any = new Error(result.error || 'Registration failed.');
-      err.status = res.status;
-      err.code = result.code;
-      throw err;
-    }
+    const result = await parseJsonOrThrow<any>(res, 'Registration failed.');
     if (result.token) {
       this.setToken(result.token);
     } else {
@@ -307,8 +382,8 @@ export const api = {
     if (cached) return cached;
     try {
       const res = await fetch(`${API_BASE}/platform/config`);
-      if (!res.ok) return null;
-      const data = (await res.json()) as PlatformConfig;
+      const data = await parseJsonOrFallback<PlatformConfig | null>(res, null);
+      if (!data) return null;
       setPublicCached('platform:config', data, 10000);
       return data;
     } catch {
@@ -316,20 +391,13 @@ export const api = {
     }
   },
 
-  async login(identifier: string, password: string, mfaCode?: string) {
+  async login(username: string, password: string, mfaCode?: string) {
     const res = await fetch(`${API_BASE}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier, password, mfaCode }),
+      body: JSON.stringify({ username, password, mfaCode }),
     });
-    const result = await res.json();
-    if (!res.ok) {
-      const err: any = new Error(result.error || 'Authentication failed.');
-      err.mfaRequired = Boolean(result.mfaRequired);
-      err.code = result.code;
-      err.retryAfterSeconds = result.retryAfterSeconds;
-      throw err;
-    }
+    const result = await parseJsonOrThrow<any>(res, 'Authentication failed.');
     if (result.token) {
       this.setToken(result.token);
     } else {
@@ -359,10 +427,7 @@ export const api = {
   async getOnlinePresence(): Promise<PresenceSummary> {
     try {
       const res = await fetch(`${API_BASE}/presence/online`, { headers: getAuthHeaders() });
-      if (!res.ok) {
-        return { onlineCount: 0, message: '0 students online now.', updatedAt: new Date().toISOString() };
-      }
-      return res.json();
+      return parseJsonOrFallback(res, { onlineCount: 0, message: '0 students online now.', updatedAt: new Date().toISOString() });
     } catch {
       return { onlineCount: 0, message: '0 students online now.', updatedAt: new Date().toISOString() };
     }
@@ -375,8 +440,7 @@ export const api = {
         headers: getAuthHeaders(),
         body: JSON.stringify({ clientId: getOrCreateTabClientId() }),
       });
-      if (!res.ok) return null;
-      return res.json();
+      return parseJsonOrFallback(res, null);
     } catch {
       return null;
     }
@@ -396,46 +460,160 @@ export const api = {
     }
   },
 
-  async verifyAccount(code: string) {
-    const res = await fetch(`${API_BASE}/auth/verify`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: JSON.stringify({ code }),
-    });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Verification failed.');
-    return result;
-  },
-
-  async resendVerificationCode() {
-    const res = await fetch(`${API_BASE}/auth/verify/resend`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-    });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Unable to resend verification code.');
-    return result;
-  },
-
-  async forgotPassword(identifier: string) {
-    const res = await fetch(`${API_BASE}/auth/forgot-password`, {
+  // --- Password Recovery & Single-Use Recovery Codes ---
+  async resetPasswordWithRecoveryCode(data: {
+    username: string;
+    recoveryCode: string;
+    newPassword: string;
+    confirmPassword: string;
+  }): Promise<{ success: boolean; message: string }> {
+    const res = await fetch(`${API_BASE}/auth/recovery/reset`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier }),
+      body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Password recovery failed.');
+    return parseJsonOrThrow(res, 'Unable to reset password.');
+  },
+
+  async getRecoveryCodeStatus(): Promise<{ remainingCount: number; totalCount: number; generatedAt: string | null }> {
+    const res = await fetch(`${API_BASE}/auth/recovery-codes/status`, {
+      headers: getAuthHeaders(),
+    });
+    return parseJsonOrThrow(res, 'Unable to load recovery code status.');
+  },
+
+  async regenerateRecoveryCodes(currentPassword: string): Promise<{
+    success: boolean;
+    recoveryCodes: string[];
+    remainingCount: number;
+    totalCount: number;
+    generatedAt: string;
+  }> {
+    const res = await fetch(`${API_BASE}/auth/recovery-codes/regenerate`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ currentPassword }),
+    });
+    return parseJsonOrThrow(res, 'Unable to regenerate recovery codes.');
+  },
+
+  // --- Passkeys / WebAuthn (Stage 3C) ---
+  async listPasskeys(): Promise<PasskeySummary[]> {
+    const res = await fetch(`${API_BASE}/auth/passkeys`, {
+      headers: getAuthHeaders(),
+    });
+    const data = await parseJsonOrThrow<{ passkeys: PasskeySummary[] }>(res, 'Unable to load passkeys.');
+    return Array.isArray(data?.passkeys) ? data.passkeys : [];
+  },
+
+  async getPasskeyRegisterOptions(): Promise<any> {
+    const res = await fetch(`${API_BASE}/auth/passkeys/register/options`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({}),
+    });
+    return parseJsonOrThrow(res, 'Unable to start passkey registration.');
+  },
+
+  async verifyPasskeyRegister(response: any, label?: string): Promise<{ verified: boolean; passkey: PasskeySummary }> {
+    const res = await fetch(`${API_BASE}/auth/passkeys/register/verify`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ response, label }),
+    });
+    return parseJsonOrThrow(res, 'Unable to verify new passkey.');
+  },
+
+  async deletePasskey(id: string, currentPassword?: string): Promise<{ success: boolean; removedId: string; message: string }> {
+    const res = await fetch(`${API_BASE}/auth/passkeys/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(currentPassword ? { currentPassword } : {}),
+    });
+    return parseJsonOrThrow(res, 'Unable to remove passkey.');
+  },
+
+  async getPasskeyReauthOptions(): Promise<any> {
+    const res = await fetch(`${API_BASE}/auth/passkeys/reauth/options`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({}),
+    });
+    return parseJsonOrThrow(res, 'Unable to initialize passkey verification.');
+  },
+
+  async verifyPasskeyReauth(response: any): Promise<{ success: boolean; lastReauthenticatedAt: string }> {
+    const res = await fetch(`${API_BASE}/auth/passkeys/reauth/verify`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ response }),
+    });
+    return parseJsonOrThrow(res, 'Passkey verification failed.');
+  },
+
+  async getPasskeyLoginOptions(username?: string): Promise<any> {
+    const res = await fetch(`${API_BASE}/auth/passkeys/login/options`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(username?.trim() ? { username: username.trim() } : {}),
+    });
+    return parseJsonOrThrow(res, 'Unable to initialize passkey sign-in.');
+  },
+
+  async verifyPasskeyLogin(response: any) {
+    const res = await fetch(`${API_BASE}/auth/passkeys/login/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response }),
+    });
+    const result = await parseJsonOrThrow<any>(res, 'Passkey sign-in failed.');
+    if (result.token) {
+      this.setToken(result.token);
+    } else {
+      hasKnownSession = true;
+    }
     return result;
   },
 
-  async resetPassword(resetCode: string, newPassword: string, identifier?: string) {
-    const res = await fetch(`${API_BASE}/auth/reset-password`, {
+  async getPasskeyRecoveryOptions(username?: string): Promise<any> {
+    const res = await fetch(`${API_BASE}/auth/passkeys/recovery/options`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ resetCode, newPassword, ...(identifier ? { identifier } : {}) }),
+      body: JSON.stringify(username?.trim() ? { username: username.trim() } : {}),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Password reset failed.');
+    return parseJsonOrThrow(res, 'Unable to initialize passkey recovery.');
+  },
+
+  async verifyPasskeyRecovery(response: any): Promise<{
+    verified: boolean;
+    recoveryToken: string;
+    expiresAt: string;
+    username: string;
+  }> {
+    const res = await fetch(`${API_BASE}/auth/passkeys/recovery/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response }),
+    });
+    return parseJsonOrThrow(res, 'Passkey verification failed.');
+  },
+
+  async resetPasswordWithPasskeyRecovery(data: {
+    recoveryToken: string;
+    newPassword: string;
+    confirmPassword: string;
+  }) {
+    const res = await fetch(`${API_BASE}/auth/passkeys/recovery/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const result = await parseJsonOrThrow<any>(res, 'Unable to reset password with passkey.');
+    if (result.token) {
+      this.setToken(result.token);
+    } else {
+      hasKnownSession = true;
+    }
     return result;
   },
 
@@ -443,8 +621,8 @@ export const api = {
   async getProfile(): Promise<StudentProfile | null> {
     try {
       const res = await fetch(`${API_BASE}/me`, { headers: getAuthHeaders() });
-      if (!res.ok) return null;
-      const data = await res.json();
+      const data = await parseJsonOrFallback<any>(res, null);
+      if (!data) return null;
       if (data?.profile?.userId) {
         hasKnownSession = true;
       }
@@ -460,8 +638,7 @@ export const api = {
       headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ accept: true }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to accept Terms.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to accept Terms.');
     return result;
   },
 
@@ -471,8 +648,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ password }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Password verification failed.');
+    const result = await parseJsonOrThrow<any>(res, 'Password verification failed.');
     return result;
   },
 
@@ -482,8 +658,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ currentPassword, newPassword }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update password.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update password.');
     return result;
   },
 
@@ -495,16 +670,13 @@ export const api = {
     maxLifetimeDays: number;
   }> {
     const res = await fetch(`${API_BASE}/me/sessions`, { headers: getAuthHeaders() });
-    if (!res.ok) {
-      return {
+    return parseJsonOrFallback(res, {
         sessions: [],
         maxActiveDevices: 5,
         accessTtlMinutes: 15,
         refreshTtlDays: 30,
         maxLifetimeDays: 90,
-      };
-    }
-    return res.json();
+      });
   },
 
   async revokeMySession(sessionId: string): Promise<{ success: boolean; revokedSelf?: boolean }> {
@@ -512,8 +684,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to sign out device.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to sign out device.');
     if (result.revokedSelf) {
       this.clearToken();
     }
@@ -525,15 +696,23 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to revoke other device sessions.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to revoke other device sessions.');
+    return result;
+  },
+
+  async revokeAllSessions(): Promise<{ success: boolean; revokedCount: number; signedOutEverywhere: boolean }> {
+    const res = await fetch(`${API_BASE}/me/sessions/revoke-all`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+    });
+    const result = await parseJsonOrThrow<any>(res, 'Failed to sign out everywhere.');
+    this.clearToken();
     return result;
   },
 
   async getMfaStatus(): Promise<{ mfaEnabled: boolean; role: string }> {
     const res = await fetch(`${API_BASE}/auth/mfa/status`, { headers: getAuthHeaders() });
-    if (!res.ok) return { mfaEnabled: false, role: 'student' };
-    return res.json();
+    return parseJsonOrFallback(res, { mfaEnabled: false, role: 'student' });
   },
 
   async setupMfa(): Promise<{ secret: string; otpauthUri: string; sampleCurrentCode?: string }> {
@@ -541,8 +720,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to start MFA setup.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to start MFA setup.');
     return result;
   },
 
@@ -552,8 +730,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ code }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Invalid verification code.');
+    const result = await parseJsonOrThrow<any>(res, 'Invalid verification code.');
     return result;
   },
 
@@ -563,8 +740,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ password }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to disable MFA.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to disable MFA.');
     return result;
   },
 
@@ -576,8 +752,7 @@ export const api = {
       const res = await fetch(`${API_BASE}/users/search?${params.toString()}`, {
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -598,8 +773,7 @@ export const api = {
       const res = await fetch(`${API_BASE}/mentions/candidates?${params.toString()}`, {
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -608,8 +782,7 @@ export const api = {
   async getPublicProfile(userId: string): Promise<StudentProfile | null> {
     try {
       const res = await fetch(`${API_BASE}/users/${userId}/profile`, { headers: getAuthHeaders() });
-      if (!res.ok) return null;
-      return res.json();
+      return parseJsonOrFallback(res, null);
     } catch {
       return null;
     }
@@ -620,8 +793,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Unable to update connection.');
+    const result = await parseJsonOrThrow<any>(res, 'Unable to update connection.');
     return result;
   },
 
@@ -630,8 +802,7 @@ export const api = {
       const res = await fetch(`${API_BASE}/users/${userId}/posts?limit=${limit}`, {
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -649,13 +820,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(updates),
     });
-    const result = await res.json();
-    if (!res.ok) {
-      const err: any = new Error(result.error || 'Failed to update profile.');
-      err.status = res.status;
-      err.code = result.code;
-      throw err;
-    }
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update profile.');
     return result;
   },
 
@@ -739,8 +904,7 @@ export const api = {
   async getBlockedUsers(): Promise<BlockedUser[]> {
     try {
       const res = await fetch(`${API_BASE}/me/blocks`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -751,8 +915,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to block student.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to block student.');
     return result;
   },
 
@@ -761,8 +924,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to unblock student.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to unblock student.');
     return result;
   },
 
@@ -780,10 +942,12 @@ export const api = {
     if (cached) return cached;
     try {
       const res = await fetch(`${API_BASE}/feed/locations`);
-      if (!res.ok) return [];
-      const data = await res.json();
-      setPublicCached('feed:locations', data, 60000);
-      return data;
+      const data = await parseJsonOrFallback<any[] | null>(res, null);
+      if (Array.isArray(data)) {
+        setPublicCached('feed:locations', data, 60000);
+        return data;
+      }
+      return [];
     } catch {
       return [];
     }
@@ -805,16 +969,14 @@ export const api = {
         preferredLocationArea: data.locationSharingEnabled ? data.preferredLocationArea ?? null : null,
       }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update location preference.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update location preference.');
     return result;
   },
 
   async getPosts(): Promise<Post[]> {
     try {
       const res = await fetch(`${API_BASE}/posts`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -838,11 +1000,7 @@ export const api = {
     const res = await fetch(`${API_BASE}/posts?${params.toString()}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) {
-      const errBody = await res.json().catch(() => ({}));
-      throw new Error(errBody.error || 'Unable to load posts right now.');
-    }
-    return res.json();
+    return parseJsonOrThrow(res, 'Unable to load posts right now.');
   },
 
   async recordPostViews(
@@ -861,8 +1019,7 @@ export const api = {
           dwellMs: options.dwellMs ?? 900,
         }),
       });
-      if (!res.ok) return { recorded: 0, skippedBot: false, viewsByPost: {} };
-      return res.json();
+      return parseJsonOrFallback(res, { recorded: 0, skippedBot: false, viewsByPost: {} });
     } catch {
       return { recorded: 0, skippedBot: false, viewsByPost: {} };
     }
@@ -877,8 +1034,7 @@ export const api = {
           visitorId: getOrCreateFeedVisitorId(),
         }),
       });
-      if (!res.ok) return null;
-      return res.json();
+      return parseJsonOrFallback(res, null);
     } catch {
       return null;
     }
@@ -887,8 +1043,7 @@ export const api = {
   async getPostById(postId: string): Promise<Post | null> {
     try {
       const res = await fetch(`${API_BASE}/posts/${postId}`, { headers: getAuthHeaders() });
-      if (!res.ok) return null;
-      return res.json();
+      return parseJsonOrFallback(res, null);
     } catch {
       return null;
     }
@@ -912,13 +1067,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(post),
     });
-    const result = await res.json();
-    if (!res.ok) {
-      const err: any = new Error(result.error || 'Failed to publish post.');
-      err.status = res.status;
-      err.code = result.code;
-      throw err;
-    }
+    const result = await parseJsonOrThrow<any>(res, 'Failed to publish post.');
     return result;
   },
 
@@ -928,8 +1077,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ optionId }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Unable to record vote right now.');
+    const result = await parseJsonOrThrow<any>(res, 'Unable to record vote right now.');
     return result;
   },
 
@@ -938,8 +1086,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(result.error || 'Unable to update like right now.');
+    const result = await parseJsonOrThrow<any>(res, 'Unable to update like right now.');
     return result;
   },
 
@@ -948,8 +1095,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Unable to repost right now.');
+    const result = await parseJsonOrThrow<any>(res, 'Unable to repost right now.');
     return result;
   },
 
@@ -959,8 +1105,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ content }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update post.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update post.');
     return result;
   },
 
@@ -969,8 +1114,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to delete post.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to delete post.');
     return result;
   },
 
@@ -980,13 +1124,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ content, parentCommentId, images }),
     });
-    const result = await res.json();
-    if (!res.ok) {
-      const err: any = new Error(result.error || 'Failed to post reply.');
-      err.status = res.status;
-      err.code = result.code;
-      throw err;
-    }
+    const result = await parseJsonOrThrow<any>(res, 'Failed to post reply.');
     return result;
   },
 
@@ -996,8 +1134,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ content }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to edit comment.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to edit comment.');
     return result;
   },
 
@@ -1006,8 +1143,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to delete comment.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to delete comment.');
     return result;
   },
 
@@ -1015,8 +1151,7 @@ export const api = {
   async getChats(): Promise<Conversation[]> {
     try {
       const res = await fetch(`${API_BASE}/chats`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1025,8 +1160,7 @@ export const api = {
   async getChatMessages(chatId: string): Promise<Message[]> {
     try {
       const res = await fetch(`${API_BASE}/chats/${chatId}/messages`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1044,8 +1178,7 @@ export const api = {
       const res = await fetch(`${API_BASE}/chats/${chatId}/messages?${params.toString()}`, {
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return { messages: [], total: 0, hasMore: false, nextOffset: 0 };
-      return res.json();
+      return parseJsonOrFallback(res, { messages: [], total: 0, hasMore: false, nextOffset: 0 });
     } catch {
       return { messages: [], total: 0, hasMore: false, nextOffset: 0 };
     }
@@ -1063,13 +1196,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ text, location, images, client_id: clientId }),
     });
-    const result = await res.json();
-    if (!res.ok) {
-      const err: any = new Error(result.error || 'Failed to send message.');
-      err.status = res.status;
-      err.code = result.code;
-      throw err;
-    }
+    const result = await parseJsonOrThrow<any>(res, 'Failed to send message.');
     return result;
   },
 
@@ -1079,8 +1206,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ text }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update message.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update message.');
     return result;
   },
 
@@ -1089,8 +1215,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to delete message.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to delete message.');
     return result;
   },
 
@@ -1100,8 +1225,7 @@ export const api = {
         method: 'POST',
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return { success: false };
-      return res.json();
+      return parseJsonOrFallback(res, { success: false });
     } catch {
       return { success: false };
     }
@@ -1112,8 +1236,7 @@ export const api = {
       const res = await fetch(`${API_BASE}/chats/eligible-users?q=${encodeURIComponent(query)}`, {
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1125,8 +1248,7 @@ export const api = {
         method: 'POST',
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return { purgedCount: 0 };
-      return res.json();
+      return parseJsonOrFallback(res, { purgedCount: 0 });
     } catch {
       return { purgedCount: 0 };
     }
@@ -1138,12 +1260,11 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ targetUserId }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to start direct conversation.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to start direct conversation.');
     return result;
   },
 
-  // --- Real-Time SSE Subscription ---
+  // --- Real-Time SSE Subscription (with automatic serverless polling fallback) ---
   connectRealtime(handlers: {
     onMessage?: (msg: any) => void;
     onMessageUpdated?: (data: any) => void;
@@ -1157,37 +1278,169 @@ export const api = {
   }): () => void {
     const clientId = getOrCreateTabClientId();
     let eventSource: EventSource | null = null;
-    let reconnectTimeout: any = null;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let pollTimeout: ReturnType<typeof setTimeout> | null = null;
     let isClosed = false;
+    let consecutiveSseErrors = 0;
+    let usePollingFallback = false;
+    let pollIntervalMs = 4500;
+    let isPollPrimed = false;
+    const seenNotificationIds = new Set<string>();
+    const readNotificationIds = new Set<string>();
+    const seenMessageIds = new Set<string>();
+    const seenReportIds = new Set<string>();
+
+    const runPollCycle = async () => {
+      if (isClosed) return;
+      if (typeof document !== 'undefined' && document.hidden) {
+        pollTimeout = setTimeout(runPollCycle, Math.max(pollIntervalMs * 3, 12000));
+        return;
+      }
+      try {
+        const res = await fetch(
+          `${API_BASE}/realtime/poll?clientId=${encodeURIComponent(clientId)}`,
+          { headers: getAuthHeaders() }
+        );
+        if (res.ok) {
+          const { isJson, data } = await readJsonSafely<any>(res);
+          if (isJson && data) {
+            if (data.presence) handlers.onPresenceUpdate?.(data.presence);
+            if (data.config) handlers.onConfigUpdated?.(data.config);
+
+            if (Array.isArray(data.notifications)) {
+              for (const n of data.notifications) {
+                if (!n?.id) continue;
+                if (!seenNotificationIds.has(n.id)) {
+                  seenNotificationIds.add(n.id);
+                  if (isPollPrimed && !n.isRead) {
+                    handlers.onNotification?.(n);
+                  }
+                } else if (n.isRead && !readNotificationIds.has(n.id)) {
+                  readNotificationIds.add(n.id);
+                  if (isPollPrimed) {
+                    handlers.onNotificationRead?.({ notificationId: n.id });
+                  }
+                }
+                if (n.isRead) readNotificationIds.add(n.id);
+              }
+            }
+
+            if (Array.isArray(data.chats)) {
+              for (const chat of data.chats) {
+                const msgs = Array.isArray(chat?.messages) ? chat.messages : [];
+                for (const m of msgs) {
+                  if (!m?.id) continue;
+                  if (!seenMessageIds.has(m.id)) {
+                    seenMessageIds.add(m.id);
+                    if (isPollPrimed && !m.isMe) {
+                      handlers.onMessage?.({ ...m, chatId: chat.id });
+                    }
+                  }
+                }
+              }
+            }
+
+            if (Array.isArray(data.adminReports)) {
+              for (const r of data.adminReports) {
+                if (!r?.id) continue;
+                if (!seenReportIds.has(r.id)) {
+                  seenReportIds.add(r.id);
+                  if (isPollPrimed) {
+                    handlers.onAdminReport?.(r);
+                  }
+                }
+              }
+            }
+
+            isPollPrimed = true;
+          }
+        }
+      } catch {
+        // Silent transient poll failure; retry next interval
+      } finally {
+        if (!isClosed) {
+          pollTimeout = setTimeout(runPollCycle, pollIntervalMs);
+        }
+      }
+    };
+
+    const startPollingFallback = (intervalOverride?: number) => {
+      if (isClosed) return;
+      if (intervalOverride && intervalOverride >= 2000) {
+        pollIntervalMs = intervalOverride;
+      }
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+      }
+      if (usePollingFallback) return;
+      usePollingFallback = true;
+      void runPollCycle();
+    };
 
     const connect = async () => {
-      if (isClosed) return;
+      if (isClosed || usePollingFallback) return;
       try {
         const params = new URLSearchParams();
         params.set('clientId', clientId);
 
-        try {
-          const ticketRes = await fetch(`${API_BASE}/realtime/ticket`, {
-            method: 'POST',
-            headers: getAuthHeaders(),
-          });
-          if (ticketRes.ok) {
-            const ticketData = await ticketRes.json();
-            if (ticketData?.ticket) {
-              params.set('ticket', ticketData.ticket);
+        if (this.hasActiveSession()) {
+          try {
+            const ticketRes = await fetch(`${API_BASE}/realtime/ticket`, {
+              method: 'POST',
+              headers: getAuthHeaders(),
+            });
+            const { isJson, data: ticketData } = await readJsonSafely<any>(ticketRes);
+            if (ticketRes.ok && isJson && ticketData) {
+              if (ticketData.mode === 'polling') {
+                startPollingFallback(ticketData.pollIntervalMs);
+                return;
+              }
+              if (ticketData.ticket) {
+                params.set('ticket', ticketData.ticket);
+              }
+            } else if (ticketRes.status === 404 || ticketRes.status >= 500 || (!isJson && !ticketRes.ok)) {
+              consecutiveSseErrors += 1;
+              if (consecutiveSseErrors >= 2) {
+                startPollingFallback();
+                return;
+              }
             }
+          } catch {
+            // Fall back to anonymous SSE or polling below
           }
-        } catch {
-          // Fall back to anonymous SSE channel if ticket exchange fails temporarily
         }
 
-        if (isClosed) return;
+        if (isClosed || usePollingFallback) return;
+        if (typeof EventSource === 'undefined') {
+          startPollingFallback();
+          return;
+        }
+
         const url = `${API_BASE}/realtime/stream?${params.toString()}`;
         eventSource = new EventSource(url);
+
+        eventSource.onopen = () => {
+          consecutiveSseErrors = 0;
+        };
+
+        eventSource.addEventListener('realtime:fallback', (e) => {
+          try {
+            const payload = JSON.parse((e as MessageEvent).data || '{}');
+            startPollingFallback(payload?.pollIntervalMs);
+          } catch {
+            startPollingFallback();
+          }
+        });
 
         eventSource.addEventListener('message:new', (e) => {
           try {
             const data = JSON.parse(e.data);
+            if (data?.id) seenMessageIds.add(data.id);
             handlers.onMessage?.(data);
           } catch (err) {
             console.warn('[SSE] Parse error message:new:', err);
@@ -1224,6 +1477,7 @@ export const api = {
         eventSource.addEventListener('notification:new', (e) => {
           try {
             const data = JSON.parse(e.data);
+            if (data?.id) seenNotificationIds.add(data.id);
             handlers.onNotification?.(data);
           } catch (err) {
             console.warn('[SSE] Parse error notification:new:', err);
@@ -1251,6 +1505,7 @@ export const api = {
         eventSource.addEventListener('admin:report:new', (e) => {
           try {
             const data = JSON.parse(e.data) as AdminReport;
+            if (data?.id) seenReportIds.add(data.id);
             handlers.onAdminReport?.(data);
           } catch (err) {
             console.warn('[SSE] Parse error admin:report:new:', err);
@@ -1271,15 +1526,23 @@ export const api = {
             eventSource.close();
             eventSource = null;
           }
-          if (!isClosed) {
-            // Reconnect with gentle backoff
-            reconnectTimeout = setTimeout(connect, 3500);
+          if (isClosed) return;
+          consecutiveSseErrors += 1;
+          if (consecutiveSseErrors >= 2) {
+            startPollingFallback();
+            return;
           }
+          reconnectTimeout = setTimeout(connect, 3500);
         };
       } catch (err) {
         console.warn('[SSE] Failed initializing EventSource:', err);
         if (!isClosed) {
-          reconnectTimeout = setTimeout(connect, 5000);
+          consecutiveSseErrors += 1;
+          if (consecutiveSseErrors >= 2) {
+            startPollingFallback();
+          } else {
+            reconnectTimeout = setTimeout(connect, 5000);
+          }
         }
       }
     };
@@ -1290,6 +1553,7 @@ export const api = {
     return () => {
       isClosed = true;
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (pollTimeout) clearTimeout(pollTimeout);
       if (eventSource) {
         eventSource.close();
         eventSource = null;
@@ -1303,8 +1567,7 @@ export const api = {
       const res = await fetch(`${API_BASE}/notifications?unread=${unreadOnly}`, {
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1323,11 +1586,7 @@ export const api = {
     const res = await fetch(`${API_BASE}/notifications?${params.toString()}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) {
-      const errBody = await res.json().catch(() => ({}));
-      throw new Error(errBody.error || 'Failed to load activity.');
-    }
-    return res.json();
+    return parseJsonOrThrow(res, 'Failed to load activity.');
   },
 
   async markNotificationAsRead(id: string): Promise<{ success: boolean }> {
@@ -1336,8 +1595,7 @@ export const api = {
         method: 'POST',
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return { success: false };
-      return res.json();
+      return parseJsonOrFallback(res, { success: false });
     } catch {
       return { success: false };
     }
@@ -1349,8 +1607,7 @@ export const api = {
         method: 'POST',
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return { success: false };
-      return res.json();
+      return parseJsonOrFallback(res, { success: false });
     } catch {
       return { success: false };
     }
@@ -1360,8 +1617,7 @@ export const api = {
   async getCommunities(): Promise<Community[]> {
     try {
       const res = await fetch(`${API_BASE}/communities`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1370,8 +1626,7 @@ export const api = {
   async getCommunity(id: string): Promise<Community | null> {
     try {
       const res = await fetch(`${API_BASE}/communities/${id}`, { headers: getAuthHeaders() });
-      if (!res.ok) return null;
-      return res.json();
+      return parseJsonOrFallback(res, null);
     } catch {
       return null;
     }
@@ -1392,8 +1647,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to create community.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to create community.');
     return result;
   },
 
@@ -1410,8 +1664,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(updates),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update community.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update community.');
     return result;
   },
 
@@ -1420,11 +1673,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Failed to update membership.');
-    }
-    return res.json();
+    return parseJsonOrThrow(res, 'Failed to update membership.');
   },
 
   async getCommunityMembers(communityId: string): Promise<CommunityMember[]> {
@@ -1432,8 +1681,7 @@ export const api = {
       const res = await fetch(`${API_BASE}/communities/${communityId}/members`, {
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1451,8 +1699,7 @@ export const api = {
       const res = await fetch(`${API_BASE}/communities/${communityId}/members?${params.toString()}`, {
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return { members: [], total: 0, hasMore: false, nextOffset: 0 };
-      return res.json();
+      return parseJsonOrFallback(res, { members: [], total: 0, hasMore: false, nextOffset: 0 });
     } catch {
       return { members: [], total: 0, hasMore: false, nextOffset: 0 };
     }
@@ -1468,8 +1715,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ role }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update member role.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update member role.');
     return result;
   },
 
@@ -1478,8 +1724,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to remove member.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to remove member.');
     return result;
   },
 
@@ -1488,8 +1733,7 @@ export const api = {
       const res = await fetch(`${API_BASE}/communities/${communityId}/posts`, {
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1506,11 +1750,7 @@ export const api = {
     const res = await fetch(`${API_BASE}/communities/${communityId}/posts?${params.toString()}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) {
-      const errBody = await res.json().catch(() => ({}));
-      throw new Error(errBody.error || 'Failed to load community discussions.');
-    }
-    return res.json();
+    return parseJsonOrThrow(res, 'Failed to load community discussions.');
   },
 
   async createCommunityPost(
@@ -1528,13 +1768,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) {
-      const err: any = new Error(result.error || 'Failed to post to community.');
-      err.status = res.status;
-      err.code = result.code;
-      throw err;
-    }
+    const result = await parseJsonOrThrow<any>(res, 'Failed to post to community.');
     return result;
   },
 
@@ -1559,8 +1793,8 @@ export const api = {
         headers: getAuthHeaders(),
       });
       if (!res.ok) return [];
-      const data = (await res.json()) as CampusLandmark[];
-      setPublicCached(cacheKey, data, 30000);
+      const data = await parseJsonOrFallback<CampusLandmark[]>(res, []);
+      if (data.length > 0) setPublicCached(cacheKey, data, 30000);
       return data;
     } catch {
       return [];
@@ -1572,8 +1806,7 @@ export const api = {
       const res = await fetch(`${API_BASE}/landmarks/${id}`, {
         headers: getAuthHeaders(),
       });
-      if (!res.ok) return null;
-      return res.json();
+      return parseJsonOrFallback(res, null);
     } catch {
       return null;
     }
@@ -1587,8 +1820,8 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/notices`, { headers: getAuthHeaders() });
       if (!res.ok) return [];
-      const data = (await res.json()) as Notice[];
-      setPublicCached('notices:all', data, 30000);
+      const data = await parseJsonOrFallback<Notice[]>(res, []);
+      if (data.length > 0) setPublicCached('notices:all', data, 30000);
       return data;
     } catch {
       return [];
@@ -1606,8 +1839,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to submit moderation report.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to submit moderation report.');
     return result;
   },
 
@@ -1615,8 +1847,7 @@ export const api = {
   async getAdminDashboard(): Promise<AdminDashboardStats | null> {
     try {
       const res = await fetch(`${API_BASE}/admin/dashboard`, { headers: getAuthHeaders() });
-      if (!res.ok) return null;
-      return res.json();
+      return parseJsonOrFallback(res, null);
     } catch {
       return null;
     }
@@ -1626,8 +1857,7 @@ export const api = {
     try {
       const url = status ? `${API_BASE}/admin/reports?status=${encodeURIComponent(status)}` : `${API_BASE}/admin/reports`;
       const res = await fetch(url, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1639,8 +1869,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ status, resolutionNotes, actionTaken }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update report.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update report.');
     return result;
   },
 
@@ -1650,8 +1879,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason, severity, details }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to issue account warning.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to issue account warning.');
     return result;
   },
 
@@ -1661,8 +1889,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ durationDays, reason }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to suspend user.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to suspend user.');
     return result;
   },
 
@@ -1672,8 +1899,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to lift suspension.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to lift suspension.');
     return result;
   },
 
@@ -1681,8 +1907,7 @@ export const api = {
     try {
       const url = status ? `${API_BASE}/admin/appeals?status=${encodeURIComponent(status)}` : `${API_BASE}/admin/appeals`;
       const res = await fetch(url, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1694,8 +1919,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ type, statement, targetId }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to submit appeal.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to submit appeal.');
     return result;
   },
 
@@ -1705,16 +1929,14 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ status, reviewNotes }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to review appeal.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to review appeal.');
     return result;
   },
 
   async getStaffRoster(): Promise<StaffMember[]> {
     try {
       const res = await fetch(`${API_BASE}/admin/staff`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1726,8 +1948,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ userId, role }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to assign role.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to assign role.');
     return result;
   },
 
@@ -1736,8 +1957,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to execute 72h purge job.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to execute 72h purge job.');
     return result;
   },
 
@@ -1751,8 +1971,7 @@ export const api = {
         ...(password ? { password } : {}),
       }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to delete account.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to delete account.');
     this.clearToken();
     return result;
   },
@@ -1760,8 +1979,7 @@ export const api = {
   async getBackups(): Promise<BackupSnapshot[]> {
     try {
       const res = await fetch(`${API_BASE}/admin/backups`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1772,8 +1990,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to create backup.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to create backup.');
     return result;
   },
 
@@ -1782,16 +1999,14 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to restore backup snapshot.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to restore backup snapshot.');
     return result;
   },
 
   async getAdminAuditLogs(): Promise<AdminAuditLog[]> {
     try {
       const res = await fetch(`${API_BASE}/admin/audit-logs`, { headers: getAuthHeaders() });
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -1806,12 +2021,11 @@ export const api = {
     const res = await fetch(`${API_BASE}/admin/users${qs.toString() ? `?${qs.toString()}` : ''}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) return [];
-    return res.json();
+    return parseJsonOrFallback(res, []);
   },
 
   async adminCreateUser(data: {
-    identifier: string;
+    identifier?: string;
     username: string;
     password: string;
     name: string;
@@ -1826,8 +2040,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to create account.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to create account.');
     return result;
   },
 
@@ -1845,8 +2058,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update profile.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update profile.');
     return result;
   },
 
@@ -1856,16 +2068,14 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ confirmation: 'PERMANENTLY_DELETE', reason }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to delete user.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to delete user.');
     return result;
   },
 
   async adminListContent(search?: string): Promise<{ posts: AdminContentPost[]; comments: AdminContentComment[] }> {
     const url = search ? `${API_BASE}/admin/content?search=${encodeURIComponent(search)}` : `${API_BASE}/admin/content`;
     const res = await fetch(url, { headers: getAuthHeaders() });
-    if (!res.ok) return { posts: [], comments: [] };
-    return res.json();
+    return parseJsonOrFallback(res, { posts: [], comments: [] });
   },
 
   async adminTogglePostVisibility(postId: string, hidden: boolean) {
@@ -1874,8 +2084,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ hidden }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update post visibility.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update post visibility.');
     return result;
   },
 
@@ -1885,8 +2094,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ pinned }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to pin/unpin post.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to pin/unpin post.');
     return result;
   },
 
@@ -1895,8 +2103,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to delete post.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to delete post.');
     return result;
   },
 
@@ -1905,15 +2112,13 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to delete comment.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to delete comment.');
     return result;
   },
 
   async adminListChats(): Promise<AdminChatOverview[]> {
     const res = await fetch(`${API_BASE}/admin/chats`, { headers: getAuthHeaders() });
-    if (!res.ok) return [];
-    return res.json();
+    return parseJsonOrFallback(res, []);
   },
 
   async adminInspectChat(chatId: string, reason: string) {
@@ -1922,8 +2127,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to inspect chat.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to inspect chat.');
     return result;
   },
 
@@ -1933,15 +2137,13 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to remove chat.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to remove chat.');
     return result;
   },
 
   async adminListNotifications(): Promise<AdminNotificationRecord[]> {
     const res = await fetch(`${API_BASE}/admin/notifications`, { headers: getAuthHeaders() });
-    if (!res.ok) return [];
-    return res.json();
+    return parseJsonOrFallback(res, []);
   },
 
   async adminBroadcastNotification(data: { title: string; body: string; targetUserId?: string; link?: string }) {
@@ -1950,15 +2152,13 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to broadcast notification.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to broadcast notification.');
     return result;
   },
 
   async adminListCommunities(): Promise<AdminCommunityRecord[]> {
     const res = await fetch(`${API_BASE}/admin/communities`, { headers: getAuthHeaders() });
-    if (!res.ok) return [];
-    return res.json();
+    return parseJsonOrFallback(res, []);
   },
 
   async adminUpdateCommunity(communityId: string, patch: { name?: string; description?: string; location?: string; isVerified?: boolean }) {
@@ -1967,8 +2167,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update community.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update community.');
     return result;
   },
 
@@ -1977,15 +2176,13 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to delete community.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to delete community.');
     return result;
   },
 
   async adminGetStorageOverview(): Promise<AdminStorageOverview | null> {
     const res = await fetch(`${API_BASE}/admin/storage`, { headers: getAuthHeaders() });
-    if (!res.ok) return null;
-    return res.json();
+    return parseJsonOrFallback(res, null);
   },
 
   async adminCleanOrphanedFiles() {
@@ -1994,8 +2191,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ confirmation: 'CLEAN_ORPHANS' }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to clean orphaned files.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to clean orphaned files.');
     return result;
   },
 
@@ -2004,22 +2200,19 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to clear caches.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to clear caches.');
     return result;
   },
 
   async adminDownloadStorageReport() {
     const res = await fetch(`${API_BASE}/admin/storage/report`, { headers: getAuthHeaders() });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to generate storage report.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to generate storage report.');
     return result;
   },
 
   async adminGetSecurityOverview(): Promise<AdminSecurityOverview | null> {
     const res = await fetch(`${API_BASE}/admin/security`, { headers: getAuthHeaders() });
-    if (!res.ok) return null;
-    return res.json();
+    return parseJsonOrFallback(res, null);
   },
 
   async adminSetupMfa(): Promise<{ secret: string; otpauthUri: string; sampleCurrentCode?: string }> {
@@ -2027,8 +2220,7 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to start MFA setup.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to start MFA setup.');
     return result;
   },
 
@@ -2038,8 +2230,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ code }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Invalid MFA verification code.');
+    const result = await parseJsonOrThrow<any>(res, 'Invalid MFA verification code.');
     return result;
   },
 
@@ -2049,8 +2240,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ password }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to disable MFA.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to disable MFA.');
     return result;
   },
 
@@ -2059,15 +2249,13 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to revoke sessions.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to revoke sessions.');
     return result;
   },
 
   async adminGetSecuritySessions(): Promise<DeviceSession[]> {
     const res = await fetch(`${API_BASE}/admin/security/sessions`, { headers: getAuthHeaders() });
-    if (!res.ok) return [];
-    const data = await res.json();
+    const data = await parseJsonOrFallback<any>(res, null);
     return Array.isArray(data?.sessions) ? data.sessions : [];
   },
 
@@ -2076,8 +2264,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to revoke session.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to revoke session.');
     return result;
   },
 
@@ -2086,23 +2273,20 @@ export const api = {
       method: 'POST',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to revoke user sessions.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to revoke user sessions.');
     return result;
   },
 
   async adminGetSecurityEvents(severity?: string): Promise<SecurityEventRecord[]> {
     const qs = severity && severity !== 'all' ? `?severity=${encodeURIComponent(severity)}` : '';
     const res = await fetch(`${API_BASE}/admin/security/events${qs}`, { headers: getAuthHeaders() });
-    if (!res.ok) return [];
-    const data = await res.json();
+    const data = await parseJsonOrFallback<any>(res, null);
     return Array.isArray(data?.events) ? data.events : [];
   },
 
   async adminListFeatures(): Promise<PlatformFeature[]> {
     const res = await fetch(`${API_BASE}/admin/features`, { headers: getAuthHeaders() });
-    if (!res.ok) return [];
-    return res.json();
+    return parseJsonOrFallback(res, []);
   },
 
   async adminRegisterFeature(data: {
@@ -2118,8 +2302,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to register feature flag.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to register feature flag.');
     clearPublicCache();
     return result;
   },
@@ -2130,16 +2313,14 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update feature configuration.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update feature configuration.');
     clearPublicCache();
     return result;
   },
 
   async adminGetWebsiteSettings(): Promise<Record<string, string>> {
     const res = await fetch(`${API_BASE}/admin/settings`, { headers: getAuthHeaders() });
-    if (!res.ok) return {};
-    return res.json();
+    return parseJsonOrFallback(res, {});
   },
 
   async adminUpdateWebsiteSettings(settings: Record<string, string>) {
@@ -2148,8 +2329,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(settings),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update website settings.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update website settings.');
     clearPublicCache();
     return result;
   },
@@ -2173,8 +2353,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to publish official Admin post.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to publish official Admin post.');
     return result;
   },
 
@@ -2196,8 +2375,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update post.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update post.');
     return result;
   },
 
@@ -2207,8 +2385,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ featured, distributionScope }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update featured status.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update featured status.');
     return result;
   },
 
@@ -2218,8 +2395,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to lift restriction.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to lift restriction.');
     return result;
   },
 
@@ -2228,8 +2404,7 @@ export const api = {
     const res = await fetch(`${API_BASE}/admin/analytics?range=${encodeURIComponent(range)}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) return null;
-    return res.json();
+    return parseJsonOrFallback(res, null);
   },
 
   async adminDownloadAnalyticsExport(range: AnalyticsRange = '7d', format: 'csv' | 'json' = 'csv') {
@@ -2238,8 +2413,7 @@ export const api = {
       { headers: getAuthHeaders() }
     );
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to export analytics report.');
+      await parseJsonOrThrow(res, 'Failed to export analytics report.');
     }
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
@@ -2253,8 +2427,7 @@ export const api = {
   // --- Moderator Role & Permission Management (Admin Only) ---
   async adminListModerators(): Promise<ModeratorAccount[]> {
     const res = await fetch(`${API_BASE}/admin/moderators`, { headers: getAuthHeaders() });
-    if (!res.ok) return [];
-    return res.json();
+    return parseJsonOrFallback(res, []);
   },
 
   async adminAssignModerator(data: {
@@ -2271,8 +2444,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to assign Moderator.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to assign Moderator.');
     return result;
   },
 
@@ -2282,8 +2454,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update Moderator permissions.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update Moderator permissions.');
     return result;
   },
 
@@ -2292,8 +2463,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to revoke Moderator.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to revoke Moderator.');
     return result;
   },
 
@@ -2303,8 +2473,7 @@ export const api = {
       const res = await fetch(
         `${API_BASE}/advertisements/active?area=${encodeURIComponent(area)}&placement=${encodeURIComponent(placement)}`
       );
-      if (!res.ok) return [];
-      return res.json();
+      return parseJsonOrFallback(res, []);
     } catch {
       return [];
     }
@@ -2324,8 +2493,7 @@ export const api = {
 
   async adminListAdvertisements(): Promise<AdvertisementRecord[]> {
     const res = await fetch(`${API_BASE}/admin/advertisements`, { headers: getAuthHeaders() });
-    if (!res.ok) return [];
-    return res.json();
+    return parseJsonOrFallback(res, []);
   },
 
   async adminCreateAdvertisement(data: {
@@ -2344,8 +2512,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to create advertisement.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to create advertisement.');
     return result;
   },
 
@@ -2355,8 +2522,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update advertisement.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update advertisement.');
     return result;
   },
 
@@ -2365,8 +2531,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to delete advertisement.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to delete advertisement.');
     return result;
   },
 
@@ -2377,14 +2542,11 @@ export const api = {
     const res = await fetch(`${API_BASE}/admin/payment-records${qs.toString() ? `?${qs.toString()}` : ''}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) {
-      return {
+    return parseJsonOrFallback(res, {
         records: [],
         retainedArchives: [],
         summary: { totalRecords: 0, confirmedNaira: 0, pendingNaira: 0, retainedCount: 0 },
-      };
-    }
-    return res.json();
+      });
   },
 
   async adminCreatePaymentRecord(data: {
@@ -2403,8 +2565,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to record payment entry.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to record payment entry.');
     return result;
   },
 
@@ -2418,16 +2579,14 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ status, notes }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update payment record status.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update payment record status.');
     return result;
   },
 
   // --- Moderator Desk Scoped API (Zero Admin/Finance/Settings access) ---
   async modGetDashboard(): Promise<ModeratorDashboardData | null> {
     const res = await fetch(`${API_BASE}/mod/dashboard`, { headers: getAuthHeaders() });
-    if (!res.ok) return null;
-    return res.json();
+    return parseJsonOrFallback(res, null);
   },
 
   async modListReports(params?: { status?: string; scope?: 'all' | 'assigned' | 'escalated' }): Promise<ModeratorReportItem[]> {
@@ -2437,8 +2596,7 @@ export const api = {
     const res = await fetch(`${API_BASE}/mod/reports${qs.toString() ? `?${qs.toString()}` : ''}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) return [];
-    return res.json();
+    return parseJsonOrFallback(res, []);
   },
 
   async modReviewReport(
@@ -2452,8 +2610,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ status, resolutionNotes, actionTaken }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update report.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update report.');
     return result;
   },
 
@@ -2463,8 +2620,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to escalate report to Admin.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to escalate report to Admin.');
     return result;
   },
 
@@ -2479,8 +2635,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ action, reason }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Moderation action denied.');
+    const result = await parseJsonOrThrow<any>(res, 'Moderation action denied.');
     return result;
   },
 
@@ -2490,8 +2645,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ reason, severity, details }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to issue warning.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to issue warning.');
     return result;
   },
 
@@ -2501,23 +2655,20 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify({ durationHours, reason }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to apply restriction.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to apply restriction.');
     return result;
   },
 
   async modListCommunities(): Promise<ModeratorCommunityReviewData> {
     const res = await fetch(`${API_BASE}/mod/communities`, { headers: getAuthHeaders() });
-    if (!res.ok) return { flaggedPosts: [], communities: [] };
-    return res.json();
+    return parseJsonOrFallback(res, { flaggedPosts: [], communities: [] });
   },
 
   async modGetHistory(scope: 'mine' | 'team' = 'mine'): Promise<ModerationHistoryEntry[]> {
     const res = await fetch(`${API_BASE}/mod/history?scope=${encodeURIComponent(scope)}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) return [];
-    return res.json();
+    return parseJsonOrFallback(res, []);
   },
 
   // --- Saved & Pinned Locations + Search History (Strictly private per authenticated account) ---
@@ -2531,11 +2682,7 @@ export const api = {
     const res = await fetch(`${API_BASE}/locations/saved${qs.toString() ? `?${qs.toString()}` : ''}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to load saved locations.');
-    }
-    return res.json();
+    return parseJsonOrThrow(res, 'Failed to load saved locations.');
   },
 
   async saveOrPinLocation(data: {
@@ -2558,8 +2705,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to save location.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to save location.');
     return result;
   },
 
@@ -2580,8 +2726,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(patch),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to update saved location.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to update saved location.');
     return result;
   },
 
@@ -2590,8 +2735,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to delete saved location.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to delete saved location.');
     return result;
   },
 
@@ -2602,11 +2746,7 @@ export const api = {
     const res = await fetch(`${API_BASE}/locations/history${qs.toString() ? `?${qs.toString()}` : ''}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to load location search history.');
-    }
-    return res.json();
+    return parseJsonOrThrow(res, 'Failed to load location search history.');
   },
 
   async recordLocationSearch(data: {
@@ -2627,8 +2767,7 @@ export const api = {
       headers: getAuthHeaders(),
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to record search history.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to record search history.');
     return result;
   },
 
@@ -2637,8 +2776,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to remove search history entry.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to remove search history entry.');
     return result;
   },
 
@@ -2647,8 +2785,7 @@ export const api = {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Failed to clear location search history.');
+    const result = await parseJsonOrThrow<any>(res, 'Failed to clear location search history.');
     return result;
   },
 };

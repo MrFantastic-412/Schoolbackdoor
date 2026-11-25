@@ -1,9 +1,9 @@
 import fs from 'node:fs';
-import { db, DB_FILE, withReadConnection } from '../db/database';
-import { cache } from '../utils/cache';
-import { escapeCsvCell } from '../utils/security';
-import { presenceService } from './presenceService';
-import { getUploadsDir } from './fileService';
+import { db, DB_FILE, withReadConnection } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { escapeCsvCell } from '../utils/security.js';
+import { presenceService } from './presenceService.js';
+import { getUploadsDir } from './fileService.js';
 
 export type AnalyticsRange = '24h' | '7d' | '30d' | 'all';
 

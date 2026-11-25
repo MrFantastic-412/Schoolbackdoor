@@ -1,13 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { db, runInTransaction } from '../db/database';
-import { cache } from '../utils/cache';
-import { sseManager } from '../realtime/sseManager';
-import { adminSecurityService } from './adminSecurityService';
-import { authService, hashPassword, verifyPassword } from './authService';
-import { presenceService } from './presenceService';
-import { fileService, getUploadsDir } from './fileService';
-import { deletionService } from './deletionService';
+import { db, runInTransaction } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { sseManager } from '../realtime/sseManager.js';
+import { adminSecurityService } from './adminSecurityService.js';
+import { authService, hashPassword, verifyPassword } from './authService.js';
+import { presenceService } from './presenceService.js';
+import { fileService, getUploadsDir } from './fileService.js';
+import { deletionService } from './deletionService.js';
 import {
   sanitizeSafeUrl,
   checkRateLimit,
@@ -16,7 +16,7 @@ import {
   hashSessionToken,
   SESSION_POLICY,
   recordSecurityEvent,
-} from '../utils/security';
+} from '../utils/security.js';
 
 const DEFAULT_FEATURES = [
   {
@@ -149,7 +149,6 @@ const DEFAULT_WEBSITE_SETTINGS: Array<{ key: string; value: string; category: st
     category: 'maintenance',
   },
   { key: 'allow_new_registrations', value: 'true', category: 'access' },
-  { key: 'require_email_verification', value: 'false', category: 'access' },
   { key: 'support_email', value: 'support@schoolbackdoor.app', category: 'support' },
   { key: 'support_location', value: 'Independent Student Community Desk · Akure', category: 'support' },
   { key: 'support_hours', value: 'Mon–Fri · 8:00 AM – 5:00 PM WAT', category: 'support' },
@@ -424,7 +423,7 @@ export const adminControlService = {
     }
     this.ensurePlatformDefaults();
     const allowedKeys = new Set(DEFAULT_WEBSITE_SETTINGS.map((s) => s.key));
-    const booleanKeys = new Set(['maintenance_mode', 'allow_new_registrations', 'require_email_verification', 'admin_mfa_required']);
+    const booleanKeys = new Set(['maintenance_mode', 'allow_new_registrations', 'admin_mfa_required']);
 
     runInTransaction(() => {
       const stmt = db.prepare(`
@@ -460,7 +459,7 @@ export const adminControlService = {
     }
     if (search && search.trim()) {
       const q = `%${escapeLikePattern(search.trim().toLowerCase())}%`;
-      conditions.push(`(LOWER(u.email) LIKE ? ESCAPE '\\' OR LOWER(u.matric_number) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(pr.handle, '')) LIKE ? ESCAPE '\\')`);
+      conditions.push(`(LOWER(COALESCE(u.username, '')) LIKE ? ESCAPE '\\' OR LOWER(u.matric_number) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(pr.handle, '')) LIKE ? ESCAPE '\\')`);
       params.push(q, q, q, q);
     }
     if (roleFilter && roleFilter !== 'all') {
@@ -523,7 +522,7 @@ export const adminControlService = {
   createUserByAdmin(
     adminId: string,
     input: {
-      identifier: string;
+      identifier?: string;
       username: string;
       password: string;
       name: string;
@@ -536,7 +535,6 @@ export const adminControlService = {
   ) {
     const role = input.role && ['admin', 'moderator', 'staff', 'student'].includes(input.role) ? input.role : 'student';
     const created = authService.register({
-      identifier: input.identifier,
       username: input.username,
       password: input.password,
       name: input.name,
@@ -546,8 +544,8 @@ export const adminControlService = {
       matric_number: input.matricNumber,
     }, undefined, true);
 
-    // Admin-created accounts are immediately verified and assigned desired role
-    db.prepare('UPDATE users SET role = ?, is_verified = 1, verification_code = NULL WHERE id = ?').run(
+    // Admin-created accounts are assigned desired role and verified community badge
+    db.prepare('UPDATE users SET role = ?, verification_code = NULL WHERE id = ?').run(
       role,
       created.user.id
     );
@@ -604,10 +602,6 @@ export const adminControlService = {
           campus = ?, bio = ?, verified = ?, updated_at = CURRENT_TIMESTAMP
       WHERE user_id = ?
     `).run(nextName, nextDept, nextLevel, nextHall, nextCampus, nextBio, nextVerified, targetUserId);
-
-    if (patch.verified !== undefined) {
-      db.prepare('UPDATE users SET is_verified = ? WHERE id = ?').run(nextVerified, targetUserId);
-    }
 
     adminSecurityService.logAdminAction(adminId, 'ADMIN_UPDATE_PROFILE', 'user', targetUserId, patch);
     cache.invalidatePrefix('posts:');

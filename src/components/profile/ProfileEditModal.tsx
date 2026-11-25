@@ -249,20 +249,20 @@ export const ProfileEditModal: React.FC<ProfileEditModalProps> = ({
               </div>
               <div className="grid grid-cols-2 gap-2 text-[#82796F] dark:text-[#A89F95] text-xs pt-1.5 border-t border-[#171613]/10 dark:border-white/10">
                 <div>
-                  <span className="text-[#82796F] dark:text-[#A89F95] block text-[10px]">Verified Gmail</span>
-                  <span className="font-mono font-semibold text-[#171613] dark:text-[#F5EFE3] truncate block">
-                    {profile.email || 'Unlinked'}
-                  </span>
-                </div>
-                <div>
                   <span className="text-[#82796F] dark:text-[#A89F95] block text-[10px]">Username Handle</span>
                   <span className="font-mono font-semibold text-[#171613] dark:text-[#F5EFE3]">
                     {profile.handle}
                   </span>
                 </div>
+                <div>
+                  <span className="text-[#82796F] dark:text-[#A89F95] block text-[10px]">Account Security</span>
+                  <span className="font-mono font-semibold text-[#171613] dark:text-[#F5EFE3] truncate block">
+                    Argon2id + Recovery Codes
+                  </span>
+                </div>
               </div>
               <p className="text-[10px] text-[#82796F] dark:text-[#A89F95] mt-0.5">
-                Unique @usernames and registered Gmail addresses are locked for account security.
+                Unique @usernames are locked for identity integrity. Manage passwords and recovery codes in Settings.
               </p>
             </div>
 

@@ -1,12 +1,12 @@
-import { db, runInTransaction, withReadConnection } from '../db/database';
-import { cache } from '../utils/cache';
-import { sseManager } from '../realtime/sseManager';
-import { notificationService } from './notificationService';
-import { fileService } from './fileService';
-import { mentionService } from './mentionService';
-import { extractMentionHandles, ResolvedMention } from '../utils/mentions';
-import { computePostExpiresAtMs, hydratePollsForRows } from './postService';
-import { validateLocationInput } from '../utils/security';
+import { db, runInTransaction, withReadConnection } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { sseManager } from '../realtime/sseManager.js';
+import { notificationService } from './notificationService.js';
+import { fileService } from './fileService.js';
+import { mentionService } from './mentionService.js';
+import { extractMentionHandles, ResolvedMention } from '../utils/mentions.js';
+import { computePostExpiresAtMs, hydratePollsForRows } from './postService.js';
+import { validateLocationInput } from '../utils/security.js';
 
 export interface CommunitySettings {
   isPrivate?: boolean;

@@ -231,7 +231,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [createUserForm, setCreateUserForm] = useState({
     name: '',
     username: '@',
-    identifier: '',
     password: '',
     role: 'student' as 'student' | 'staff' | 'moderator',
     department: 'Computer Science',
@@ -264,7 +263,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [assignModMode, setAssignModMode] = useState<'promote' | 'create'>('promote');
   const [assignModForm, setAssignModForm] = useState({
     userId: '',
-    identifier: '',
     username: '@',
     password: '',
     name: '',
@@ -641,7 +639,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       setCreateUserForm({
         name: '',
         username: '@',
-        identifier: '',
         password: '',
         role: 'student',
         department: 'Computer Science',
@@ -738,7 +735,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
               },
             }
           : {
-              identifier: assignModForm.identifier,
               username: assignModForm.username,
               password: assignModForm.password,
               name: assignModForm.name,
@@ -2913,22 +2909,13 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     className="w-full px-3.5 py-2 glass-input rounded-xl"
                   />
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <label className="p-3 rounded-xl border border-[#171613]/10 dark:border-white/10 flex items-center justify-between cursor-pointer">
                     <span>Allow New Registrations</span>
                     <input
                       type="checkbox"
                       checked={siteSettings.allow_new_registrations !== 'false'}
                       onChange={(e) => setSiteSettings({ ...siteSettings, allow_new_registrations: e.target.checked ? 'true' : 'false' })}
-                      className="w-4 h-4 accent-[#D98BA5]"
-                    />
-                  </label>
-                  <label className="p-3 rounded-xl border border-[#171613]/10 dark:border-white/10 flex items-center justify-between cursor-pointer">
-                    <span>Require Email Verification</span>
-                    <input
-                      type="checkbox"
-                      checked={siteSettings.require_email_verification === 'true'}
-                      onChange={(e) => setSiteSettings({ ...siteSettings, require_email_verification: e.target.checked ? 'true' : 'false' })}
                       className="w-4 h-4 accent-[#D98BA5]"
                     />
                   </label>
@@ -3426,7 +3413,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         <form onSubmit={handleCreateUser} className="p-5 space-y-3 text-xs">
           <input required placeholder="Full Name" value={createUserForm.name} onChange={(e) => setCreateUserForm({ ...createUserForm, name: e.target.value })} className="w-full px-3.5 py-2.5 glass-input rounded-xl" />
           <input required placeholder="@handle" value={createUserForm.username} onChange={(e) => setCreateUserForm({ ...createUserForm, username: e.target.value })} className="w-full px-3.5 py-2.5 glass-input rounded-xl font-mono" />
-          <input required placeholder="Email (e.g. student@gmail.com)" value={createUserForm.identifier} onChange={(e) => setCreateUserForm({ ...createUserForm, identifier: e.target.value })} className="w-full px-3.5 py-2.5 glass-input rounded-xl" />
           <input required type="password" placeholder="Strong Password (8+ chars)" value={createUserForm.password} onChange={(e) => setCreateUserForm({ ...createUserForm, password: e.target.value })} className="w-full px-3.5 py-2.5 glass-input rounded-xl" />
           <select value={createUserForm.role} onChange={(e) => setCreateUserForm({ ...createUserForm, role: e.target.value as any })} className="w-full px-3.5 py-2.5 glass-input rounded-xl">
             <option value="student">Student</option>
@@ -3478,7 +3464,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             <div className="space-y-2">
               <input required placeholder="Full Name" value={assignModForm.name} onChange={(e) => setAssignModForm({ ...assignModForm, name: e.target.value })} className="w-full px-3.5 py-2 glass-input rounded-xl" />
               <input required placeholder="@mod_handle" value={assignModForm.username} onChange={(e) => setAssignModForm({ ...assignModForm, username: e.target.value })} className="w-full px-3.5 py-2 glass-input rounded-xl font-mono" />
-              <input required placeholder="Email (e.g. mod@gmail.com)" value={assignModForm.identifier} onChange={(e) => setAssignModForm({ ...assignModForm, identifier: e.target.value })} className="w-full px-3.5 py-2 glass-input rounded-xl" />
               <input required type="password" placeholder="Strong Password (8+ chars)" value={assignModForm.password} onChange={(e) => setAssignModForm({ ...assignModForm, password: e.target.value })} className="w-full px-3.5 py-2 glass-input rounded-xl" />
             </div>
           )}

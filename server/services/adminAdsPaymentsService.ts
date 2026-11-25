@@ -1,7 +1,7 @@
-import { db, runInTransaction } from '../db/database';
-import { cache } from '../utils/cache';
-import { sanitizeInputText, sanitizeSafeUrl } from '../utils/security';
-import { adminSecurityService } from './adminSecurityService';
+import { db, runInTransaction } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { sanitizeInputText, sanitizeSafeUrl } from '../utils/security.js';
+import { adminSecurityService } from './adminSecurityService.js';
 
 export interface CreateAdInput {
   title: string;

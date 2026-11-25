@@ -32,17 +32,17 @@ function assert(condition: any, message: string) {
 }
 
 async function runMentionTests() {
-  const { initDatabase, db } = await import('../db/database');
-  const { seedInitialData, hashPassword } = await import('../db/seed');
-  const { extractMentionHandles } = await import('../utils/mentions');
-  const { mentionService } = await import('../services/mentionService');
-  const { userService } = await import('../services/userService');
-  const { postService } = await import('../services/postService');
-  const { commentReactionService } = await import('../services/commentReactionService');
-  const { chatService } = await import('../services/chatService');
-  const { communityService } = await import('../services/communityService');
-  const { blockService } = await import('../services/blockService');
-  const { notificationService } = await import('../services/notificationService');
+  const { initDatabase, db } = await import('../db/database.js');
+  const { seedInitialData, hashPassword } = await import('../db/seed.js');
+  const { extractMentionHandles } = await import('../utils/mentions.js');
+  const { mentionService } = await import('../services/mentionService.js');
+  const { userService } = await import('../services/userService.js');
+  const { postService } = await import('../services/postService.js');
+  const { commentReactionService } = await import('../services/commentReactionService.js');
+  const { chatService } = await import('../services/chatService.js');
+  const { communityService } = await import('../services/communityService.js');
+  const { blockService } = await import('../services/blockService.js');
+  const { notificationService } = await import('../services/notificationService.js');
 
   console.log('\n======================================================');
   console.log('🏷️  SCHOOLBACKDOOR MENTIONS & TAGGING TEST SUITE');

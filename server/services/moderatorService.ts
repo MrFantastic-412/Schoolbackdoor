@@ -1,9 +1,9 @@
-import { db, runInTransaction } from '../db/database';
-import { cache } from '../utils/cache';
-import { sseManager } from '../realtime/sseManager';
-import { adminSecurityService } from './adminSecurityService';
-import { authService } from './authService';
-import { notificationService } from './notificationService';
+import { db, runInTransaction } from '../db/database.js';
+import { cache } from '../utils/cache.js';
+import { sseManager } from '../realtime/sseManager.js';
+import { adminSecurityService } from './adminSecurityService.js';
+import { authService } from './authService.js';
+import { notificationService } from './notificationService.js';
 
 export interface ModeratorPermissionSet {
   userId: string;
@@ -202,12 +202,11 @@ export const moderatorService = {
 
     return runInTransaction(() => {
       if (!targetUserId) {
-        if (!input.identifier || !input.username || !input.password) {
-          throw new Error('Provide an existing userId OR Gmail, @username, and strong password to create a Moderator.');
+        if (!input.username || !input.password) {
+          throw new Error('Provide an existing userId OR @username and strong password to create a Moderator.');
         }
         const created = authService.register(
           {
-            identifier: input.identifier,
             username: input.username,
             password: input.password,
             name: input.name || input.username.replace('@', ''),
@@ -218,7 +217,6 @@ export const moderatorService = {
           true
         );
         targetUserId = created.user.id;
-        db.prepare('UPDATE users SET is_verified = 1, verification_code = NULL WHERE id = ?').run(targetUserId);
         db.prepare('UPDATE user_profiles SET verified = 1 WHERE user_id = ?').run(targetUserId);
       }
 
