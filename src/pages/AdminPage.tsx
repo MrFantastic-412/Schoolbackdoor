@@ -11,6 +11,7 @@ import {
   Edit3,
   Eye,
   EyeOff,
+  Fingerprint,
   Flag,
   Globe,
   HardDrive,
@@ -64,12 +65,14 @@ import {
   SecurityEventRecord,
   StudentProfile,
 } from '../types';
+import { startAuthentication } from '@simplewebauthn/browser';
 import { api } from '../api/client';
 import { GlassButton, GlassCard, GlassInput, GlassModal } from '../components/glass';
 import { AdminDashboardSkeleton } from '../components/common/Skeletons';
 import { CAMPUS_AREA_OPTIONS } from '../data/locationAreas';
 import { useDebounce } from '../utils/useDebounce';
 import { triggerHaptic } from '../utils/haptics';
+import { formatPasskeyError, isPasskeySupported } from '../utils/webauthn';
 
 type AdminSection =
   | 'overview'
@@ -327,6 +330,13 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   });
   const [editingLimitsKey, setEditingLimitsKey] = useState<string | null>(null);
   const [editingLimitsJson, setEditingLimitsJson] = useState('{}');
+  const [reauthPendingAction, setReauthPendingAction] = useState<{
+    label: string;
+    retry: () => Promise<void>;
+  } | null>(null);
+  const [reauthPassword, setReauthPassword] = useState('');
+  const [reauthError, setReauthError] = useState<string | null>(null);
+  const [isReauthBusy, setIsReauthBusy] = useState(false);
 
   const isAdmin = profile.role === 'admin';
 
@@ -340,6 +350,23 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       setTimeout(() => setActionMessage(null), 4000);
     }
   }, []);
+
+  const executeWithReauth = useCallback(
+    async (label: string, fn: () => Promise<void>) => {
+      try {
+        await fn();
+      } catch (err: any) {
+        if (err?.code === 'REAUTH_REQUIRED') {
+          setReauthPassword('');
+          setReauthError(null);
+          setReauthPendingAction({ label, retry: fn });
+          return;
+        }
+        showFeedback(err?.message || 'Action failed.', true);
+      }
+    },
+    [showFeedback]
+  );
 
   const syncPublicConfig = useCallback(async () => {
     const cfg = await api.getPlatformConfig();
@@ -666,14 +693,14 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
   const handleAssignRole = async () => {
     if (!roleModalTarget) return;
-    try {
-      await api.assignStaffRole(roleModalTarget.id, selectedNewRole);
-      showFeedback(`Updated ${roleModalTarget.name} role to ${selectedNewRole.toUpperCase()}.`);
+    const target = roleModalTarget;
+    const nextRole = selectedNewRole;
+    await executeWithReauth(`Assign role ${nextRole.toUpperCase()} to ${target.handle}`, async () => {
+      await api.assignStaffRole(target.id, nextRole);
+      showFeedback(`Updated ${target.name} role to ${nextRole.toUpperCase()}.`);
       setRoleModalTarget(null);
       await loadAll();
-    } catch (err: any) {
-      showFeedback(err.message, true);
-    }
+    });
   };
 
   const handleIssueWarning = async (e: React.FormEvent) => {
@@ -706,57 +733,54 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
   const handleDeleteUserPermanently = async () => {
     if (!deleteUserTarget || deleteConfirmText !== 'PERMANENTLY_DELETE') return;
-    try {
-      await api.adminDeleteUserPermanently(deleteUserTarget.id, 'Removed via Admin Console');
-      showFeedback(`Permanently erased ${deleteUserTarget.handle} with SHA-256 tombstone.`);
+    const target = deleteUserTarget;
+    await executeWithReauth(`Permanently erase ${target.handle}`, async () => {
+      await api.adminDeleteUserPermanently(target.id, 'Removed via Admin Console');
+      showFeedback(`Permanently erased ${target.handle} with SHA-256 tombstone.`);
       setDeleteUserTarget(null);
       setDeleteConfirmText('');
       await loadAll();
-    } catch (err: any) {
-      showFeedback(err.message, true);
-    }
+    });
   };
 
   const handleAssignModeratorSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    try {
-      const payload =
-        assignModMode === 'promote'
-          ? {
-              userId: assignModForm.userId,
-              permissions: {
-                canReviewReports: assignModForm.canReviewReports,
-                canHideContent: assignModForm.canHideContent,
-                canWarnUsers: assignModForm.canWarnUsers,
-                canRestrictUsers: assignModForm.canRestrictUsers,
-                maxRestrictionHours: assignModForm.maxRestrictionHours,
-                canReviewCommunities: assignModForm.canReviewCommunities,
-                canEscalate: assignModForm.canEscalate,
-              },
-            }
-          : {
-              username: assignModForm.username,
-              password: assignModForm.password,
-              name: assignModForm.name,
-              department: assignModForm.department,
-              permissions: {
-                canReviewReports: assignModForm.canReviewReports,
-                canHideContent: assignModForm.canHideContent,
-                canWarnUsers: assignModForm.canWarnUsers,
-                canRestrictUsers: assignModForm.canRestrictUsers,
-                maxRestrictionHours: assignModForm.maxRestrictionHours,
-                canReviewCommunities: assignModForm.canReviewCommunities,
-                canEscalate: assignModForm.canEscalate,
-              },
-            };
+    const payload =
+      assignModMode === 'promote'
+        ? {
+            userId: assignModForm.userId,
+            permissions: {
+              canReviewReports: assignModForm.canReviewReports,
+              canHideContent: assignModForm.canHideContent,
+              canWarnUsers: assignModForm.canWarnUsers,
+              canRestrictUsers: assignModForm.canRestrictUsers,
+              maxRestrictionHours: assignModForm.maxRestrictionHours,
+              canReviewCommunities: assignModForm.canReviewCommunities,
+              canEscalate: assignModForm.canEscalate,
+            },
+          }
+        : {
+            username: assignModForm.username,
+            password: assignModForm.password,
+            name: assignModForm.name,
+            department: assignModForm.department,
+            permissions: {
+              canReviewReports: assignModForm.canReviewReports,
+              canHideContent: assignModForm.canHideContent,
+              canWarnUsers: assignModForm.canWarnUsers,
+              canRestrictUsers: assignModForm.canRestrictUsers,
+              maxRestrictionHours: assignModForm.maxRestrictionHours,
+              canReviewCommunities: assignModForm.canReviewCommunities,
+              canEscalate: assignModForm.canEscalate,
+            },
+          };
 
+    await executeWithReauth('Assign Moderator privileges', async () => {
       await api.adminAssignModerator(payload);
       showFeedback('Moderator account assigned with scoped permissions.');
       setShowAssignModModal(false);
       await loadAll();
-    } catch (err: any) {
-      showFeedback(err?.message || 'Failed to assign Moderator.', true);
-    }
+    });
   };
 
   const handleSaveAd = async (e: React.FormEvent) => {
@@ -1263,7 +1287,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   type="text"
                   value={userSearch}
                   onChange={(e) => setUserSearch(e.target.value)}
-                  placeholder="Search name, @handle, email, ID..."
+                  placeholder="Search name, @handle, ID..."
                   className="w-full pl-8 pr-3 py-2 glass-input rounded-xl text-xs text-[#171613] dark:text-[#F5EFE3]"
                 />
               </div>
@@ -1313,7 +1337,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                       <td className="p-3">
                         <div className="font-semibold text-[#171613] dark:text-[#F5EFE3]">{u.name}</div>
                         <div className="text-[11px] text-[#82796F] dark:text-[#A89F95] font-mono">
-                          {u.handle} · {u.email}
+                          {u.handle}
                         </div>
                         <div className="text-[10px] text-[#82796F] dark:text-[#A89F95] font-mono tabular-nums">
                           {u.matricNumber}
@@ -2080,13 +2104,11 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             <div className="space-y-3">
               {moderators.map((m) => {
                 const togglePerm = async (key: keyof ModeratorPermissions, val: any) => {
-                  try {
+                  await executeWithReauth(`Update ${m.handle} permissions`, async () => {
                     await api.adminUpdateModeratorPermissions(m.id, { [key]: val });
                     showFeedback(`Updated ${m.handle} permissions.`);
                     await loadAll();
-                  } catch (err: any) {
-                    showFeedback(err.message, true);
-                  }
+                  });
                 };
                 return (
                   <GlassCard key={m.id} tone="cream" padding="md" className="text-xs space-y-3">
@@ -2096,19 +2118,17 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                           {m.name} <span className="font-mono text-xs text-[#C4718E]">{m.handle}</span>
                         </div>
                         <div className="text-[11px] text-[#82796F] dark:text-[#A89F95] font-mono tabular-nums">
-                          {m.email} · Handled {m.handledReportsCount} report(s) · {m.actionsCount} logged action(s)
+                          Handled {m.handledReportsCount} report(s) · {m.actionsCount} logged action(s)
                         </div>
                       </div>
                       <button
                         type="button"
                         onClick={async () => {
-                          try {
+                          await executeWithReauth(`Revoke Moderator role for ${m.handle}`, async () => {
                             await api.adminRevokeModerator(m.id);
                             showFeedback(`Revoked Moderator privileges for ${m.handle}.`);
                             await loadAll();
-                          } catch (err: any) {
-                            showFeedback(err.message, true);
-                          }
+                          });
                         }}
                         className="px-3 py-1.5 rounded-lg bg-[#171613] dark:bg-[#23211C] text-[#F5EFE3] cursor-pointer self-start sm:self-auto"
                       >
@@ -2829,9 +2849,11 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     variant="glass"
                     size="sm"
                     onClick={async () => {
-                      const res = await api.restoreBackup(b.id);
-                      showFeedback(res.message || 'Snapshot restored.');
-                      await loadAll();
+                      await executeWithReauth(`Restore backup ${b.filename}`, async () => {
+                        const res = await api.restoreBackup(b.id);
+                        showFeedback(res.message || 'Snapshot restored.');
+                        await loadAll();
+                      });
                     }}
                   >
                     <RotateCcw className="w-3 h-3" />
@@ -2876,10 +2898,12 @@ export const AdminPage: React.FC<AdminPageProps> = ({
               <form
                 onSubmit={async (e) => {
                   e.preventDefault();
-                  await api.adminUpdateWebsiteSettings(siteSettings);
-                  showFeedback('Global website settings saved and broadcast live.');
-                  await loadAll();
-                  await syncPublicConfig();
+                  await executeWithReauth('Save global website settings', async () => {
+                    await api.adminUpdateWebsiteSettings(siteSettings);
+                    showFeedback('Global website settings saved and broadcast live.');
+                    await loadAll();
+                    await syncPublicConfig();
+                  });
                 }}
                 className="space-y-5 text-xs"
               >
@@ -3147,9 +3171,11 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     variant="black"
                     size="sm"
                     onClick={async () => {
-                      const res = await api.adminRevokeSessions();
-                      showFeedback(`Revoked ${res.revokedCount} other session(s).`);
-                      await loadAll();
+                      await executeWithReauth('Revoke all other Admin sessions', async () => {
+                        const res = await api.adminRevokeSessions();
+                        showFeedback(`Revoked ${res.revokedCount} other session(s).`);
+                        await loadAll();
+                      });
                     }}
                     className="w-full"
                   >
@@ -3711,10 +3737,12 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 variant="pink"
                 size="sm"
                 onClick={async () => {
-                  const res = await api.adminCleanOrphanedFiles();
-                  showFeedback(`Cleaned ${res.deletedCount} file(s).`);
-                  setShowCleanOrphansConfirm(false);
-                  await loadAll();
+                  await executeWithReauth('Clean orphaned upload files', async () => {
+                    const res = await api.adminCleanOrphanedFiles();
+                    showFeedback(`Cleaned ${res.deletedCount} file(s).`);
+                    setShowCleanOrphansConfirm(false);
+                    await loadAll();
+                  });
                 }}
               >
                 Confirm Cleanup
@@ -3751,6 +3779,96 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             <GlassButton type="submit" variant="pink" size="sm">Register Feature</GlassButton>
           </div>
         </form>
+      </GlassModal>
+
+      <GlassModal
+        isOpen={Boolean(reauthPendingAction)}
+        onClose={() => {
+          if (isReauthBusy) return;
+          setReauthPendingAction(null);
+          setReauthPassword('');
+          setReauthError(null);
+        }}
+        title="Confirm Admin Identity"
+        subtitle={reauthPendingAction?.label || 'Sensitive administrative action'}
+        maxWidthClass="max-w-sm"
+      >
+        <div className="p-5 space-y-3.5 text-xs">
+          <p className="text-[#82796F] dark:text-[#A89F95] leading-relaxed">
+            For security, sensitive administrative changes require recent verification. Confirm with your Admin password or registered passkey to continue.
+          </p>
+          {reauthError && (
+            <div className="p-2.5 rounded-xl bg-[#F6E2E6] dark:bg-[#4A2532]/75 border border-[#D98BA5]/60 text-[#171613] dark:text-[#F5EFE3]">
+              {reauthError}
+            </div>
+          )}
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              if (!reauthPendingAction || !reauthPassword || isReauthBusy) return;
+              setIsReauthBusy(true);
+              setReauthError(null);
+              try {
+                await api.reauthenticate(reauthPassword);
+                const pending = reauthPendingAction;
+                setReauthPendingAction(null);
+                setReauthPassword('');
+                await pending.retry();
+              } catch (err: any) {
+                setReauthError(err?.message || 'Password verification failed.');
+              } finally {
+                setIsReauthBusy(false);
+              }
+            }}
+            className="space-y-3"
+          >
+            <GlassInput
+              label="Current Admin Password"
+              type="password"
+              autoComplete="current-password"
+              required
+              value={reauthPassword}
+              onChange={(e) => setReauthPassword(e.target.value)}
+              placeholder="Enter Admin password"
+              leftIcon={<Lock className="w-4 h-4" />}
+            />
+            <div className="flex flex-col gap-2">
+              <GlassButton type="submit" variant="pink" size="md" disabled={isReauthBusy || !reauthPassword} className="w-full">
+                {isReauthBusy ? 'Verifying...' : 'Confirm & Continue'}
+              </GlassButton>
+              {isPasskeySupported() && (
+                <GlassButton
+                  type="button"
+                  variant="glass"
+                  size="sm"
+                  disabled={isReauthBusy}
+                  onClick={async () => {
+                    if (!reauthPendingAction || isReauthBusy) return;
+                    setIsReauthBusy(true);
+                    setReauthError(null);
+                    try {
+                      const options = await api.getPasskeyReauthOptions();
+                      const assertion = await startAuthentication({ optionsJSON: options });
+                      await api.verifyPasskeyReauth(assertion);
+                      const pending = reauthPendingAction;
+                      setReauthPendingAction(null);
+                      setReauthPassword('');
+                      await pending.retry();
+                    } catch (err: any) {
+                      setReauthError(formatPasskeyError(err, 'Passkey verification failed.'));
+                    } finally {
+                      setIsReauthBusy(false);
+                    }
+                  }}
+                  className="w-full"
+                >
+                  <Fingerprint className="w-3.5 h-3.5 text-[#C4718E]" />
+                  <span>Confirm with Passkey</span>
+                </GlassButton>
+              )}
+            </div>
+          </form>
+        </div>
       </GlassModal>
     </div>
   );

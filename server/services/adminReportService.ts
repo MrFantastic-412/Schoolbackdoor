@@ -172,7 +172,8 @@ export const adminReportService = {
     reportId: string,
     adminId: string,
     status: 'reviewed' | 'dismissed' | 'resolved',
-    resolutionNotes?: string
+    resolutionNotes?: string,
+    actionTaken?: string
   ) {
     const allowedStatuses = new Set(['reviewed', 'dismissed', 'resolved']);
     if (!allowedStatuses.has(status)) {
@@ -182,12 +183,20 @@ export const adminReportService = {
       typeof resolutionNotes === 'string' && resolutionNotes.trim()
         ? resolutionNotes.trim().slice(0, 500)
         : null;
+    const cleanAction =
+      typeof actionTaken === 'string' && actionTaken.trim()
+        ? actionTaken.trim().slice(0, 120)
+        : null;
 
     const res = db.prepare(`
       UPDATE reports
-      SET status = ?, resolution_notes = ?, reviewed_by = ?, updated_at = CURRENT_TIMESTAMP
+      SET status = ?,
+          resolution_notes = ?,
+          action_taken = COALESCE(?, action_taken),
+          reviewed_by = ?,
+          updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
-    `).run(status, cleanNotes, adminId, reportId);
+    `).run(status, cleanNotes, cleanAction, adminId, reportId);
 
     if (!res.changes) {
       throw new Error('Report not found.');
@@ -195,10 +204,11 @@ export const adminReportService = {
 
     adminSecurityService.logAdminAction(adminId, `RESOLVE_REPORT_${status.toUpperCase()}`, 'report', reportId, {
       resolutionNotes: cleanNotes,
+      ...(cleanAction ? { actionTaken: cleanAction } : {}),
     });
     cache.invalidatePrefix('admin:');
 
-    return { success: true, reportId, status };
+    return { success: true, reportId, status, ...(cleanAction ? { actionTaken: cleanAction } : {}) };
   },
 
   getAuditLogs(limit = 50) {

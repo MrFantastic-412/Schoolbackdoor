@@ -1,4 +1,4 @@
-import { db, runInTransaction, syncTheBackdoorAdminIdentity, syncDefaultModeratorAccount } from './database.js';
+import { db, runInTransaction, syncTheBackdoorAdminIdentity, syncDefaultModeratorAccount, UNCLAIMED_CREDENTIAL_SENTINEL } from './database.js';
 import crypto from 'node:crypto';
 import { hashPassword } from '../utils/security.js';
 
@@ -13,7 +13,7 @@ export function seedInitialData() {
   }
 
   runInTransaction(() => {
-    // 1. Seed Users (students/staff use dev sample hash; Admin uses ADMIN_PASSWORD env secret or ephemeral lock hash)
+    // 1. Seed Users (students/staff use random ephemeral lock hash; Admin uses ADMIN_PASSWORD env secret or unclaimed sentinel)
     const defaultStudentPassword = hashPassword(crypto.randomBytes(16).toString('hex'));
     const configuredAdminSecret = (
       process.env.ADMIN_PASSWORD ||
@@ -22,7 +22,7 @@ export function seedInitialData() {
     ).trim();
     const adminPasswordHash = configuredAdminSecret
       ? hashPassword(configuredAdminSecret)
-      : hashPassword(crypto.randomBytes(32).toString('hex'));
+      : UNCLAIMED_CREDENTIAL_SENTINEL;
 
     const insertUser = db.prepare(`
       INSERT INTO users (id, matric_number, email, username, password_hash, role, status, is_verified)

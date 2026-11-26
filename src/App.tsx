@@ -33,6 +33,7 @@ import {
 import { api } from './api/client';
 import { triggerHaptic } from './utils/haptics';
 import { SavedLocationsProvider } from './utils/useSavedLocations';
+import type { SettingsSectionTab } from './pages/SettingsPage';
 
 const ChatsPage = lazy(() => import('./pages/ChatsPage').then((m) => ({ default: m.ChatsPage })));
 const CommunitiesPage = lazy(() =>
@@ -246,6 +247,9 @@ export default function App() {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [authModalMode, setAuthModalMode] = useState<'login' | 'register'>('login');
   const [latestAdminReport, setLatestAdminReport] = useState<AdminReport | null>(null);
+  const [settingsRequestedSection, setSettingsRequestedSection] = useState<SettingsSectionTab | null>(null);
+  const [needsRecoveryCodeSetup, setNeedsRecoveryCodeSetup] = useState(false);
+  const [dismissedRecoveryBanner, setDismissedRecoveryBanner] = useState(false);
 
   // Per-tab scroll position cache + in-flight duplicate-submission locks
   const scrollPositionsRef = useRef<Partial<Record<NavigationTab, number>>>({});
@@ -784,6 +788,35 @@ export default function App() {
     };
   }, [profile.userId]);
 
+  // Check if an existing/legacy account has never generated single-use recovery codes
+  useEffect(() => {
+    if (!profile.userId) {
+      setNeedsRecoveryCodeSetup(false);
+      setDismissedRecoveryBanner(false);
+      return;
+    }
+    let active = true;
+    try {
+      const dismissed = sessionStorage.getItem(`sb_dismiss_rc_prompt:${profile.userId}`) === '1';
+      setDismissedRecoveryBanner(dismissed);
+    } catch {
+      setDismissedRecoveryBanner(false);
+    }
+    api
+      .getRecoveryCodeStatus()
+      .then((status) => {
+        if (!active || !status) return;
+        const missing = Boolean(status.needsInitialSetup || (!status.generatedAt && status.remainingCount === 0));
+        setNeedsRecoveryCodeSetup(missing);
+      })
+      .catch(() => {
+        if (active) setNeedsRecoveryCodeSetup(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [profile.userId]);
+
   const handleOpenAuth = useCallback((mode: 'login' | 'register' = 'login') => {
     setAuthModalMode(mode);
     setIsAuthModalOpen(true);
@@ -895,6 +928,14 @@ export default function App() {
   );
 
   const handleAuthSuccess = async (newProfile: StudentProfile, message?: string) => {
+    if (newProfile.userId) {
+      try {
+        sessionStorage.removeItem(`sb_dismiss_rc_prompt:${newProfile.userId}`);
+      } catch {
+        // Ignore storage errors
+      }
+      setDismissedRecoveryBanner(false);
+    }
     setProfile(newProfile);
     setDismissedWelcome(true);
     showToast(message || `Authenticated as ${newProfile.handle}`, 'success');
@@ -905,7 +946,16 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
+      if (profile.userId) {
+        try {
+          sessionStorage.removeItem(`sb_dismiss_rc_prompt:${profile.userId}`);
+        } catch {
+          // Ignore storage errors
+        }
+      }
       await api.logout();
+      setNeedsRecoveryCodeSetup(false);
+      setDismissedRecoveryBanner(false);
       setProfile(INITIAL_STUDENT_PROFILE);
       setConversations([]);
       setFeedCategory('for_you');
@@ -1754,6 +1804,46 @@ export default function App() {
               </div>
             )}
 
+            {profile.userId && needsRecoveryCodeSetup && !dismissedRecoveryBanner && (
+              <div className="bg-[#FFFCF7]/90 dark:bg-[#23211C]/95 text-[#171613] dark:text-[#F5EFE3] px-4 py-2.5 text-xs flex flex-wrap items-center justify-between gap-2.5 border-b border-[#D98BA5]/55">
+                <div className="min-w-0 flex-1">
+                  <span className="font-semibold">Set up your single-use recovery codes:</span>{' '}
+                  <span className="text-[#82796F] dark:text-[#A89F95]">
+                    This account doesn&apos;t have recovery codes yet. Generate 10 one-time codes (or add a passkey) so you can reset a forgotten password without email or SMS.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <GlassButton
+                    type="button"
+                    variant="pink"
+                    size="sm"
+                    onClick={() => {
+                      setSettingsRequestedSection('devices');
+                      navigate({ tab: 'settings', clearPost: true });
+                    }}
+                  >
+                    Generate Recovery Codes
+                  </GlassButton>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDismissedRecoveryBanner(true);
+                      if (profile.userId) {
+                        try {
+                          sessionStorage.setItem(`sb_dismiss_rc_prompt:${profile.userId}`, '1');
+                        } catch {
+                          // Ignore storage errors
+                        }
+                      }
+                    }}
+                    className="px-2 py-1 text-[11px] font-semibold text-[#82796F] dark:text-[#A89F95] hover:text-[#171613] dark:hover:text-[#F5EFE3] cursor-pointer"
+                  >
+                    Later
+                  </button>
+                </div>
+              </div>
+            )}
+
             {isTabBlocked ? (
               <div className="max-w-xl mx-auto my-12 px-4">
                 <GlassCard tone="cream" padding="lg" className="text-center">
@@ -1926,6 +2016,14 @@ export default function App() {
                       onOpenAuth={handleOpenAuth}
                       onLogout={handleLogout}
                       onNavigateToTab={handleSelectTab}
+                      requestedSection={settingsRequestedSection}
+                      onClearRequestedSection={() => setSettingsRequestedSection(null)}
+                      onRecoveryStatusChanged={(status) => {
+                        const missing = Boolean(
+                          status.needsInitialSetup || (!status.generatedAt && status.remainingCount === 0)
+                        );
+                        setNeedsRecoveryCodeSetup(missing);
+                      }}
                     />
                   )}
 

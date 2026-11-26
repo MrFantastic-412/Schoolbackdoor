@@ -1004,9 +1004,13 @@ export function initDatabase() {
   }
 }
 
+export const UNCLAIMED_CREDENTIAL_SENTINEL = '!UNCLAIMED_SETUP_REQUIRED';
+
 /**
  * Keeps the single Admin account ('u-admin') synced to username THEBACKDOOR (@THEBACKDOOR)
  * and securely hashes ADMIN_PASSWORD / SCHOOLBACKDOOR_ADMIN_PASSWORD if configured on the server.
+ * Never embeds fallback passwords in code; unconfigured fresh installs remain unclaimed until
+ * configured via env secret, CLI provisioning script (`npm run provision:staff`), or first-run setup.
  */
 export function syncTheBackdoorAdminIdentity() {
   try {
@@ -1019,7 +1023,7 @@ export function syncTheBackdoorAdminIdentity() {
     const envPassword = (
       process.env.ADMIN_PASSWORD ||
       process.env.SCHOOLBACKDOOR_ADMIN_PASSWORD ||
-      (process.env.NODE_ENV === 'production' ? '' : 'TheBackdoor2026!')
+      ''
     ).trim();
 
     db.prepare(`
@@ -1045,7 +1049,11 @@ export function syncTheBackdoorAdminIdentity() {
     `).run(adminRow.id);
 
     if (envPassword) {
-      if (!adminRow.password_hash || !verifyPassword(envPassword, adminRow.password_hash)) {
+      if (
+        !adminRow.password_hash ||
+        adminRow.password_hash === UNCLAIMED_CREDENTIAL_SENTINEL ||
+        !verifyPassword(envPassword, adminRow.password_hash)
+      ) {
         db.prepare('UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
           hashPassword(envPassword),
           adminRow.id
@@ -1053,7 +1061,7 @@ export function syncTheBackdoorAdminIdentity() {
       }
     } else if (!adminRow.password_hash) {
       db.prepare('UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
-        hashPassword(crypto.randomBytes(32).toString('hex')),
+        UNCLAIMED_CREDENTIAL_SENTINEL,
         adminRow.id
       );
     }
@@ -1063,7 +1071,8 @@ export function syncTheBackdoorAdminIdentity() {
 }
 
 /**
- * Ensures a dedicated default Moderator account (@campus_mod) exists with standard permissions
+ * Ensures a dedicated default Moderator account (@campus_mod) exists with standard permissions.
+ * Password is only set when MODERATOR_PASSWORD is supplied via environment or CLI provisioning.
  */
 export function syncDefaultModeratorAccount() {
   try {
@@ -1074,13 +1083,10 @@ export function syncDefaultModeratorAccount() {
       .prepare("SELECT id, password_hash FROM users WHERE id = 'u-mod' OR username = '@campus_mod' LIMIT 1")
       .get() as { id: string; password_hash: string } | undefined;
 
-    const defaultPass = (
-      process.env.MODERATOR_PASSWORD ||
-      (process.env.NODE_ENV === 'production' ? '' : 'Moderator2026!')
-    ).trim();
+    const envModPassword = (process.env.MODERATOR_PASSWORD || '').trim();
 
     if (!modRow) {
-      const modHash = defaultPass ? hashPassword(defaultPass) : hashPassword(crypto.randomBytes(32).toString('hex'));
+      const modHash = envModPassword ? hashPassword(envModPassword) : UNCLAIMED_CREDENTIAL_SENTINEL;
       const modId = 'u-mod';
       db.prepare(`
         INSERT INTO users (id, matric_number, email, username, password_hash, role, status, is_verified, accepted_terms_version, accepted_terms_at)
@@ -1108,9 +1114,14 @@ export function syncDefaultModeratorAccount() {
           ?, 'u-admin', 1, 1, 1, 1, 72, 1, 1, '[]', 'Default Campus Moderator', CURRENT_TIMESTAMP
         )
       `).run(modId);
-    } else if (defaultPass && (!modRow.password_hash || !verifyPassword(defaultPass, modRow.password_hash))) {
+    } else if (
+      envModPassword &&
+      (!modRow.password_hash ||
+        modRow.password_hash === UNCLAIMED_CREDENTIAL_SENTINEL ||
+        !verifyPassword(envModPassword, modRow.password_hash))
+    ) {
       db.prepare('UPDATE users SET password_hash = ?, role = "moderator", updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
-        hashPassword(defaultPass),
+        hashPassword(envModPassword),
         modRow.id
       );
     }

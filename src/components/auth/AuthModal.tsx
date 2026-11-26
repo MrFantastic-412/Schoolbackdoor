@@ -165,6 +165,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [adminNeedsSetup, setAdminNeedsSetup] = useState(false);
+  const [showAdminSetupForm, setShowAdminSetupForm] = useState(false);
+  const [adminSetupPassword, setAdminSetupPassword] = useState('');
+  const [adminSetupConfirm, setAdminSetupConfirm] = useState('');
   const isSubmittingRef = useRef(false);
   const regIdempotencyKeyRef = useRef<string | null>(null);
 
@@ -180,6 +184,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setPasskeyRecoveryUser(null);
       setIsPasskeyBusy(false);
       regIdempotencyKeyRef.current = null;
+      setShowAdminSetupForm(false);
+      setAdminSetupPassword('');
+      setAdminSetupConfirm('');
+      void api
+        .getSetupStatus()
+        .then((st) => setAdminNeedsSetup(Boolean(st?.adminNeedsSetup)))
+        .catch(() => setAdminNeedsSetup(false));
     } else {
       setIsCropModalOpen(false);
       isSubmittingRef.current = false;
@@ -474,6 +485,44 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   };
 
+  const handleClaimFirstRunAdmin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSubmittingRef.current) return;
+    setError(null);
+    setSuccessMsg(null);
+    const pwdStatus = evaluatePasswordStrength(adminSetupPassword, '@THEBACKDOOR');
+    if (!pwdStatus.valid) {
+      setError(pwdStatus.error || 'Choose a stronger password.');
+      return;
+    }
+    if (adminSetupPassword !== adminSetupConfirm) {
+      setError('Password and confirmation password do not match.');
+      return;
+    }
+    isSubmittingRef.current = true;
+    setIsLoading(true);
+    try {
+      const res = await api.claimFirstRunAdmin(adminSetupPassword, adminSetupConfirm);
+      triggerHaptic('success');
+      setAdminSetupPassword('');
+      setAdminSetupConfirm('');
+      setAdminNeedsSetup(false);
+      setShowAdminSetupForm(false);
+      setPendingProfile(res.profile);
+      setIssuedRecoveryCodes(Array.isArray(res.recoveryCodes) ? res.recoveryCodes : []);
+      setCopiedCodes(false);
+      setSavedCodesConfirmed(false);
+      setSuccessMsg('Initial @THEBACKDOOR Admin password set. Save these 10 single-use recovery codes now.');
+      setMode('recoveryCodes');
+    } catch (err: any) {
+      triggerHaptic('error');
+      setError(err?.message || 'Unable to complete initial Admin setup.');
+    } finally {
+      isSubmittingRef.current = false;
+      setIsLoading(false);
+    }
+  };
+
   const modalTitle =
     mode === 'login'
       ? 'Welcome Back'
@@ -514,8 +563,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           {mode !== 'recoveryCodes' && (
             <GlassTab
               items={[
-                { id: 'login', label: 'Log In', icon: <LogIn className="w-3.5 h-3.5" /> },
-                { id: 'register', label: 'Sign Up', icon: <UserPlus className="w-3.5 h-3.5" /> },
+                { id: 'login', label: 'Sign In', icon: <LogIn className="w-3.5 h-3.5" /> },
+                { id: 'register', label: 'Create Account', icon: <UserPlus className="w-3.5 h-3.5" /> },
                 { id: 'forgot', label: 'Recovery', icon: <KeyRound className="w-3.5 h-3.5" /> },
               ]}
               activeId={mode}
@@ -575,7 +624,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     }}
                     className="text-[11px] font-semibold text-[#171613] dark:text-[#F5EFE3] hover:text-[#C4718E] dark:hover:text-[#E5A4BA] transition-colors cursor-pointer"
                   >
-                    Forgot password?
+                    Forgot Password?
                   </button>
                 </div>
                 <GlassInput
@@ -622,7 +671,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               </div>
 
               <GlassButton type="submit" variant="pink" size="lg" disabled={isLoading || isPasskeyBusy} className="w-full">
-                {isLoading ? 'Signing in...' : 'Log In'}
+                {isLoading ? 'Signing in...' : 'Sign In'}
               </GlassButton>
 
               <div className="flex items-center gap-2.5 text-[11px] text-[#82796F] dark:text-[#A89F95]">
@@ -649,6 +698,86 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     : 'Passkeys require HTTPS and a supported browser; password sign-in works everywhere.'}
                 </p>
               </div>
+
+              <div className="pt-1 flex items-center justify-center gap-1.5 text-xs text-[#82796F] dark:text-[#A89F95]">
+                <span>New to Schoolbackdoor?</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    triggerHaptic('tap');
+                    setMode('register');
+                    setError(null);
+                    setSuccessMsg(null);
+                  }}
+                  className="font-semibold text-[#C4718E] dark:text-[#E5A4BA] hover:underline cursor-pointer"
+                >
+                  Create Account
+                </button>
+              </div>
+
+              {adminNeedsSetup && (
+                <div className="pt-2 border-t border-[#171613]/10 dark:border-white/10">
+                  {!showAdminSetupForm ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic('tap');
+                        setShowAdminSetupForm(true);
+                        setError(null);
+                      }}
+                      className="w-full py-2 px-3 rounded-xl glass-subtle border border-[#D98BA5]/45 text-[11px] font-semibold text-[#171613] dark:text-[#F5EFE3] hover:bg-[#F6E2E6]/60 dark:hover:bg-[#4A2532]/50 transition-colors cursor-pointer"
+                    >
+                      First-Run Setup: Claim @THEBACKDOOR Admin Password
+                    </button>
+                  ) : (
+                    <div className="p-3.5 rounded-xl glass-subtle border border-[#D98BA5]/55 space-y-2.5 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-[#171613] dark:text-[#F5EFE3]">
+                          Set Initial @THEBACKDOOR Password
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setShowAdminSetupForm(false)}
+                          className="text-[11px] underline text-[#82796F] cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-[#82796F] dark:text-[#A89F95]">
+                        Available once on a fresh installation with no <code className="font-mono">ADMIN_PASSWORD</code> set.
+                      </p>
+                      <GlassInput
+                        label="New Admin Password"
+                        type="password"
+                        autoComplete="new-password"
+                        value={adminSetupPassword}
+                        onChange={(e) => setAdminSetupPassword(e.target.value)}
+                        placeholder="8+ chars: A-Z, a-z, 0-9, symbol"
+                        leftIcon={<Lock className="w-4 h-4" />}
+                      />
+                      <GlassInput
+                        label="Confirm Admin Password"
+                        type="password"
+                        autoComplete="new-password"
+                        value={adminSetupConfirm}
+                        onChange={(e) => setAdminSetupConfirm(e.target.value)}
+                        placeholder="Re-enter password"
+                        leftIcon={<Lock className="w-4 h-4" />}
+                      />
+                      <GlassButton
+                        type="button"
+                        variant="black"
+                        size="sm"
+                        disabled={isLoading}
+                        onClick={handleClaimFirstRunAdmin}
+                        className="w-full"
+                      >
+                        {isLoading ? 'Provisioning Admin...' : 'Set Admin Password & Generate Recovery Codes'}
+                      </GlassButton>
+                    </div>
+                  )}
+                </div>
+              )}
             </form>
           )}
 
@@ -901,7 +1030,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   className="mt-0.5 w-4 h-4 accent-[#D98BA5] shrink-0 cursor-pointer"
                 />
                 <span className="text-[11px] text-[#171613]/85 dark:text-[#F5EFE3]/85 leading-relaxed">
-                  I have saved my 10 recovery codes safely and understand they will not be displayed again.
+                  I&apos;ve saved these 10 single-use recovery codes safely and understand they will not be displayed again.
                 </span>
               </label>
 

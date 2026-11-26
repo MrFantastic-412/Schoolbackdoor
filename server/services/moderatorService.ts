@@ -138,7 +138,7 @@ export const moderatorService = {
    */
   listModerators() {
     const rows = db.prepare(`
-      SELECT u.id, u.matric_number, u.email, u.username, u.role, u.status, u.last_active_at, u.created_at,
+      SELECT u.id, u.matric_number, u.username, u.role, u.status, u.last_active_at, u.created_at,
              pr.name, pr.handle, pr.department, pr.campus,
              mp.assigned_by, mp.can_review_reports, mp.can_hide_content, mp.can_warn_users,
              mp.can_restrict_users, mp.max_restriction_hours, mp.can_review_communities,
@@ -156,7 +156,6 @@ export const moderatorService = {
       id: r.id,
       name: r.name || 'Moderator',
       handle: r.handle || r.username || '@moderator',
-      email: r.email,
       matricNumber: r.matric_number,
       department: r.department || 'Community Safety',
       campus: r.campus || 'Main Campus',
@@ -465,7 +464,8 @@ export const moderatorService = {
       let targetPreview: any = null;
       if (r.target_type === 'post') {
         const post = db.prepare(`
-          SELECT p.id, p.author_id, p.content, COALESCE(p.is_hidden, 0) as is_hidden, p.community_id,
+          SELECT p.id, p.author_id, p.content, COALESCE(p.is_hidden, 0) as is_hidden,
+                 COALESCE(p.is_anonymous, 0) as is_anonymous, p.community_id,
                  pr.name as author_name, pr.handle as author_handle, u.role as author_role,
                  u.account_restricted_until, COALESCE(u.warnings_count, 0) as warnings_count
           FROM posts p
@@ -474,17 +474,23 @@ export const moderatorService = {
           WHERE p.id = ?
         `).get(r.target_id) as any;
         if (post) {
+          const hideAnonAuthor = Boolean(post.is_anonymous) && actorRole !== 'admin';
           targetPreview = {
             exists: true,
-            targetUserId: post.author_id,
-            authorName: post.author_name || 'Student',
-            authorHandle: post.author_handle || '@student',
-            authorRole: post.author_role,
+            ...(hideAnonAuthor ? {} : { targetUserId: post.author_id }),
+            authorName: hideAnonAuthor ? 'Anonymous Whisper' : post.author_name || 'Student',
+            authorHandle: hideAnonAuthor ? '@anonymous' : post.author_handle || '@student',
+            authorRole: hideAnonAuthor ? 'student' : post.author_role,
+            isAnonymous: Boolean(post.is_anonymous),
             snippet: String(post.content || '').slice(0, 280),
             isHidden: Boolean(post.is_hidden),
             communityId: post.community_id || undefined,
-            restrictedUntil: post.account_restricted_until || undefined,
-            warningsCount: Number(post.warnings_count || 0),
+            ...(hideAnonAuthor
+              ? {}
+              : {
+                  restrictedUntil: post.account_restricted_until || undefined,
+                  warningsCount: Number(post.warnings_count || 0),
+                }),
           };
         }
       } else if (r.target_type === 'comment') {
@@ -669,6 +675,9 @@ export const moderatorService = {
       if ((Boolean(post.is_admin_post) || author?.role === 'admin') && actorRole !== 'admin') {
         throw new ForbiddenModeratorActionError('Forbidden. Moderators cannot hide or remove Official Admin posts.');
       }
+      if (author?.role === 'moderator' && post.author_id !== modId && actorRole !== 'admin') {
+        throw new ForbiddenModeratorActionError('Forbidden. Moderators cannot modify fellow Moderators’ posts.');
+      }
 
       if (action === 'remove') {
         // Moderators hide violating posts cleanly with audit trace; Admin retains permanent hard-delete authority
@@ -700,6 +709,9 @@ export const moderatorService = {
         | undefined;
       if (author?.role === 'admin' && actorRole !== 'admin') {
         throw new ForbiddenModeratorActionError('Forbidden. Moderators cannot remove Admin comments.');
+      }
+      if (author?.role === 'moderator' && comment.author_id !== modId && actorRole !== 'admin') {
+        throw new ForbiddenModeratorActionError('Forbidden. Moderators cannot remove fellow Moderators’ comments.');
       }
 
       runInTransaction(() => {

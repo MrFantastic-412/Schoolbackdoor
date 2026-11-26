@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { db } from '../db/database.js';
 import { logger } from '../utils/logger.js';
-import { hashSessionToken, SESSION_POLICY } from '../utils/security.js';
+import { hashSessionToken, recordSecurityEvent, SESSION_POLICY, verifyPassword } from '../utils/security.js';
 
 export type UserRole = 'admin' | 'moderator' | 'staff' | 'student';
 
@@ -9,7 +9,6 @@ export interface AuthenticatedUser {
   id: string;
   matric_number: string;
   username?: string;
-  email?: string | null;
   role: UserRole;
   status: 'active' | 'suspended' | 'pending_verification';
   restricted_until?: string | null;
@@ -139,7 +138,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
       const tokenHash = hashSessionToken(rawToken);
       const sessionRow = db.prepare(`
         SELECT s.token, s.id as session_id, s.expires_at, s.max_expires_at, s.revoked_at,
-               u.id, u.matric_number, u.username, u.email, u.role, u.status,
+               u.id, u.matric_number, u.username, u.role, u.status,
                u.account_restricted_until, u.restriction_reason,
                u.accepted_terms_version, u.last_reauthenticated_at
         FROM sessions s
@@ -159,7 +158,6 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
           id: sessionRow.id,
           matric_number: sessionRow.matric_number,
           username: sessionRow.username || undefined,
-          email: sessionRow.email || null,
           role: sessionRow.role as UserRole,
           status: sessionRow.status,
           restricted_until: restriction.restricted_until,
@@ -174,7 +172,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
     const hasRefreshCookie = Boolean(parseCookieValue(req.headers.cookie, 'sb_refresh'));
     if (!resolvedUser && !rawToken && !hasRefreshCookie && process.env.NODE_ENV !== 'production') {
       const defaultUser = db.prepare(`
-        SELECT id, matric_number, username, email, role, status, account_restricted_until, restriction_reason,
+        SELECT id, matric_number, username, role, status, account_restricted_until, restriction_reason,
                accepted_terms_version, last_reauthenticated_at
         FROM users
         WHERE id = 'u-ayodele'
@@ -186,7 +184,6 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
           id: defaultUser.id,
           matric_number: defaultUser.matric_number,
           username: defaultUser.username || undefined,
-          email: defaultUser.email || null,
           role: defaultUser.role as UserRole,
           status: defaultUser.status,
           restricted_until: restriction.restricted_until,
@@ -258,6 +255,61 @@ export function hasRecentReauth(user: AuthenticatedUser | undefined, maxAgeMinut
   const reauthMs = parseTimestampMs(user.lastReauthenticatedAt);
   if (!Number.isFinite(reauthMs) || reauthMs <= 0) return false;
   return Date.now() - reauthMs <= maxAgeMinutes * 60 * 1000;
+}
+
+/**
+ * Enforces recent step-up re-authentication (password or passkey within REAUTH_WINDOW_MINUTES)
+ * for sensitive administrative or destructive account operations.
+ */
+export function requireRecentReauth(req: Request, res: Response, next: NextFunction) {
+  if (!req.user) {
+    res.status(401).json({ error: 'Authentication required.' });
+    return;
+  }
+  if (hasRecentReauth(req.user)) {
+    next();
+    return;
+  }
+
+  const inlinePassword =
+    typeof req.body?.currentPassword === 'string' && req.body.currentPassword.length > 0
+      ? req.body.currentPassword
+      : '';
+
+  if (inlinePassword) {
+    const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id) as
+      | { password_hash: string }
+      | undefined;
+    if (inlinePassword.length <= 128 && row && verifyPassword(inlinePassword, row.password_hash)) {
+      const nowIso = new Date().toISOString();
+      db.prepare('UPDATE users SET last_reauthenticated_at = ? WHERE id = ?').run(nowIso, req.user.id);
+      req.user.lastReauthenticatedAt = nowIso;
+      recordSecurityEvent({
+        userId: req.user.id,
+        eventType: 'REAUTH_SUCCESS',
+        severity: 'info',
+        ipAddress: req.ip || req.socket.remoteAddress,
+      });
+      next();
+      return;
+    }
+    recordSecurityEvent({
+      userId: req.user.id,
+      eventType: 'REAUTH_FAILED',
+      severity: 'warning',
+      ipAddress: req.ip || req.socket.remoteAddress,
+    });
+    res.status(401).json({
+      error: 'Incorrect password for step-up verification.',
+      code: 'REAUTH_FAILED',
+    });
+    return;
+  }
+
+  res.status(403).json({
+    error: 'Please re-authenticate with your password or passkey before performing this sensitive action.',
+    code: 'REAUTH_REQUIRED',
+  });
 }
 
 /**

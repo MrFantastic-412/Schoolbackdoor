@@ -50,6 +50,8 @@ import {
   SavedLocation,
   LocationSearchHistoryItem,
   PasskeySummary,
+  RecoveryCodeStatus,
+  UserSecurityEvent,
 } from '../types';
 
 const API_BASE = '/api';
@@ -230,6 +232,8 @@ const SKIP_REFRESH_PATHS = [
   '/auth/recovery/reset',
   '/auth/passkeys/login',
   '/auth/passkeys/recovery',
+  '/auth/setup-status',
+  '/auth/setup-admin',
 ];
 
 async function fetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
@@ -338,6 +342,30 @@ export const api = {
   }> {
     const res = await fetch(`${API_BASE}/auth/challenge`);
     return parseJsonOrThrow(res, 'Unable to initialize signup security check.');
+  },
+
+  async getSetupStatus(): Promise<{ adminNeedsSetup: boolean }> {
+    try {
+      const res = await fetch(`${API_BASE}/auth/setup-status`);
+      return parseJsonOrFallback(res, { adminNeedsSetup: false });
+    } catch {
+      return { adminNeedsSetup: false };
+    }
+  },
+
+  async claimFirstRunAdmin(password: string, confirmPassword: string) {
+    const res = await fetch(`${API_BASE}/auth/setup-admin`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password, confirmPassword }),
+    });
+    const result = await parseJsonOrThrow<any>(res, 'Unable to complete initial Admin setup.');
+    if (result.token) {
+      this.setToken(result.token);
+    } else {
+      hasKnownSession = true;
+    }
+    return result;
   },
 
   async register(data: {
@@ -475,24 +503,31 @@ export const api = {
     return parseJsonOrThrow(res, 'Unable to reset password.');
   },
 
-  async getRecoveryCodeStatus(): Promise<{ remainingCount: number; totalCount: number; generatedAt: string | null }> {
+  async getRecoveryCodeStatus(): Promise<RecoveryCodeStatus> {
     const res = await fetch(`${API_BASE}/auth/recovery-codes/status`, {
       headers: getAuthHeaders(),
     });
     return parseJsonOrThrow(res, 'Unable to load recovery code status.');
   },
 
-  async regenerateRecoveryCodes(currentPassword: string): Promise<{
+  async regenerateRecoveryCodes(
+    currentPassword?: string,
+    usePasskeyReauth = false
+  ): Promise<{
     success: boolean;
     recoveryCodes: string[];
     remainingCount: number;
     totalCount: number;
     generatedAt: string;
+    needsInitialSetup?: boolean;
   }> {
     const res = await fetch(`${API_BASE}/auth/recovery-codes/regenerate`, {
       method: 'POST',
       headers: getAuthHeaders(),
-      body: JSON.stringify({ currentPassword }),
+      body: JSON.stringify({
+        ...(currentPassword ? { currentPassword } : {}),
+        ...(usePasskeyReauth ? { usePasskeyReauth: true } : {}),
+      }),
     });
     return parseJsonOrThrow(res, 'Unable to regenerate recovery codes.');
   },
@@ -708,6 +743,14 @@ export const api = {
     const result = await parseJsonOrThrow<any>(res, 'Failed to sign out everywhere.');
     this.clearToken();
     return result;
+  },
+
+  async getMySecurityEvents(limit = 20): Promise<UserSecurityEvent[]> {
+    const res = await fetch(`${API_BASE}/me/security-events?limit=${encodeURIComponent(String(limit))}`, {
+      headers: getAuthHeaders(),
+    });
+    const data = await parseJsonOrFallback<{ events?: UserSecurityEvent[] }>(res, { events: [] });
+    return Array.isArray(data?.events) ? data.events : [];
   },
 
   async getMfaStatus(): Promise<{ mfaEnabled: boolean; role: string }> {

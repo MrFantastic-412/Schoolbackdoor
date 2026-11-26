@@ -380,16 +380,18 @@ export const fileService = {
         return { accessible: true, expiresAtMs: null, isAvatar: true, isPrivateChatMedia: false };
       }
 
-      // 2. Active (< 72h) public/community posts and comments — remains serveable to authorized viewers of the feed
+      // 2. Active (< 72h) visible public/community posts and comments — remains serveable to authorized viewers of the feed
       const activePostRef = conn.prepare(`
         SELECT MAX(created_at) as latest_created_at FROM (
           SELECT created_at FROM posts
           WHERE (images_json LIKE ? ESCAPE '\\' OR images_json LIKE ? ESCAPE '\\')
+            AND COALESCE(is_hidden, 0) = 0
             AND created_at >= datetime('now', '-72 hours')
           UNION ALL
           SELECT p.created_at as created_at FROM comments c
           JOIN posts p ON p.id = c.post_id
           WHERE (c.images_json LIKE ? ESCAPE '\\' OR c.images_json LIKE ? ESCAPE '\\')
+            AND COALESCE(p.is_hidden, 0) = 0
             AND p.created_at >= datetime('now', '-72 hours')
         )
       `).get(likePattern, thumbPattern, likePattern, thumbPattern) as { latest_created_at: string | null } | undefined;

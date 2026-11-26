@@ -1729,6 +1729,7 @@ async function runTests() {
   try {
     // Issue session tokens for seeded admin and active student
     const adminRow = db.prepare("SELECT * FROM users WHERE role = 'admin' LIMIT 1").get() as any;
+    db.prepare('UPDATE users SET last_reauthenticated_at = CURRENT_TIMESTAMP WHERE id = ?').run(adminRow.id);
     const adminToken = authService.createSession(adminRow.id, '127.0.0.1', 'TestSuite').token;
     const studentUser = db.prepare("SELECT * FROM users WHERE role = 'student' OR role = 'user' LIMIT 1").get() as any;
     const studentToken = authService.createSession(studentUser.id, '127.0.0.1', 'TestSuite').token;
@@ -5155,7 +5156,8 @@ async function runTests() {
       headers: { 'Content-Type': 'application/json', 'User-Agent': 'DeleteCheck/1.0' },
       body: JSON.stringify({ username: s3Handle, password: s3NewPass }),
     });
-    const freshDeleteTok = ((await freshLoginForDelete.json()) as any).token;
+    const freshLoginDeleteBody = (await freshLoginForDelete.json()) as any;
+    const freshDeleteTok = freshLoginDeleteBody.token;
     db.prepare("UPDATE users SET last_reauthenticated_at = datetime('now', '-2 hours') WHERE id = ?").run(pkUserId);
 
     const noReauthDeleteRes = await fetch(`${baseUrl}/api/auth/passkeys/${regVerify2Body.passkey.id}`, {
@@ -5203,6 +5205,8 @@ async function runTests() {
       Boolean(removedEvent);
     if (!ok36e) {
       console.error('36e debug:', {
+        freshLoginStatus: freshLoginForDelete.status,
+        freshLoginDeleteBody,
         noReauthStatus: noReauthDeleteRes.status,
         noReauthDeleteBody,
         crossUserStatus: crossUserDeleteRes.status,
@@ -5297,6 +5301,442 @@ async function runTests() {
     assert(
       ok36f,
       'Method B passkey password recovery verifies assertion, consumes single-use reset token, revokes all prior sessions, and accepts new Argon2id password'
+    );
+
+    // =========================================================================
+    // 37. STAGE 3D: LEGACY ACCOUNTS, SECURITY ACTIVITY FEED & PERMISSION CHECKS
+    // =========================================================================
+    console.log('\n--- 37. Testing Stage 3D Legacy Account Flow, User Security Activity Feed & Permission Boundaries ---');
+
+    // 37a: Legacy pre-Stage-3B user (v3 scrypt hash, optional legacy email, zero recovery codes yet)
+    const legacyId = `u-legacy3d-${Date.now()}`;
+    const legacyHandle = `@legacy3d_${String(Date.now()).slice(-4)}`;
+    const legacyPass = 'LegacyAccountPass!2026';
+    const legacy3dSalt = crypto.randomBytes(16).toString('hex');
+    const legacy3dScryptHex = crypto
+      .scryptSync(legacyPass, legacy3dSalt, 64, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 })
+      .toString('hex');
+    const legacyV3Hash = `v3:${legacy3dSalt}:${legacy3dScryptHex}`;
+
+    db.prepare(`
+      INSERT INTO users (id, matric_number, email, username, password_hash, role, status, is_verified, recovery_codes_generated_at, recovery_codes_remaining)
+      VALUES (?, ?, ?, ?, ?, 'student', 'active', 0, NULL, 0)
+    `).run(legacyId, 'LEGACY/3D/001', 'legacy-optional@example.com', legacyHandle, legacyV3Hash);
+    db.prepare(`
+      INSERT INTO user_profiles (id, user_id, name, handle, department, school, level, hall_of_residence, avatar_initials, avatar_bg)
+      VALUES (?, ?, 'Legacy User', ?, 'CSC', 'Independent Student Community', '200L', 'Off-Campus', 'LU', '#E8DDCC')
+    `).run(`p-${legacyId}`, legacyId, legacyHandle);
+
+    const legacyLoginRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'LegacyDevice/1.0' },
+      body: JSON.stringify({ username: legacyHandle, password: legacyPass }),
+    });
+    const legacyLoginBody = (await legacyLoginRes.json()) as any;
+    const legacyToken = legacyLoginBody.token;
+    const upgradedLegacyRow = db
+      .prepare('SELECT password_hash, email FROM users WHERE id = ?')
+      .get(legacyId) as { password_hash: string; email: string | null };
+
+    const legacyRcBeforeRes = await fetch(`${baseUrl}/api/auth/recovery-codes/status`, {
+      headers: { Authorization: `Bearer ${legacyToken}` },
+    });
+    const legacyRcBefore = (await legacyRcBeforeRes.json()) as any;
+
+    // Legacy user adds a passkey
+    const legacyAuth = createVirtualAuthenticator();
+    const legacyPkOpts = (await (
+      await fetch(`${baseUrl}/api/auth/passkeys/register/options`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${legacyToken}`, 'Content-Type': 'application/json' },
+      })
+    ).json()) as any;
+    const legacyPkVerifyRes = await fetch(`${baseUrl}/api/auth/passkeys/register/verify`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${legacyToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        label: 'Legacy Phone Passkey',
+        response: legacyAuth.buildRegistration(legacyPkOpts.challenge, { counter: 1 }),
+      }),
+    });
+
+    // Attempting passwordless recovery-code generation without recent reauth fails with 403 REAUTH_REQUIRED
+    db.prepare("UPDATE users SET last_reauthenticated_at = datetime('now', '-2 hours') WHERE id = ?").run(legacyId);
+    const blockedInitialGenRes = await fetch(`${baseUrl}/api/auth/recovery-codes/regenerate`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${legacyToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ usePasskeyReauth: true }),
+    });
+    const blockedInitialGenBody = (await blockedInitialGenRes.json()) as any;
+
+    // Step-up passkey reauth then generate initial 10 recovery codes
+    const legacyReauthOpts = (await (
+      await fetch(`${baseUrl}/api/auth/passkeys/reauth/options`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${legacyToken}`, 'Content-Type': 'application/json' },
+      })
+    ).json()) as any;
+    const legacyReauthRes = await fetch(`${baseUrl}/api/auth/passkeys/reauth/verify`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${legacyToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: legacyAuth.buildAssertion(legacyReauthOpts.challenge, { counter: 2 }) }),
+    });
+    const initialGenRes = await fetch(`${baseUrl}/api/auth/recovery-codes/regenerate`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${legacyToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ usePasskeyReauth: true }),
+    });
+    const initialGenBody = (await initialGenRes.json()) as any;
+
+    const legacyRcAfterRes = await fetch(`${baseUrl}/api/auth/recovery-codes/status`, {
+      headers: { Authorization: `Bearer ${legacyToken}` },
+    });
+    const legacyRcAfter = (await legacyRcAfterRes.json()) as any;
+
+    assert(
+      legacyLoginRes.status === 200 &&
+        upgradedLegacyRow.password_hash.startsWith('$argon2id$v=19$') &&
+        upgradedLegacyRow.email === 'legacy-optional@example.com' &&
+        legacyRcBeforeRes.status === 200 &&
+        legacyRcBefore.needsInitialSetup === true &&
+        legacyRcBefore.remainingCount === 0 &&
+        legacyRcBefore.generatedAt === null &&
+        legacyPkVerifyRes.status === 201 &&
+        blockedInitialGenRes.status === 403 &&
+        blockedInitialGenBody.code === 'REAUTH_REQUIRED' &&
+        legacyReauthRes.status === 200 &&
+        initialGenRes.status === 200 &&
+        Array.isArray(initialGenBody.recoveryCodes) &&
+        initialGenBody.recoveryCodes.length === 10 &&
+        legacyRcAfter.needsInitialSetup === false &&
+        legacyRcAfter.remainingCount === 10 &&
+        Boolean(legacyRcAfter.generatedAt),
+      'Legacy account logs in with v3 scrypt, upgrades to Argon2id, reports needsInitialSetup until generating 10 codes (with passkey re-auth), and preserves optional legacy email'
+    );
+
+    // 37b: User-scoped security activity endpoint (self-only, zero credential/secret leaks)
+    const secEventsRes = await fetch(`${baseUrl}/api/me/security-events?limit=25`, {
+      headers: { Authorization: `Bearer ${legacyToken}` },
+    });
+    const secEventsBody = (await secEventsRes.json()) as any;
+    const eventsArr: any[] = Array.isArray(secEventsBody.events) ? secEventsBody.events : [];
+    const serializedEvents = JSON.stringify(eventsArr);
+    const hasExpectedTypes =
+      eventsArr.some((e) => e.eventType === 'LOGIN_SUCCESS') &&
+      eventsArr.some((e) => e.eventType === 'PASSKEY_REGISTERED' || e.eventType === 'PASSKEY_ADDED') &&
+      eventsArr.some((e) => e.eventType === 'RECOVERY_CODES_REGENERATED');
+    const leaksSensitive =
+      serializedEvents.includes(legacyPass) ||
+      serializedEvents.includes(legacy3dScryptHex) ||
+      serializedEvents.includes(legacyToken) ||
+      initialGenBody.recoveryCodes.some((c: string) => serializedEvents.includes(c));
+    const foreignEventRow = db
+      .prepare('SELECT id FROM security_events WHERE user_id != ? LIMIT 1')
+      .get(legacyId) as { id: string } | undefined;
+    const leakedForeignEvent = Boolean(foreignEventRow && eventsArr.some((e) => e.id === foreignEventRow.id));
+
+    assert(
+      secEventsRes.status === 200 &&
+        hasExpectedTypes &&
+        !leaksSensitive &&
+        !leakedForeignEvent,
+      'GET /api/me/security-events returns user-scoped sanitized security events with zero credential leaks or cross-user data'
+    );
+
+    // 37c: Permission boundaries & unauthenticated rejection
+    const unauthEventsRes = await fetch(`${baseUrl}/api/me/security-events`);
+    const unauthRcRes = await fetch(`${baseUrl}/api/auth/recovery-codes/status`);
+    const studentAdminSecRes = await fetch(`${baseUrl}/api/admin/security/overview`, {
+      headers: { Authorization: `Bearer ${legacyToken}` },
+    });
+    const crossSessionRevokeRes = await fetch(`${baseUrl}/api/me/sessions/${encodeURIComponent(legacyLoginBody.sessionId)}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${intruderSession.token}` },
+    });
+
+    assert(
+      unauthEventsRes.status === 401 &&
+        unauthRcRes.status === 401 &&
+        studentAdminSecRes.status === 403 &&
+        crossSessionRevokeRes.status === 404,
+      'Permission checks enforce 401 for anonymous callers, 403 for student access to admin security routes, and 404 for cross-user session revocation'
+    );
+
+    // =========================================================================
+    // 38. STAGE 4 AUDIT: AUTHORISATION, STEP-UP RE-AUTH, REALTIME, PII & HARDENING
+    // =========================================================================
+    console.log('\n--- 38. Stage 4 Audit: Credential Provisioning, Step-Up Re-Auth, Moderator Scope & Response Minimization ---');
+
+    // 38a: Unconfigured fresh privileged accounts reject login until claimed/provisioned once
+    const setupBeforeRes = await fetch(`${baseUrl}/api/auth/setup-status`);
+    const setupBefore = (await setupBeforeRes.json()) as any;
+    assert(
+      setupBeforeRes.status === 200 && setupBefore.adminNeedsSetup === true,
+      'Fresh unconfigured installation reports adminNeedsSetup=true without seeding hardcoded passwords'
+    );
+
+    const unclaimedAdminLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: '@THEBACKDOOR', password: 'InvalidLegacyAttempt1!' }),
+    });
+    const unclaimedModLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: '@campus_mod', password: 'InvalidLegacyAttempt1!' }),
+    });
+    assert(
+      unclaimedAdminLogin.status === 401 && unclaimedModLogin.status === 401,
+      'Unclaimed privileged accounts reject arbitrary password logins (401)'
+    );
+
+    const claimedAdminPw = 'Stage4ClaimedAdmin#2026!';
+    const firstClaimRes = await fetch(`${baseUrl}/api/auth/setup-admin`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: claimedAdminPw, confirmPassword: claimedAdminPw }),
+    });
+    const firstClaimBody = (await firstClaimRes.json()) as any;
+
+    const secondClaimRes = await fetch(`${baseUrl}/api/auth/setup-admin`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'AnotherAdminPassword#9!', confirmPassword: 'AnotherAdminPassword#9!' }),
+    });
+    const setupAfterRes = await fetch(`${baseUrl}/api/auth/setup-status`);
+    const setupAfter = (await setupAfterRes.json()) as any;
+
+    assert(
+      firstClaimRes.status === 201 &&
+        Array.isArray(firstClaimBody.recoveryCodes) &&
+        firstClaimBody.recoveryCodes.length === 10 &&
+        secondClaimRes.status === 409 &&
+        setupAfter.adminNeedsSetup === false,
+      'First-run @THEBACKDOOR claim succeeds once with 10 recovery codes, then permanently locks (409)'
+    );
+
+    // 38b: Raw session tokens in query params (?token=) no longer authenticate SSE stream; signed ?ticket= does
+    const sseAnonController = new AbortController();
+    const sseRawTokenRes = await fetch(
+      `${baseUrl}/api/realtime/stream?token=${encodeURIComponent(adminToken)}&clientId=stage4-raw-token`,
+      { signal: sseAnonController.signal }
+    );
+    const readerRaw = sseRawTokenRes.body!.getReader();
+    const firstChunkRaw = new TextDecoder().decode((await readerRaw.read()).value || new Uint8Array());
+    sseAnonController.abort();
+
+    const ticketRes = await fetch(`${baseUrl}/api/realtime/ticket`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    const ticketBody = (await ticketRes.json()) as any;
+    const sseTicketController = new AbortController();
+    const sseTicketRes = await fetch(
+      `${baseUrl}/api/realtime/stream?ticket=${encodeURIComponent(ticketBody.ticket)}&clientId=stage4-ticket`,
+      { signal: sseTicketController.signal }
+    );
+    const readerTicket = sseTicketRes.body!.getReader();
+    const firstChunkTicket = new TextDecoder().decode((await readerTicket.read()).value || new Uint8Array());
+    sseTicketController.abort();
+
+    assert(
+      sseRawTokenRes.status === 200 &&
+        !firstChunkRaw.includes(adminRow.id) &&
+        ticketRes.status === 200 &&
+        Boolean(ticketBody.ticket) &&
+        firstChunkTicket.includes(adminRow.id),
+      'SSE rejects ?token= query-string authentication (subscribes as anonymous) and accepts short-lived ?ticket='
+    );
+
+    // 38c: Step-up re-authentication required on sensitive Admin endpoints & Admin delete audit logging
+    db.prepare("UPDATE users SET last_reauthenticated_at = datetime('now', '-30 minutes') WHERE id = ?").run(adminRow.id);
+    const freshAdminLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: '@THEBACKDOOR', password: claimedAdminPw }),
+    });
+    const freshAdminBody = (await freshAdminLogin.json()) as any;
+    const claimedAdminToken = freshAdminBody.token as string;
+    // Simulate stale re-auth timestamp after login window expires
+    db.prepare("UPDATE users SET last_reauthenticated_at = datetime('now', '-30 minutes') WHERE id = ?").run(adminRow.id);
+
+    const staleSettingsRes = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${claimedAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ campus_zone: 'Should Require Reauth' }),
+    });
+    const staleSettingsBody = (await staleSettingsRes.json()) as any;
+
+    const staleRoleRes = await fetch(`${baseUrl}/api/admin/staff/role`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${claimedAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: studentUser.id, role: 'staff' }),
+    });
+    const staleRevokeSessionsRes = await fetch(`${baseUrl}/api/admin/security/sessions/revoke`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${claimedAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+
+    const stepUpRes = await fetch(`${baseUrl}/api/auth/reauthenticate`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${claimedAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: claimedAdminPw }),
+    });
+    const allowedSettingsRes = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${claimedAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ site_tagline: 'Verified Stage 4 Settings Update' }),
+    });
+
+    const auditPost = postService.createPost(studentUser.id, { content: 'Post to test Admin delete audit logging' })!;
+    const adminDeletePostRes = await fetch(`${baseUrl}/api/admin/posts/${auditPost.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${claimedAdminToken}` },
+    });
+    const deleteAuditRow = db
+      .prepare("SELECT * FROM admin_audit_logs WHERE action = 'ADMIN_DELETE_POST' AND target_id = ?")
+      .get(auditPost.id) as any;
+
+    assert(
+      staleSettingsRes.status === 403 &&
+        staleSettingsBody.code === 'REAUTH_REQUIRED' &&
+        staleRoleRes.status === 403 &&
+        staleRevokeSessionsRes.status === 403 &&
+        stepUpRes.status === 200 &&
+        allowedSettingsRes.status === 200 &&
+        adminDeletePostRes.status === 200 &&
+        Boolean(deleteAuditRow),
+      'Sensitive Admin endpoints enforce step-up re-auth (403 REAUTH_REQUIRED -> 200 after re-auth) and log ADMIN_DELETE_POST'
+    );
+
+    // 38d: Moderator RBAC hardening: permission-gated poll reports, anonymous masking, peer-mod protection, invalid type validation
+    const scopedModRes = await fetch(`${baseUrl}/api/admin/moderators`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${claimedAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: `@mod_s4_${Date.now().toString().slice(-4)}`,
+        password: 'ModStrongPassword4!',
+        name: 'Scoped Mod',
+        permissions: {
+          canReviewReports: false,
+          canHideContent: true,
+          canWarnUsers: false,
+          canRestrictUsers: false,
+          maxRestrictionHours: 12,
+          canReviewCommunities: false,
+          canEscalate: false,
+        },
+      }),
+    });
+    const scopedModBody = (await scopedModRes.json()) as any;
+    const scopedModSession = authService.createSession(scopedModBody.id, '127.0.0.1', 'ModBrowser').token;
+
+    const modPollDeniedReports = await fetch(`${baseUrl}/api/realtime/poll?clientId=mod-no-reports`, {
+      headers: { Authorization: `Bearer ${scopedModSession}` },
+    });
+    const modPollBody = (await modPollDeniedReports.json()) as any;
+
+    const peerModRes = await fetch(`${baseUrl}/api/admin/moderators`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${claimedAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: `@mod_peer_${Date.now().toString().slice(-4)}`,
+        password: 'ModStrongPassword4!',
+        name: 'Peer Mod',
+        permissions: { canReviewReports: true },
+      }),
+    });
+    const peerModBody = (await peerModRes.json()) as any;
+    const peerModPost = postService.createPost(peerModBody.id, { content: 'Moderator safety notice' })!;
+
+    const modCrossTargetRes = await fetch(`${baseUrl}/api/mod/content/post/${peerModPost.id}`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${scopedModSession}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'hide', reason: 'Attempt to hide peer moderator post' }),
+    });
+    const modInvalidTypeRes = await fetch(`${baseUrl}/api/mod/content/users/${peerModPost.id}`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${scopedModSession}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'hide', reason: 'Invalid content type test' }),
+    });
+
+    // Anonymous post author identity stays masked in moderator report queue
+    const anonPost = postService.createPost(studentUser.id, {
+      content: 'Anonymous campus confession for moderator report check',
+      is_anonymous: true,
+    })!;
+    const anonReportRes = await fetch(`${baseUrl}/api/reports`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${studentToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetType: 'post',
+        targetId: anonPost.id,
+        reason: 'Needs moderator review while preserving anonymity',
+      }),
+    });
+    const peerModToken = authService.createSession(peerModBody.id, '127.0.0.1', 'PeerMod').token;
+    const modReportsQueueRes = await fetch(`${baseUrl}/api/mod/reports`, {
+      headers: { Authorization: `Bearer ${peerModToken}` },
+    });
+    const modReportsQueue = (await modReportsQueueRes.json()) as any[];
+    const anonReportEntry = modReportsQueue.find((r) => r.target_id === anonPost.id);
+
+    assert(
+      scopedModRes.status === 201 &&
+        modPollDeniedReports.status === 200 &&
+        modPollBody.adminReports === undefined &&
+        modCrossTargetRes.status === 403 &&
+        modInvalidTypeRes.status === 400 &&
+        anonReportRes.status === 201 &&
+        Boolean(anonReportEntry) &&
+        anonReportEntry.authorHandle === '@anonymous' &&
+        anonReportEntry.targetUserId === null,
+      'Moderator controls enforce canReviewReports in /realtime/poll, block peer-mod tampering (403), validate type (400), and mask anonymous authors'
+    );
+
+    // 38e: Hidden post media protection, suspend duration bounds, and PII removal across profile & admin APIs
+    const hiddenUploadName = `hidden-test-${Date.now()}.png`;
+    fs.writeFileSync(path.join(getUploadsDir(), hiddenUploadName), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    const hiddenMediaPost = postService.createPost(studentUser.id, {
+      content: 'Post with image that gets hidden',
+      images: [`/api/uploads/${hiddenUploadName}`],
+    })!;
+    db.prepare('UPDATE posts SET is_hidden = 1 WHERE id = ?').run(hiddenMediaPost.id);
+    const hiddenMediaFetch = await fetch(`${baseUrl}/api/uploads/${hiddenUploadName}`);
+
+    const badSuspendRes = await fetch(`${baseUrl}/api/admin/users/${studentUser.id}/suspend`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${claimedAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ durationDays: -5, reason: 'Invalid negative days' }),
+    });
+
+    const [meRes, pubProfRes, admUsersRes, admModsRes, admStaffRes, admAppealsRes] = await Promise.all([
+      fetch(`${baseUrl}/api/me`, { headers: { Authorization: `Bearer ${studentToken}` } }),
+      fetch(`${baseUrl}/api/users/${studentUser.id}/profile`),
+      fetch(`${baseUrl}/api/admin/users`, { headers: { Authorization: `Bearer ${claimedAdminToken}` } }),
+      fetch(`${baseUrl}/api/admin/moderators`, { headers: { Authorization: `Bearer ${claimedAdminToken}` } }),
+      fetch(`${baseUrl}/api/admin/staff`, { headers: { Authorization: `Bearer ${claimedAdminToken}` } }),
+      fetch(`${baseUrl}/api/admin/appeals`, { headers: { Authorization: `Bearer ${claimedAdminToken}` } }),
+    ]);
+    const serializedPiiCheck = JSON.stringify({
+      me: await meRes.json(),
+      pubProf: await pubProfRes.json(),
+      admUsers: await admUsersRes.json(),
+      admMods: await admModsRes.json(),
+      admStaff: await admStaffRes.json(),
+      admAppeals: await admAppealsRes.json(),
+    });
+
+    assert(
+      hiddenMediaFetch.status === 404 &&
+        badSuspendRes.status === 400 &&
+        !serializedPiiCheck.includes('"email"') &&
+        !serializedPiiCheck.includes('"phoneNumber"') &&
+        !serializedPiiCheck.includes('"password_hash"') &&
+        !serializedPiiCheck.includes('"mfa_secret"') &&
+        !serializedPiiCheck.includes('"recovery_codes"'),
+      'Hidden post media returns 404, suspend validates duration bounds (400), and API responses omit email/phone/credential secrets'
     );
   } finally {
     await new Promise<void>((resolve) => testServer.close(() => resolve()));

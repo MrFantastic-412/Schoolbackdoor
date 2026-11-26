@@ -9,6 +9,7 @@
     "start": "node server.ts",
     "test:backend": "tsx server/test/backend.test.ts",
     "test:load": "tsx server/test/loadTest.ts",
+    "provision:staff": "tsx server/scripts/provisionPrivileged.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"

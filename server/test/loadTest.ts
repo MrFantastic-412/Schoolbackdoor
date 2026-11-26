@@ -133,19 +133,32 @@ function httpRequest(
   });
 }
 
-function openSseStream(
+async function openSseStream(
   port: number,
   token: string,
   clientId: string,
   onEvent: (event: string, data: any) => void
 ): Promise<{ close: () => void; connected: boolean }> {
+  let ticket = '';
+  try {
+    const ticketRes = await fetch(`http://127.0.0.1:${port}/api/realtime/ticket`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (ticketRes.ok) {
+      const td = (await ticketRes.json()) as { ticket?: string };
+      ticket = td.ticket || '';
+    }
+  } catch {
+    // ignore
+  }
   return new Promise((resolve) => {
     let settled = false;
     const req = http.get(
       {
         hostname: '127.0.0.1',
         port,
-        path: `/api/realtime/stream?token=${encodeURIComponent(token)}&clientId=${encodeURIComponent(clientId)}`,
+        path: `/api/realtime/stream?ticket=${encodeURIComponent(ticket)}&clientId=${encodeURIComponent(clientId)}`,
         headers: { Accept: 'text/event-stream' },
       },
       (res) => {

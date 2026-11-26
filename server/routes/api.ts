@@ -8,6 +8,7 @@ import {
   hasRecentReauth,
   requireAuth,
   requireNotRestricted,
+  requireRecentReauth,
   requireRole,
   requireTermsAccepted,
 } from '../middleware/auth.js';
@@ -82,10 +83,7 @@ const IS_SERVERLESS_RUNTIME = Boolean(
 const REALTIME_TICKET_SECRET =
   process.env.REALTIME_TICKET_SECRET ||
   process.env.SESSION_SECRET ||
-  crypto
-    .createHmac('sha256', 'schoolbackdoor-realtime-ticket-v1')
-    .update(process.env.ADMIN_PASSWORD || process.env.SCHOOLBACKDOOR_DB_PATH || process.cwd())
-    .digest('hex');
+  crypto.randomBytes(32).toString('hex');
 
 function signRealtimeTicket(userId: string, ttlMs = 60_000): string {
   const payload = Buffer.from(
@@ -237,6 +235,25 @@ apiRouter.get('/auth/challenge', (req: Request, res: Response) => {
       return;
     }
     res.status(400).json({ error: err?.message || 'Unable to issue signup challenge.' });
+  }
+});
+
+apiRouter.get('/auth/setup-status', (_req: Request, res: Response) => {
+  res.json(authService.getFirstRunAdminSetupStatus());
+});
+
+apiRouter.post('/auth/setup-admin', (req: Request, res: Response) => {
+  try {
+    const ip = req.ip || req.socket.remoteAddress;
+    const result = authService.claimFirstRunAdminPassword(
+      req.body?.password || '',
+      req.body?.confirmPassword,
+      ip,
+      req.headers['user-agent']
+    );
+    res.status(201).json(result);
+  } catch (err: any) {
+    res.status(err?.status || 400).json({ error: err?.message || 'Unable to complete first-run admin setup.' });
   }
 });
 
@@ -502,7 +519,11 @@ apiRouter.post('/auth/recovery-codes/regenerate', requireAuth, (req: Request, re
       req.user!.id,
       req.body?.currentPassword || '',
       ip,
-      req.headers['user-agent']
+      req.headers['user-agent'],
+      {
+        hasRecentReauth: hasRecentReauth(req.user),
+        usePasskeyReauth: Boolean(req.body?.usePasskeyReauth),
+      }
     );
     res.json(result);
   } catch (err: any) {
@@ -511,7 +532,10 @@ apiRouter.post('/auth/recovery-codes/regenerate', requireAuth, (req: Request, re
       res.status(429).json({ error: err.message, retryAfterSeconds: err.retryAfterSeconds || 900 });
       return;
     }
-    res.status(400).json({ error: err?.message || 'Unable to regenerate recovery codes.' });
+    res.status(err?.status || 400).json({
+      error: err?.message || 'Unable to regenerate recovery codes.',
+      ...(err?.code ? { code: err.code } : {}),
+    });
   }
 });
 
@@ -786,6 +810,13 @@ apiRouter.post('/me/sessions/revoke-all', requireAuth, (req: Request, res: Respo
   const result = authService.revokeAllUserSessions(req.user!.id, ip);
   clearSessionCookie(req, res);
   res.json({ ...result, signedOutEverywhere: true });
+});
+
+apiRouter.get('/me/security-events', requireAuth, (req: Request, res: Response) => {
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+  res.json({
+    events: authService.getUserSecurityEvents(req.user!.id, limit),
+  });
 });
 
 apiRouter.put('/me/profile', requireAuth, (req: Request, res: Response) => {
@@ -1271,19 +1302,13 @@ apiRouter.get('/realtime/stream', (req: Request, res: Response) => {
       const verifiedUserId = verifySignedRealtimeTicket(req.query.ticket);
       if (verifiedUserId) {
         const dbUser = db
-          .prepare('SELECT id, matric_number, email, role, status FROM users WHERE id = ?')
+          .prepare('SELECT id, matric_number, username, role, status FROM users WHERE id = ?')
           .get(verifiedUserId) as any;
         if (dbUser && dbUser.status === 'active') {
           user = dbUser;
           isExplicitAuth = true;
         }
       }
-    }
-  } else if (req.query.token && typeof req.query.token === 'string') {
-    const tokenUser = authService.validateSession(req.query.token);
-    if (tokenUser) {
-      user = tokenUser;
-      isExplicitAuth = true;
     }
   }
   // Security: Unauthenticated SSE connections subscribe only to anonymous public channel, never a private student's feed/messages
@@ -1345,10 +1370,13 @@ apiRouter.get('/realtime/poll', (req: Request, res: Response) => {
 
     const notifications = notificationService.getUserNotifications(req.user.id, false, 20, 0);
     const chats = chatService.getUserChats(req.user.id);
-    const adminReports =
-      req.user.role === 'admin' || req.user.role === 'moderator'
-        ? adminReportService.getAllReports('pending').slice(0, 10)
-        : undefined;
+    const canViewReportsInPoll =
+      req.user.role === 'admin' ||
+      (req.user.role === 'moderator' &&
+        Boolean(moderatorService.getModeratorPermissions(req.user.id)?.canReviewReports));
+    const adminReports = canViewReportsInPoll
+      ? adminReportService.getAllReports('pending').slice(0, 10)
+      : undefined;
 
     res.json({
       serverTime: new Date().toISOString(),
@@ -1919,12 +1947,10 @@ apiRouter.patch('/admin/reports/:id', requireRole('admin'), (req: Request, res: 
       req.params.id,
       req.user!.id,
       status,
-      resolutionNotes
+      resolutionNotes,
+      cleanAction
     );
-    if (cleanAction) {
-      db.prepare('UPDATE reports SET action_taken = ? WHERE id = ?').run(cleanAction, req.params.id);
-    }
-    res.json({ ...result, actionTaken: cleanAction });
+    res.json(result);
   } catch (err: any) {
     const code = String(err?.message || '').includes('not found') ? 404 : 400;
     res.status(code).json({ error: err.message });
@@ -1975,30 +2001,39 @@ apiRouter.post('/admin/users/:id/warn', requireRole('admin'), (req: Request, res
     );
     res.status(201).json(result);
   } catch (err: any) {
-    res.status(403).json({ error: err.message });
+    const msg = String(err?.message || '');
+    const status = msg.includes('not found') ? 404 : msg.includes('Forbidden') ? 403 : 400;
+    res.status(status).json({ error: msg });
   }
 });
 
 // Moderation Actions: User Suspensions
 apiRouter.post('/admin/users/:id/suspend', requireRole('admin'), (req: Request, res: Response) => {
   try {
-    const { durationDays, reason } = req.body;
+    const { durationDays, reason } = req.body || {};
+    const rawDays = durationDays === undefined || durationDays === null || durationDays === '' ? 7 : Number(durationDays);
+    if (!Number.isFinite(rawDays) || rawDays < 1 || rawDays > 365) {
+      res.status(400).json({ error: 'Suspension duration must be between 1 and 365 days.' });
+      return;
+    }
     const result = adminSecurityService.suspendUser(
       req.user!.id,
       req.user!.role,
       req.params.id,
-      Number(durationDays) || 7,
+      Math.floor(rawDays),
       reason || 'Violation of Campus Guidelines'
     );
     res.json(result);
   } catch (err: any) {
-    res.status(403).json({ error: err.message });
+    const msg = String(err?.message || '');
+    const status = msg.includes('not found') ? 404 : msg.includes('Forbidden') ? 403 : 400;
+    res.status(status).json({ error: msg });
   }
 });
 
 apiRouter.post('/admin/users/:id/unsuspend', requireRole('admin'), (req: Request, res: Response) => {
   try {
-    const { reason } = req.body;
+    const { reason } = req.body || {};
     const result = adminSecurityService.unsuspendUser(
       req.user!.id,
       req.user!.role,
@@ -2007,7 +2042,9 @@ apiRouter.post('/admin/users/:id/unsuspend', requireRole('admin'), (req: Request
     );
     res.json(result);
   } catch (err: any) {
-    res.status(403).json({ error: err.message });
+    const msg = String(err?.message || '');
+    const status = msg.includes('not found') ? 404 : msg.includes('Forbidden') ? 403 : 400;
+    res.status(status).json({ error: msg });
   }
 });
 
@@ -2061,7 +2098,7 @@ apiRouter.get('/admin/staff', requireRole('admin'), (_req: Request, res: Respons
   res.json(adminSecurityService.getStaffRoster());
 });
 
-apiRouter.post('/admin/staff/role', requireRole('admin'), (req: Request, res: Response) => {
+apiRouter.post('/admin/staff/role', requireRole('admin'), requireRecentReauth, (req: Request, res: Response) => {
   try {
     const { userId, role } = req.body;
     if (!userId || !role) {
@@ -2145,7 +2182,9 @@ apiRouter.post('/admin/users/:id/lift-restriction', requireRole('admin'), (req: 
 
 apiRouter.delete('/admin/posts/:id', requireRole('admin'), (req: Request, res: Response) => {
   try {
-    res.json(postService.deletePost(req.params.id, req.user!.id, req.user!.role));
+    const result = postService.deletePost(req.params.id, req.user!.id, req.user!.role);
+    adminSecurityService.logAdminAction(req.user!.id, 'ADMIN_DELETE_POST', 'post', req.params.id);
+    res.json(result);
   } catch (err: any) {
     res.status(403).json({ error: err.message });
   }
@@ -2153,7 +2192,9 @@ apiRouter.delete('/admin/posts/:id', requireRole('admin'), (req: Request, res: R
 
 apiRouter.delete('/admin/comments/:id', requireRole('admin'), (req: Request, res: Response) => {
   try {
-    res.json(commentReactionService.deleteComment(req.params.id, req.user!.id, req.user!.role));
+    const result = commentReactionService.deleteComment(req.params.id, req.user!.id, req.user!.role);
+    adminSecurityService.logAdminAction(req.user!.id, 'ADMIN_DELETE_COMMENT', 'comment', req.params.id);
+    res.json(result);
   } catch (err: any) {
     res.status(403).json({ error: err.message });
   }
@@ -2217,7 +2258,7 @@ apiRouter.get('/admin/storage', requireRole('admin'), (_req: Request, res: Respo
   res.json(adminControlService.getStorageOverview());
 });
 
-apiRouter.post('/admin/storage/clean-orphans', requireRole('admin'), (req: Request, res: Response) => {
+apiRouter.post('/admin/storage/clean-orphans', requireRole('admin'), requireRecentReauth, (req: Request, res: Response) => {
   if (req.body?.confirmation !== 'CLEAN_ORPHANS') {
     res.status(400).json({ error: 'Explicit confirmation ("CLEAN_ORPHANS") is required before deleting orphaned files.' });
     return;
@@ -2284,7 +2325,7 @@ apiRouter.post('/user/delete-account', requireAuth, (req: Request, res: Response
   }
 });
 
-apiRouter.delete('/admin/users/:id', requireRole('admin'), (req: Request, res: Response) => {
+apiRouter.delete('/admin/users/:id', requireRole('admin'), requireRecentReauth, (req: Request, res: Response) => {
   try {
     const { reason, confirmation } = req.body || {};
     if (confirmation && confirmation !== 'PERMANENTLY_DELETE') {
@@ -2316,7 +2357,7 @@ apiRouter.get('/admin/backups', requireRole('admin'), (_req: Request, res: Respo
   res.json(adminSecurityService.getBackups());
 });
 
-apiRouter.post('/admin/backups/:id/restore', requireRole('admin'), (req: Request, res: Response) => {
+apiRouter.post('/admin/backups/:id/restore', requireRole('admin'), requireRecentReauth, (req: Request, res: Response) => {
   try {
     const result = adminSecurityService.restoreBackup(req.user!.id, req.user!.role, req.params.id);
     res.json(result);
@@ -2350,7 +2391,7 @@ apiRouter.post('/admin/security/mfa/disable', requireRole('admin'), (req: Reques
   }
 });
 
-apiRouter.post('/admin/security/sessions/revoke', requireRole('admin'), (req: Request, res: Response) => {
+apiRouter.post('/admin/security/sessions/revoke', requireRole('admin'), requireRecentReauth, (req: Request, res: Response) => {
   const token = extractSessionToken(req) || undefined;
   res.json(adminControlService.revokeExpiredOrAllSessions(req.user!.id, token));
 });
@@ -2372,7 +2413,11 @@ apiRouter.delete('/admin/security/sessions/:id', requireRole('admin'), (req: Req
 });
 
 apiRouter.post('/admin/security/users/:id/revoke-sessions', requireRole('admin'), (req: Request, res: Response) => {
-  res.json(adminControlService.revokeUserSessionsByAdmin(req.user!.id, req.params.id, req.body?.reason));
+  try {
+    res.json(adminControlService.revokeUserSessionsByAdmin(req.user!.id, req.params.id, req.body?.reason));
+  } catch (err: any) {
+    res.status(404).json({ error: err?.message || 'User not found.' });
+  }
 });
 
 apiRouter.get('/admin/security/events', requireRole('admin'), (req: Request, res: Response) => {
@@ -2406,7 +2451,7 @@ apiRouter.get('/admin/settings', requireRole('admin'), (_req: Request, res: Resp
   res.json(adminControlService.getPublicPlatformConfig().settings);
 });
 
-apiRouter.put('/admin/settings', requireRole('admin'), (req: Request, res: Response) => {
+apiRouter.put('/admin/settings', requireRole('admin'), requireRecentReauth, (req: Request, res: Response) => {
   try {
     res.json(adminControlService.updateWebsiteSettings(req.user!.id, req.body || {}));
   } catch (err: any) {
@@ -2445,7 +2490,7 @@ apiRouter.get('/admin/moderators', requireRole('admin'), (_req: Request, res: Re
   res.json(moderatorService.listModerators());
 });
 
-apiRouter.post('/admin/moderators', requireRole('admin'), (req: Request, res: Response) => {
+apiRouter.post('/admin/moderators', requireRole('admin'), requireRecentReauth, (req: Request, res: Response) => {
   try {
     const created = moderatorService.assignModerator(req.user!.id, req.body || {});
     res.status(201).json(created);
@@ -2454,7 +2499,7 @@ apiRouter.post('/admin/moderators', requireRole('admin'), (req: Request, res: Re
   }
 });
 
-apiRouter.patch('/admin/moderators/:id/permissions', requireRole('admin'), (req: Request, res: Response) => {
+apiRouter.patch('/admin/moderators/:id/permissions', requireRole('admin'), requireRecentReauth, (req: Request, res: Response) => {
   try {
     const updated = moderatorService.updateModeratorPermissions(req.user!.id, req.params.id, req.body || {});
     res.json(updated);
@@ -2464,7 +2509,7 @@ apiRouter.patch('/admin/moderators/:id/permissions', requireRole('admin'), (req:
   }
 });
 
-apiRouter.delete('/admin/moderators/:id', requireRole('admin'), (req: Request, res: Response) => {
+apiRouter.delete('/admin/moderators/:id', requireRole('admin'), requireRecentReauth, (req: Request, res: Response) => {
   try {
     res.json(moderatorService.revokeModerator(req.user!.id, req.params.id));
   } catch (err: any) {
@@ -2604,15 +2649,23 @@ apiRouter.post('/mod/reports/:id/escalate', requireRole('moderator', 'admin'), (
 
 apiRouter.patch('/mod/content/:type/:id', requireRole('moderator', 'admin'), (req: Request, res: Response) => {
   try {
-    const targetType = req.params.type === 'comment' ? 'comment' : 'post';
-    const action = req.body?.action === 'unhide' ? 'unhide' : req.body?.action === 'remove' ? 'remove' : 'hide';
+    const rawType = String(req.params.type || '').trim();
+    if (rawType !== 'post' && rawType !== 'comment') {
+      res.status(400).json({ error: 'Invalid moderation target type. Allowed: post, comment.' });
+      return;
+    }
+    const rawAction = String(req.body?.action || '').trim();
+    if (rawAction !== 'hide' && rawAction !== 'unhide' && rawAction !== 'remove') {
+      res.status(400).json({ error: 'Invalid moderation action. Allowed: hide, unhide, remove.' });
+      return;
+    }
     res.json(
       moderatorService.moderateContentByModerator(
         req.user!.id,
         req.user!.role,
-        targetType,
+        rawType,
         req.params.id,
-        action,
+        rawAction,
         req.body?.reason || ''
       )
     );

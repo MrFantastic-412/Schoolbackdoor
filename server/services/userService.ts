@@ -98,7 +98,6 @@ export const userService = {
         p.*,
         u.created_at as account_created_at,
         u.matric_number,
-        u.email,
         u.role,
         u.accepted_terms_version,
         COALESCE(pc.c, 0) as posts_count,
@@ -222,7 +221,6 @@ export const userService = {
           }
         : {}),
       matricNumber: isOwner || isElevated ? profile.matric_number : 'CONFIDENTIAL',
-      email: isOwner || isElevated ? profile.email : undefined,
       ...(isOwner
         ? {
             role: profile.role,

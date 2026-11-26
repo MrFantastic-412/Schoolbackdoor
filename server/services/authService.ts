@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { db, runInTransaction } from '../db/database.js';
+import { db, runInTransaction, UNCLAIMED_CREDENTIAL_SENTINEL } from '../db/database.js';
 import { AuthenticatedUser, parseTimestampMs } from '../middleware/auth.js';
 import { generateBase32Secret, computeTotpCode, verifyTotpToken } from '../utils/totp.js';
 import { fileService, PROTECTION_MODE_MAX_UPLOAD_BYTES } from './fileService.js';
@@ -297,7 +297,7 @@ export const authService = {
     const { userId, aliases } = this.resolveLoginAliases(identifier);
     const placeholders = aliases.map(() => '?').join(', ');
 
-    // 1. Check Per-IP limits FIRST
+    // 1. Check Per-IP limits FIRST (exclude scoped rl-* rate-limit bucket rows)
     const ipShort = ipAddress
       ? (db
           .prepare(`
@@ -305,6 +305,7 @@ export const authService = {
             FROM login_attempts
             WHERE ip_address = ?
               AND success = 0
+              AND id NOT LIKE 'rl-%'
               AND datetime(attempted_at) >= datetime(?)
           `)
           .get(ipAddress, shortWindowStart) as
@@ -319,10 +320,11 @@ export const authService = {
             FROM login_attempts
             WHERE ip_address = ?
               AND success = 0
+              AND id NOT LIKE 'rl-%'
               AND datetime(attempted_at) >= datetime(?)
               AND attempted_at > COALESCE((
                 SELECT MAX(attempted_at) FROM login_attempts
-                WHERE ip_address = ? AND success = 1
+                WHERE ip_address = ? AND success = 1 AND id NOT LIKE 'rl-%'
               ), '1970-01-01')
           `)
           .get(ipAddress, escalationWindowStart, ipAddress) as { failed_count: number } | undefined)?.failed_count ?? 0)
@@ -1177,7 +1179,7 @@ export const authService = {
 
     const refreshHash = hashSessionToken(cleanRefresh);
     const row = db.prepare(`
-      SELECT s.*, u.status, u.role, u.matric_number, u.email, u.username, u.accepted_terms_version
+      SELECT s.*, u.status, u.role, u.matric_number, u.username, u.accepted_terms_version
       FROM sessions s
       JOIN users u ON u.id = s.user_id
       WHERE s.refresh_token_hash = ?
@@ -1300,7 +1302,6 @@ export const authService = {
         id: row.user_id,
         matric_number: row.matric_number,
         username: row.username,
-        email: row.email || undefined,
         role: row.role,
         status: row.status,
         acceptedTermsVersion: row.accepted_terms_version || null,
@@ -1314,7 +1315,7 @@ export const authService = {
 
     const row = db.prepare(`
       SELECT s.token, s.expires_at, s.max_expires_at, s.revoked_at,
-             u.id, u.matric_number, u.email, u.username, u.role, u.status, u.accepted_terms_version, u.last_reauthenticated_at
+             u.id, u.matric_number, u.username, u.role, u.status, u.accepted_terms_version, u.last_reauthenticated_at
       FROM sessions s
       JOIN users u ON u.id = s.user_id
       WHERE s.token = ?
@@ -1338,7 +1339,6 @@ export const authService = {
     return {
       id: row.id,
       matric_number: row.matric_number,
-      email: row.email || '',
       username: row.username || undefined,
       role: row.role,
       status: row.status,
@@ -1573,7 +1573,12 @@ export const authService = {
   /**
    * Returns only the remaining unused recovery code count & generation timestamp — NEVER returns codes or hashes.
    */
-  getRecoveryCodeStatus(userId: string): { remainingCount: number; totalCount: number; generatedAt: string | null } {
+  getRecoveryCodeStatus(userId: string): {
+    remainingCount: number;
+    totalCount: number;
+    generatedAt: string | null;
+    needsInitialSetup: boolean;
+  } {
     const countRow = db
       .prepare('SELECT COUNT(*) as c FROM recovery_codes WHERE user_id = ? AND used_at IS NULL AND invalidated_at IS NULL')
       .get(userId) as { c: number } | undefined;
@@ -1581,46 +1586,66 @@ export const authService = {
       .prepare('SELECT recovery_codes_generated_at FROM users WHERE id = ?')
       .get(userId) as { recovery_codes_generated_at: string | null } | undefined;
 
+    const remainingCount = Number(countRow?.c ?? 0);
+    const generatedAt = userRow?.recovery_codes_generated_at || null;
     return {
-      remainingCount: Number(countRow?.c ?? 0),
+      remainingCount,
       totalCount: 10,
-      generatedAt: userRow?.recovery_codes_generated_at || null,
+      generatedAt,
+      needsInitialSetup: !generatedAt && remainingCount === 0,
     };
   },
 
   /**
-   * Regenerates 10 fresh single-use recovery codes after verifying current password.
+   * Regenerates 10 fresh single-use recovery codes after verifying current password or recent step-up passkey re-auth.
    * Immediately invalidates all previous unused codes and returns plaintext codes ONCE.
    */
-  regenerateRecoveryCodes(userId: string, currentPassword: string, ipAddress?: string, userAgent?: string) {
+  regenerateRecoveryCodes(
+    userId: string,
+    currentPassword: string,
+    ipAddress?: string,
+    userAgent?: string,
+    options?: { hasRecentReauth?: boolean; usePasskeyReauth?: boolean }
+  ) {
     const bucketKey = `regen:${userId}`;
     if (!checkRateLimit(bucketKey, MAX_FAILED_ATTEMPTS, RATE_LIMIT_WINDOW_MS, ipAddress)) {
       throw new AuthRateLimitError('Too many recovery code regeneration attempts. Please wait 15 minutes.', 900);
     }
 
-    const user = db.prepare('SELECT id, username, password_hash FROM users WHERE id = ?').get(userId) as
-      | { id: string; username: string | null; password_hash: string }
+    const user = db.prepare('SELECT id, username, password_hash, recovery_codes_generated_at FROM users WHERE id = ?').get(userId) as
+      | { id: string; username: string | null; password_hash: string; recovery_codes_generated_at: string | null }
       | undefined;
     if (!user) {
       throw new Error('Account not found.');
     }
 
-    if (!currentPassword || typeof currentPassword !== 'string' || currentPassword.length > 128 || !verifyPassword(currentPassword, user.password_hash)) {
-      recordRateLimitEvent(bucketKey, false, ipAddress);
-      recordSecurityEvent({
-        userId,
-        eventType: 'RECOVERY_CODE_REGEN_FAILED',
-        severity: 'warning',
-        identifier: user.username,
-        ipAddress,
-        userAgent,
-      });
-      throw new Error('Incorrect password. Enter your current password to regenerate recovery codes.');
+    const suppliedPassword = typeof currentPassword === 'string' && currentPassword.length > 0;
+    if (suppliedPassword) {
+      if (currentPassword.length > 128 || !verifyPassword(currentPassword, user.password_hash)) {
+        recordRateLimitEvent(bucketKey, false, ipAddress);
+        recordSecurityEvent({
+          userId,
+          eventType: 'RECOVERY_CODE_REGEN_FAILED',
+          severity: 'warning',
+          identifier: user.username,
+          ipAddress,
+          userAgent,
+        });
+        throw new Error('Incorrect password. Enter your current password to regenerate recovery codes.');
+      }
+    } else if (!options?.usePasskeyReauth || !options?.hasRecentReauth) {
+      const err: any = new Error(
+        'Please re-authenticate with your password or passkey before generating recovery codes.'
+      );
+      err.status = 403;
+      err.code = 'REAUTH_REQUIRED';
+      throw err;
     }
 
     recordRateLimitEvent(bucketKey, true, ipAddress);
     const plainCodes = generateRecoveryCodes(10);
     const generatedAt = new Date().toISOString();
+    const isInitialGeneration = !user.recovery_codes_generated_at;
 
     return runInTransaction(() => {
       db.prepare(`
@@ -1660,13 +1685,19 @@ export const authService = {
         identifier: user.username,
         ipAddress,
         userAgent,
-        details: { count: plainCodes.length },
+        details: {
+          count: plainCodes.length,
+          isInitialGeneration,
+          reauthMethod: suppliedPassword ? 'password' : 'passkey',
+        },
       });
 
       insertSecurityNotification(
         userId,
-        'Recovery Codes Regenerated',
-        'A fresh set of 10 single-use recovery codes was generated for your account. Any earlier unused codes are now invalid.'
+        isInitialGeneration ? 'Recovery Codes Generated' : 'Recovery Codes Regenerated',
+        isInitialGeneration
+          ? 'Your 10 single-use recovery codes have been created. Store them safely offline.'
+          : 'A fresh set of 10 single-use recovery codes was generated for your account. Any earlier unused codes are now invalid.'
       );
 
       return {
@@ -1675,6 +1706,109 @@ export const authService = {
         remainingCount: plainCodes.length,
         totalCount: 10,
         generatedAt,
+        needsInitialSetup: false,
+      };
+    });
+  },
+
+  /**
+   * Returns recent sanitized security events exclusively for the signed-in user.
+   * Never exposes credentials, tokens, hashes, or raw internal identifiers.
+   */
+  getUserSecurityEvents(userId: string, limit = 20) {
+    const safeLimit = Math.min(50, Math.max(1, Math.floor(limit)));
+    const rows = db.prepare(`
+      SELECT id, event_type, severity, ip_address, device_name, details_json, created_at
+      FROM security_events
+      WHERE user_id = ?
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    `).all(userId, safeLimit) as Array<{
+      id: string;
+      event_type: string;
+      severity: string;
+      ip_address: string | null;
+      device_name: string | null;
+      details_json: string | null;
+      created_at: string;
+    }>;
+
+    const eventLabels: Record<string, string> = {
+      ACCOUNT_REGISTERED: 'Account created',
+      LOGIN_SUCCESS: 'Signed in',
+      LOGIN_FAILED: 'Failed sign-in attempt',
+      PASSKEY_ADDED: 'Passkey added',
+      PASSKEY_REGISTERED: 'Passkey added',
+      PASSKEY_REAUTHENTICATED: 'Passkey verified',
+      PASSKEY_REMOVED: 'Passkey removed',
+      PASSKEY_COUNTER_ANOMALY: 'Blocked suspicious passkey sign-in',
+      PASSWORD_CHANGED: 'Password changed',
+      PASSWORD_RESET_COMPLETED: 'Password reset completed',
+      RECOVERY_CODE_USED: 'Single-use recovery code used',
+      RECOVERY_CODES_REGENERATED: 'Recovery codes generated',
+      RECOVERY_CODE_REGEN_FAILED: 'Failed recovery code generation attempt',
+      RECOVERY_CODE_FAILED: 'Failed recovery code attempt',
+      USER_REVOKED_SESSION: 'Signed out a device session',
+      USER_REVOKED_OTHER_SESSIONS: 'Signed out all other devices',
+      USER_REVOKED_ALL_SESSIONS: 'Signed out everywhere',
+      MFA_ENABLED: 'Authenticator 2FA enabled',
+      MFA_DISABLED: 'Authenticator 2FA disabled',
+      ACCOUNT_LOCKED: 'Temporary sign-in protection triggered',
+    };
+
+    return rows.map((row) => {
+      let parsedDetails: Record<string, unknown> = {};
+      if (row.details_json) {
+        try {
+          parsedDetails = JSON.parse(row.details_json) || {};
+        } catch {
+          parsedDetails = {};
+        }
+      }
+
+      const safeDetails: Record<string, string | number | boolean> = {};
+      const allowedKeys = [
+        'method',
+        'reauthMethod',
+        'revokedOtherSessions',
+        'revokedSessions',
+        'revokedCount',
+        'remainingCodes',
+        'isInitialGeneration',
+        'evictedOldestDevice',
+      ];
+      for (const k of allowedKeys) {
+        const val = parsedDetails[k];
+        if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+          safeDetails[k] = val;
+        }
+      }
+      if (typeof parsedDetails.label === 'string') {
+        safeDetails.label = sanitizeInputText(parsedDetails.label, 60);
+      }
+
+      let summary = eventLabels[row.event_type] || row.event_type.replace(/_/g, ' ').toLowerCase();
+      if (row.event_type === 'LOGIN_SUCCESS' && safeDetails.method === 'passkey') {
+        summary = 'Signed in with passkey';
+      } else if (row.event_type === 'LOGIN_SUCCESS' && safeDetails.method === 'password') {
+        summary = 'Signed in with password';
+      } else if (row.event_type === 'PASSWORD_RESET_COMPLETED' && safeDetails.method === 'passkey') {
+        summary = 'Password reset via passkey';
+      } else if (row.event_type === 'PASSWORD_RESET_COMPLETED' && safeDetails.method === 'recovery_code') {
+        summary = 'Password reset via recovery code';
+      } else if (row.event_type === 'RECOVERY_CODES_REGENERATED' && safeDetails.isInitialGeneration === true) {
+        summary = 'Initial 10 recovery codes generated';
+      }
+
+      return {
+        id: row.id,
+        eventType: row.event_type,
+        severity: row.severity || 'info',
+        summary,
+        deviceName: row.device_name || null,
+        ipAddress: row.ip_address || null,
+        details: safeDetails,
+        createdAt: row.created_at,
       };
     });
   },
@@ -1949,6 +2083,107 @@ export const authService = {
       severity: 'warning',
     });
     return { success: true, mfaEnabled: false };
+  },
+
+  getFirstRunAdminSetupStatus() {
+    if ((process.env.ADMIN_PASSWORD || process.env.SCHOOLBACKDOOR_ADMIN_PASSWORD || '').trim()) {
+      return { adminNeedsSetup: false };
+    }
+    const adminRow = db
+      .prepare("SELECT password_hash FROM users WHERE id = 'u-admin' OR role = 'admin' LIMIT 1")
+      .get() as { password_hash?: string | null } | undefined;
+    const needsSetup = Boolean(adminRow && (!adminRow.password_hash || adminRow.password_hash === UNCLAIMED_CREDENTIAL_SENTINEL));
+    return { adminNeedsSetup: needsSetup };
+  },
+
+  claimFirstRunAdminPassword(password: string, confirmPassword?: string, ipAddress?: string, userAgent?: string) {
+    if ((process.env.ADMIN_PASSWORD || process.env.SCHOOLBACKDOOR_ADMIN_PASSWORD || '').trim()) {
+      const err: any = new Error('Admin credentials are already managed via server environment configuration.');
+      err.status = 409;
+      throw err;
+    }
+    if (typeof password !== 'string' || !password) {
+      throw new Error('Admin password is required.');
+    }
+    if (confirmPassword !== undefined && password !== confirmPassword) {
+      throw new Error('Password confirmation does not match.');
+    }
+
+    const adminRow = db
+      .prepare("SELECT id, username, password_hash FROM users WHERE id = 'u-admin' OR role = 'admin' LIMIT 1")
+      .get() as { id: string; username: string | null; password_hash: string | null } | undefined;
+
+    if (!adminRow || (adminRow.password_hash && adminRow.password_hash !== UNCLAIMED_CREDENTIAL_SENTINEL)) {
+      const err: any = new Error('Admin setup has already been completed.');
+      err.status = 409;
+      throw err;
+    }
+
+    const pwCheck = validateStrongPassword(password, [adminRow.username || 'THEBACKDOOR']);
+    if (!pwCheck.valid) {
+      throw new Error(pwCheck.error);
+    }
+
+    const newHash = hashPassword(password);
+    const plainCodes = generateRecoveryCodes(10);
+    const nowIso = new Date().toISOString();
+
+    const claimed = runInTransaction(() => {
+      const res = db.prepare(`
+        UPDATE users
+        SET password_hash = ?,
+            accepted_terms_version = COALESCE(accepted_terms_version, ?),
+            accepted_terms_at = COALESCE(accepted_terms_at, CURRENT_TIMESTAMP),
+            recovery_codes_generated_at = ?,
+            recovery_codes_remaining = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND (password_hash IS NULL OR password_hash = ?)
+      `).run(newHash, CURRENT_TERMS_VERSION, nowIso, plainCodes.length, adminRow.id, UNCLAIMED_CREDENTIAL_SENTINEL);
+
+      if (!res.changes) {
+        return false;
+      }
+
+      db.prepare('DELETE FROM recovery_codes WHERE user_id = ?').run(adminRow.id);
+      const insertCode = db.prepare(`
+        INSERT INTO recovery_codes (id, user_id, code_salt, code_hash)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const code of plainCodes) {
+        const normalized = normalizeRecoveryCode(code);
+        const { salt, hash } = hashRecoveryCode(normalized);
+        insertCode.run(
+          `rc-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`,
+          adminRow.id,
+          salt,
+          hash
+        );
+      }
+      return true;
+    });
+
+    if (!claimed) {
+      const err: any = new Error('Admin setup has already been completed.');
+      err.status = 409;
+      throw err;
+    }
+
+    recordSecurityEvent({
+      userId: adminRow.id,
+      eventType: 'ADMIN_FIRST_RUN_CLAIMED',
+      severity: 'warning',
+      identifier: adminRow.username || '@THEBACKDOOR',
+      ipAddress,
+      userAgent,
+    });
+
+    return {
+      success: true,
+      username: adminRow.username || '@THEBACKDOOR',
+      recoveryCodes: plainCodes,
+      message: 'Admin account provisioned! Save these 10 single-use recovery codes now.',
+    };
   },
 };
 

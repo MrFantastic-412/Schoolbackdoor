@@ -27,6 +27,15 @@ if (!fs.existsSync(BACKUP_DIR)) {
 
 const BACKUP_ENC_MAGIC = Buffer.from('SBDBENC1', 'utf8'); // 8-byte header for AES-256-GCM encrypted backups
 
+function safeJsonParse(raw: string | null | undefined): any {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 function getBackupEncryptionKey(): Buffer {
   const envKey = process.env.SCHOOLBACKDOOR_BACKUP_KEY;
   if (envKey && envKey.trim()) {
@@ -154,7 +163,7 @@ export const adminSecurityService = {
       action: r.action,
       targetType: r.target_type,
       targetId: r.target_id,
-      metadata: r.metadata_json ? JSON.parse(r.metadata_json) : null,
+      metadata: safeJsonParse(r.metadata_json),
       createdAt: r.created_at,
     }));
   },
@@ -399,13 +408,35 @@ export const adminSecurityService = {
       throw new Error('Forbidden. Insufficient permissions to issue account warnings.');
     }
 
+    const targetUser = db.prepare('SELECT id, role FROM users WHERE id = ?').get(userId) as
+      | { id: string; role: string }
+      | undefined;
+    if (!targetUser) {
+      throw new Error('User not found.');
+    }
+    if (targetUser.id === adminId || targetUser.role === 'admin') {
+      throw new Error('Forbidden. Cannot issue warnings to an Admin account.');
+    }
+
+    const cleanReason = String(reason || '').trim().slice(0, 300);
+    if (cleanReason.length < 3) {
+      throw new Error('Warning reason must be at least 3 characters.');
+    }
+    const allowedSeverity = new Set(['minor', 'standard', 'severe']);
+    const cleanSeverity = allowedSeverity.has(severity) ? severity : 'standard';
+    const cleanDetails = typeof details === 'string' && details.trim() ? details.trim().slice(0, 600) : null;
+
     const warningId = `warn-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
 
     runInTransaction(() => {
       db.prepare(`
         INSERT INTO user_warnings (id, user_id, admin_id, reason, severity, details)
         VALUES (?, ?, ?, ?, ?, ?)
-      `).run(warningId, userId, adminId, reason, severity, details || null);
+      `).run(warningId, userId, adminId, cleanReason, cleanSeverity, cleanDetails);
+
+      db.prepare(`
+        UPDATE users SET warnings_count = COALESCE(warnings_count, 0) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+      `).run(userId);
 
       // Create high-visibility in-app notice for the student
       db.prepare(`
@@ -414,18 +445,23 @@ export const adminSecurityService = {
       `).run(
         `n-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         userId,
-        `Academic Integrity Notice: A ${severity} warning has been issued regarding your recent activity (${reason}). Review our Community Guidelines.`
+        `Academic Integrity Notice: A ${cleanSeverity} warning has been issued regarding your recent activity (${cleanReason}). Review our Community Guidelines.`
       );
 
-      this.logAdminAction(adminId, 'ISSUE_WARNING', 'user', userId, { warningId, reason, severity, details });
+      this.logAdminAction(adminId, 'ISSUE_WARNING', 'user', userId, {
+        warningId,
+        reason: cleanReason,
+        severity: cleanSeverity,
+        details: cleanDetails,
+      });
     });
 
     return {
       success: true,
       warningId,
       userId,
-      reason,
-      severity,
+      reason: cleanReason,
+      severity: cleanSeverity,
       issuedAt: new Date().toISOString(),
     };
   },
@@ -444,6 +480,12 @@ export const adminSecurityService = {
       throw new Error('Forbidden. Insufficient permissions to suspend accounts.');
     }
 
+    const parsedDays = Math.floor(Number(durationDays));
+    if (!Number.isFinite(parsedDays) || parsedDays < 1 || parsedDays > 365) {
+      throw new Error('Suspension duration must be between 1 and 365 days.');
+    }
+    const cleanReason = String(reason || '').trim().slice(0, 300) || 'Violation of Campus Guidelines';
+
     const targetUser = db.prepare('SELECT id, role, status FROM users WHERE id = ?').get(userId) as any;
     if (!targetUser) throw new Error('User not found.');
 
@@ -455,7 +497,7 @@ export const adminSecurityService = {
       throw new Error('Forbidden. Only an Admin can manage Admin accounts.');
     }
 
-    const suspendedUntil = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000).toISOString();
+    const suspendedUntil = new Date(Date.now() + parsedDays * 24 * 60 * 60 * 1000).toISOString();
 
     runInTransaction(() => {
       // 1. Update status
@@ -466,15 +508,15 @@ export const adminSecurityService = {
             suspended_until = ?,
             suspended_by = ?
         WHERE id = ?
-      `).run(reason, suspendedUntil, adminId, userId);
+      `).run(cleanReason, suspendedUntil, adminId, userId);
 
       // 2. Kill all active sessions immediately
       db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
 
       // 3. Log audit action
       this.logAdminAction(adminId, 'SUSPEND_USER', 'user', userId, {
-        durationDays,
-        reason,
+        durationDays: parsedDays,
+        reason: cleanReason,
         suspendedUntil,
       });
     });
@@ -484,7 +526,7 @@ export const adminSecurityService = {
       userId,
       status: 'suspended',
       suspendedUntil,
-      reason,
+      reason: cleanReason,
     };
   },
 
@@ -495,6 +537,13 @@ export const adminSecurityService = {
     if (!this.hasPermission(adminRole, 'users:unsuspend')) {
       throw new Error('Forbidden. Insufficient permissions to lift account suspensions.');
     }
+
+    const targetUser = db.prepare('SELECT id FROM users WHERE id = ?').get(userId);
+    if (!targetUser) {
+      throw new Error('User not found.');
+    }
+
+    const cleanReason = String(reason || '').trim().slice(0, 300) || 'Suspension resolved or appeal granted';
 
     db.prepare(`
       UPDATE users
@@ -508,9 +557,9 @@ export const adminSecurityService = {
       WHERE id = ?
     `).run(userId);
 
-    this.logAdminAction(adminId, 'UNSUSPEND_USER', 'user', userId, { reason });
+    this.logAdminAction(adminId, 'UNSUSPEND_USER', 'user', userId, { reason: cleanReason });
 
-    return { success: true, userId, status: 'active', reason };
+    return { success: true, userId, status: 'active', reason: cleanReason };
   },
 
   /**
@@ -600,13 +649,13 @@ export const adminSecurityService = {
    */
   getAppeals(status?: string) {
     const query = status
-      ? `SELECT a.*, pr.name as student_name, pr.handle as student_handle, u.email as student_email
+      ? `SELECT a.*, pr.name as student_name, pr.handle as student_handle
          FROM appeals a
          JOIN users u ON u.id = a.user_id
          LEFT JOIN user_profiles pr ON pr.user_id = a.user_id
          WHERE a.status = ?
          ORDER BY a.created_at DESC`
-      : `SELECT a.*, pr.name as student_name, pr.handle as student_handle, u.email as student_email
+      : `SELECT a.*, pr.name as student_name, pr.handle as student_handle
          FROM appeals a
          JOIN users u ON u.id = a.user_id
          LEFT JOIN user_profiles pr ON pr.user_id = a.user_id
@@ -618,7 +667,6 @@ export const adminSecurityService = {
       userId: r.user_id,
       studentName: r.student_name || 'Student',
       studentHandle: r.student_handle || '@futa_student',
-      studentEmail: r.student_email,
       type: r.type,
       targetId: r.target_id,
       statement: r.statement,
@@ -634,7 +682,7 @@ export const adminSecurityService = {
    */
   getStaffRoster() {
     const rows = db.prepare(`
-      SELECT u.id, u.matric_number, u.email, u.role, u.status, u.created_at,
+      SELECT u.id, u.matric_number, u.role, u.status, u.created_at,
              pr.name, pr.handle, pr.department
       FROM users u
       LEFT JOIN user_profiles pr ON pr.user_id = u.id
@@ -650,7 +698,6 @@ export const adminSecurityService = {
       id: r.id,
       name: r.name || 'Staff Member',
       handle: r.handle || '@staff',
-      email: r.email,
       matricNumber: r.matric_number,
       department: r.department || 'Platform Governance',
       role: r.role as UserRole,
@@ -1067,7 +1114,7 @@ export const adminSecurityService = {
       createdAt: r.created_at,
       expiresAt: r.expires_at,
       createdBy: r.created_by,
-      metadata: r.metadata_json ? JSON.parse(r.metadata_json) : null,
+      metadata: safeJsonParse(r.metadata_json),
     }));
   },
 

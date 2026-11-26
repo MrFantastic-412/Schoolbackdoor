@@ -8,6 +8,7 @@ import {
   Download,
   FileText,
   Fingerprint,
+  History,
   KeyRound,
   Laptop,
   Lock,
@@ -19,6 +20,7 @@ import {
   RefreshCw,
   Shield,
   ShieldAlert,
+  ShieldCheck,
   Smartphone,
   Sun,
   Tablet,
@@ -32,6 +34,7 @@ import {
   PasskeySummary,
   RecoveryCodeStatus,
   StudentProfile,
+  UserSecurityEvent,
 } from '../types';
 import { api } from '../api/client';
 import { CAMPUS_AREA_OPTIONS, snapCoordsToArea } from '../data/locationAreas';
@@ -47,12 +50,17 @@ const AvatarCropModal = lazy(() =>
   import('../components/profile/AvatarCropModal').then((m) => ({ default: m.AvatarCropModal }))
 );
 
+export type SettingsSectionTab = 'privacy' | 'devices' | 'blocked' | 'notifications' | 'erasure';
+
 interface SettingsPageProps {
   profile?: StudentProfile;
   onProfileUpdated?: (updated: StudentProfile) => void;
   onOpenAuth?: (mode?: 'login' | 'register') => void;
   onLogout?: () => void;
   onNavigateToTab?: (tab: any) => void;
+  requestedSection?: SettingsSectionTab | null;
+  onClearRequestedSection?: () => void;
+  onRecoveryStatusChanged?: (status: RecoveryCodeStatus) => void;
 }
 
 export const SettingsPage: React.FC<SettingsPageProps> = ({
@@ -61,6 +69,9 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   onOpenAuth,
   onLogout,
   onNavigateToTab,
+  requestedSection,
+  onClearRequestedSection,
+  onRecoveryStatusChanged,
 }) => {
   const { preference: themePreference, resolvedTheme, setTheme } = useTheme();
 
@@ -129,9 +140,18 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   const [reauthPasskeyTargetId, setReauthPasskeyTargetId] = useState<string | null>(null);
   const [passkeyReauthPassword, setPasskeyReauthPassword] = useState('');
   const [isPasskeyReauthing, setIsPasskeyReauthing] = useState(false);
+  const [securityEvents, setSecurityEvents] = useState<UserSecurityEvent[]>([]);
+  const [isLoadingEvents, setIsLoadingEvents] = useState(false);
   const webauthnSupported = isPasskeySupported();
   const [isAvatarModalOpen, setIsAvatarModalOpen] = useState(false);
   const [isUpdatingAvatar, setIsUpdatingAvatar] = useState(false);
+
+  useEffect(() => {
+    if (requestedSection) {
+      setActiveSettingsTab(requestedSection);
+      onClearRequestedSection?.();
+    }
+  }, [requestedSection, onClearRequestedSection]);
 
   useEffect(() => {
     if (profile) {
@@ -162,11 +182,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   const loadSessionsAndSecurity = async () => {
     if (!profile?.userId) return;
     setIsLoadingSessions(true);
+    setIsLoadingEvents(true);
     try {
-      const [data, rcStatus, passkeyList] = await Promise.all([
+      const [data, rcStatus, passkeyList, eventsList] = await Promise.all([
         api.getMySessions(),
         api.getRecoveryCodeStatus().catch(() => null),
         api.listPasskeys().catch(() => []),
+        api.getMySecurityEvents(20).catch(() => []),
       ]);
       setSessions(data.sessions || []);
       setSessionLimits({
@@ -177,8 +199,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
       });
       if (rcStatus) {
         setRecoveryStatus(rcStatus);
+        onRecoveryStatusChanged?.(rcStatus);
       }
       setPasskeys(passkeyList || []);
+      setSecurityEvents(eventsList || []);
       if (profile.role === 'admin' || profile.role === 'moderator') {
         const mfaRes = await api.getMfaStatus();
         setMfaEnabled(Boolean(mfaRes.mfaEnabled));
@@ -187,6 +211,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
       console.warn('Failed to load active sessions:', e);
     } finally {
       setIsLoadingSessions(false);
+      setIsLoadingEvents(false);
     }
   };
 
@@ -851,6 +876,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                       setPasskeyLabelInput('');
                       triggerHaptic('success');
                       showNotice(`Passkey "${res.passkey.label}" added.`);
+                      api.getMySecurityEvents(20).then(setSecurityEvents).catch(() => {});
                     } catch (err: any) {
                       triggerHaptic('error');
                       showNotice(formatPasskeyError(err, 'Unable to add passkey.'));
@@ -919,6 +945,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                                 setReauthPasskeyTargetId(null);
                                 triggerHaptic('success');
                                 showNotice(res.message || 'Passkey removed.');
+                                api.getMySecurityEvents(20).then(setSecurityEvents).catch(() => {});
                               } catch (err: any) {
                                 if (err?.code === 'REAUTH_REQUIRED' || err?.status === 403) {
                                   setReauthPasskeyTargetId(pk.id);
@@ -966,6 +993,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                                     setPasskeyReauthPassword('');
                                     triggerHaptic('success');
                                     showNotice(res.message || 'Passkey removed.');
+                                    api.getMySecurityEvents(20).then(setSecurityEvents).catch(() => {});
                                   } catch (err: any) {
                                     triggerHaptic('error');
                                     showNotice(err?.message || 'Password verification failed.');
@@ -993,6 +1021,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                                       setReauthPasskeyTargetId(null);
                                       triggerHaptic('success');
                                       showNotice(res.message || 'Passkey verified and removed.');
+                                      api.getMySecurityEvents(20).then(setSecurityEvents).catch(() => {});
                                     } catch (err: any) {
                                       triggerHaptic('error');
                                       showNotice(formatPasskeyError(err, 'Passkey verification failed.'));
@@ -1182,114 +1211,268 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               </GlassCard>
             )}
 
-            {profile?.userId && (
-              <GlassCard tone="cream" padding="lg" className="flex flex-col gap-3.5 text-xs">
-                <div className="flex items-center justify-between gap-2 border-b border-[#171613]/10 dark:border-[#F5EFE3]/10 pb-3">
-                  <div className="flex items-center gap-2">
-                    <KeyRound className="w-4 h-4 text-[#C4718E] dark:text-[#E5A4BA]" />
-                    <h3 className="font-serif font-bold text-base text-[#171613] dark:text-[#F5EFE3]">
-                      Single-Use Recovery Codes
-                    </h3>
+            {profile?.userId && (() => {
+              const isLegacyNoCodes = Boolean(
+                recoveryStatus && recoveryStatus.generatedAt === null && recoveryStatus.remainingCount === 0
+              );
+              return (
+                <GlassCard tone="cream" padding="lg" className="flex flex-col gap-3.5 text-xs">
+                  <div className="flex items-center justify-between gap-2 border-b border-[#171613]/10 dark:border-[#F5EFE3]/10 pb-3">
+                    <div className="flex items-center gap-2">
+                      <KeyRound className="w-4 h-4 text-[#C4718E] dark:text-[#E5A4BA]" />
+                      <h3 className="font-serif font-bold text-base text-[#171613] dark:text-[#F5EFE3]">
+                        Single-Use Recovery Codes
+                      </h3>
+                    </div>
+                    <span className="font-mono text-[11px] px-2.5 py-0.5 rounded-md glass-subtle text-[#171613] dark:text-[#F5EFE3] tabular-nums">
+                      {recoveryStatus
+                        ? isLegacyNoCodes
+                          ? 'Not generated yet'
+                          : `${recoveryStatus.remainingCount}/${recoveryStatus.totalCount} unused`
+                        : 'Checking...'}
+                    </span>
                   </div>
-                  <span className="font-mono text-[11px] px-2.5 py-0.5 rounded-md glass-subtle text-[#171613] dark:text-[#F5EFE3] tabular-nums">
-                    {recoveryStatus ? `${recoveryStatus.remainingCount}/${recoveryStatus.totalCount} unused` : 'Checking...'}
-                  </span>
-                </div>
 
-                <p className="text-[11px] text-[#82796F] dark:text-[#A89F95] leading-relaxed">
-                  Existing recovery codes are stored as cryptographic hashes and cannot be viewed again. Regenerating invalidates all unused codes and issues 10 fresh single-use codes shown once.
-                </p>
-
-                <form
-                  onSubmit={async (e) => {
-                    e.preventDefault();
-                    if (!regenPassword) return;
-                    setIsRegeneratingCodes(true);
-                    try {
-                      const res = await api.regenerateRecoveryCodes(regenPassword);
-                      setFreshRecoveryCodes(res.recoveryCodes);
-                      setRecoveryStatus({
-                        remainingCount: res.remainingCount,
-                        totalCount: res.totalCount,
-                        generatedAt: res.generatedAt,
-                      });
-                      setRegenPassword('');
-                      setCopiedFreshCodes(false);
-                      triggerHaptic('success');
-                      showNotice('10 new recovery codes generated. Save them immediately.');
-                    } catch (err: any) {
-                      triggerHaptic('error');
-                      showNotice(err?.message || 'Unable to regenerate recovery codes.');
-                    } finally {
-                      setIsRegeneratingCodes(false);
-                    }
-                  }}
-                  className="flex flex-col sm:flex-row gap-2.5"
-                >
-                  <input
-                    type="password"
-                    autoComplete="current-password"
-                    required
-                    value={regenPassword}
-                    onChange={(e) => setRegenPassword(e.target.value)}
-                    placeholder="Enter current password to regenerate codes"
-                    className="flex-1 px-3.5 py-2 rounded-xl glass-input text-xs text-[#171613] dark:text-[#F5EFE3]"
-                  />
-                  <GlassButton type="submit" variant="pink" size="sm" loading={isRegeneratingCodes}>
-                    <RefreshCw className="w-3.5 h-3.5" />
-                    <span>Regenerate 10 Codes</span>
-                  </GlassButton>
-                </form>
-
-                {freshRecoveryCodes && freshRecoveryCodes.length > 0 && (
-                  <div className="p-3.5 rounded-2xl glass-subtle border border-[#D98BA5]/50 space-y-3 animate-sb-in">
-                    <div className="text-[11px] font-semibold text-[#171613] dark:text-[#F5EFE3]">
-                      New Single-Use Recovery Codes (shown once — copy or download now):
+                  {isLegacyNoCodes ? (
+                    <div className="p-3 rounded-xl bg-[#F6E2E6]/75 dark:bg-[#4A2532]/55 border border-[#D98BA5]/55 text-[11px] text-[#171613] dark:text-[#F5EFE3] leading-relaxed flex items-start gap-2">
+                      <ShieldAlert className="w-4 h-4 text-[#C4718E] dark:text-[#E5A4BA] shrink-0 mt-0.5" />
+                      <span>
+                        <strong>Legacy account check:</strong> You have not generated single-use recovery codes yet. Generate 10 codes now so you can reset your password without email or SMS if you ever lose access.
+                      </span>
                     </div>
-                    <div className="grid grid-cols-2 gap-2 font-mono text-xs">
-                      {freshRecoveryCodes.map((code, idx) => (
-                        <div
-                          key={code}
-                          className="px-2.5 py-1.5 rounded-lg bg-[#FFFCF7]/85 dark:bg-[#1E1C18] border border-[#171613]/8 dark:border-white/8 text-[#171613] dark:text-[#F5EFE3] flex items-center justify-between gap-1.5"
-                        >
-                          <span className="text-[10px] text-[#82796F] dark:text-[#A89F95]">
-                            {String(idx + 1).padStart(2, '0')}
-                          </span>
-                          <span className="font-semibold tracking-tight select-all">{code}</span>
-                        </div>
-                      ))}
-                    </div>
-                    <div className="flex flex-wrap gap-2">
+                  ) : (
+                    <p className="text-[11px] text-[#82796F] dark:text-[#A89F95] leading-relaxed">
+                      Existing recovery codes are stored as cryptographic hashes and cannot be viewed again. Regenerating requires re-authentication, immediately invalidates all unused codes, and shows 10 fresh single-use codes once.
+                    </p>
+                  )}
+
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      if (!regenPassword) return;
+                      setIsRegeneratingCodes(true);
+                      try {
+                        const res = await api.regenerateRecoveryCodes(regenPassword);
+                        const nextStatus: RecoveryCodeStatus = {
+                          remainingCount: res.remainingCount,
+                          totalCount: res.totalCount,
+                          generatedAt: res.generatedAt,
+                          needsInitialSetup: false,
+                        };
+                        setFreshRecoveryCodes(res.recoveryCodes);
+                        setRecoveryStatus(nextStatus);
+                        onRecoveryStatusChanged?.(nextStatus);
+                        setRegenPassword('');
+                        setCopiedFreshCodes(false);
+                        triggerHaptic('success');
+                        showNotice('10 single-use recovery codes generated. Save them immediately.');
+                        api.getMySecurityEvents(20).then(setSecurityEvents).catch(() => {});
+                      } catch (err: any) {
+                        triggerHaptic('error');
+                        showNotice(err?.message || 'Unable to generate recovery codes.');
+                      } finally {
+                        setIsRegeneratingCodes(false);
+                      }
+                    }}
+                    className="flex flex-col sm:flex-row gap-2.5"
+                  >
+                    <input
+                      type="password"
+                      autoComplete="current-password"
+                      required
+                      value={regenPassword}
+                      onChange={(e) => setRegenPassword(e.target.value)}
+                      placeholder={
+                        isLegacyNoCodes
+                          ? 'Enter current password to generate codes'
+                          : 'Enter current password to regenerate codes'
+                      }
+                      className="flex-1 px-3.5 py-2 rounded-xl glass-input text-xs text-[#171613] dark:text-[#F5EFE3]"
+                    />
+                    <GlassButton type="submit" variant="pink" size="sm" loading={isRegeneratingCodes}>
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>{isLegacyNoCodes ? 'Generate 10 Recovery Codes' : 'Regenerate 10 Codes'}</span>
+                    </GlassButton>
+                    {passkeys.length > 0 && webauthnSupported && (
                       <GlassButton
                         type="button"
                         variant="glass"
                         size="sm"
+                        disabled={isRegeneratingCodes}
                         onClick={async () => {
+                          setIsRegeneratingCodes(true);
                           try {
-                            await navigator.clipboard.writeText(freshRecoveryCodes.join('\n'));
-                            setCopiedFreshCodes(true);
+                            const opts = await api.getPasskeyReauthOptions();
+                            const assertion = await startAuthentication({ optionsJSON: opts });
+                            await api.verifyPasskeyReauth(assertion);
+                            const res = await api.regenerateRecoveryCodes(undefined, true);
+                            const nextStatus: RecoveryCodeStatus = {
+                              remainingCount: res.remainingCount,
+                              totalCount: res.totalCount,
+                              generatedAt: res.generatedAt,
+                              needsInitialSetup: false,
+                            };
+                            setFreshRecoveryCodes(res.recoveryCodes);
+                            setRecoveryStatus(nextStatus);
+                            onRecoveryStatusChanged?.(nextStatus);
+                            setCopiedFreshCodes(false);
                             triggerHaptic('success');
-                          } catch {
-                            showNotice('Clipboard unavailable; please use Download .txt.');
+                            showNotice('Passkey verified. 10 new recovery codes generated.');
+                            api.getMySecurityEvents(20).then(setSecurityEvents).catch(() => {});
+                          } catch (err: any) {
+                            triggerHaptic('error');
+                            showNotice(formatPasskeyError(err, 'Passkey verification failed.'));
+                          } finally {
+                            setIsRegeneratingCodes(false);
                           }
                         }}
                       >
-                        {copiedFreshCodes ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                        <span>{copiedFreshCodes ? 'Copied All' : 'Copy Codes'}</span>
+                        <Fingerprint className="w-3.5 h-3.5" />
+                        <span>Use Passkey</span>
                       </GlassButton>
-                      <GlassButton
-                        type="button"
-                        variant="black"
-                        size="sm"
-                        onClick={() => {
-                          downloadRecoveryCodesTxt(profile.handle, freshRecoveryCodes);
-                          triggerHaptic('success');
-                        }}
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        <span>Download .txt</span>
-                      </GlassButton>
+                    )}
+                  </form>
+
+                  {freshRecoveryCodes && freshRecoveryCodes.length > 0 && (
+                    <div className="p-3.5 rounded-2xl glass-subtle border border-[#D98BA5]/50 space-y-3 animate-sb-in">
+                      <div className="text-[11px] font-semibold text-[#171613] dark:text-[#F5EFE3]">
+                        New Single-Use Recovery Codes (shown once — copy or download now):
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 font-mono text-xs">
+                        {freshRecoveryCodes.map((code, idx) => (
+                          <div
+                            key={code}
+                            className="px-2.5 py-1.5 rounded-lg bg-[#FFFCF7]/85 dark:bg-[#1E1C18] border border-[#171613]/8 dark:border-white/8 text-[#171613] dark:text-[#F5EFE3] flex items-center justify-between gap-1.5"
+                          >
+                            <span className="text-[10px] text-[#82796F] dark:text-[#A89F95]">
+                              {String(idx + 1).padStart(2, '0')}
+                            </span>
+                            <span className="font-semibold tracking-tight select-all">{code}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <GlassButton
+                          type="button"
+                          variant="glass"
+                          size="sm"
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard.writeText(freshRecoveryCodes.join('\n'));
+                              setCopiedFreshCodes(true);
+                              triggerHaptic('success');
+                            } catch {
+                              showNotice('Clipboard unavailable; please use Download .txt.');
+                            }
+                          }}
+                        >
+                          {copiedFreshCodes ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                          <span>{copiedFreshCodes ? 'Copied All' : 'Copy Codes'}</span>
+                        </GlassButton>
+                        <GlassButton
+                          type="button"
+                          variant="black"
+                          size="sm"
+                          onClick={() => {
+                            downloadRecoveryCodesTxt(profile.handle, freshRecoveryCodes);
+                            triggerHaptic('success');
+                          }}
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Download .txt</span>
+                        </GlassButton>
+                      </div>
                     </div>
+                  )}
+                </GlassCard>
+              );
+            })()}
+
+            {profile?.userId && (
+              <GlassCard tone="cream" padding="lg" className="flex flex-col gap-3.5 text-xs">
+                <div className="flex items-center justify-between gap-2 border-b border-[#171613]/10 dark:border-[#F5EFE3]/10 pb-3">
+                  <div className="flex items-center gap-2">
+                    <History className="w-4 h-4 text-[#C4718E] dark:text-[#E5A4BA]" />
+                    <h3 className="font-serif font-bold text-base text-[#171613] dark:text-[#F5EFE3]">
+                      Recent Security Activity
+                    </h3>
+                  </div>
+                  <GlassButton
+                    type="button"
+                    variant="glass"
+                    size="sm"
+                    disabled={isLoadingEvents}
+                    onClick={() => {
+                      setIsLoadingEvents(true);
+                      api
+                        .getMySecurityEvents(20)
+                        .then(setSecurityEvents)
+                        .finally(() => setIsLoadingEvents(false));
+                    }}
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isLoadingEvents ? 'animate-spin' : ''}`} />
+                    <span>Refresh</span>
+                  </GlassButton>
+                </div>
+
+                <p className="text-[11px] text-[#82796F] dark:text-[#A89F95] leading-relaxed">
+                  Audit history of sign-ins, password changes, passkey updates, session revocations, and recovery actions on your account. Secrets, passwords, and tokens are never logged.
+                </p>
+
+                {isLoadingEvents && securityEvents.length === 0 ? (
+                  <div className="py-5 text-center text-xs text-[#82796F] dark:text-[#A89F95]">
+                    Loading recent security activity...
+                  </div>
+                ) : securityEvents.length === 0 ? (
+                  <div className="py-5 text-center text-xs text-[#82796F] dark:text-[#A89F95] glass-subtle rounded-xl">
+                    No security activity recorded yet.
+                  </div>
+                ) : (
+                  <div className="divide-y divide-[#171613]/8 dark:divide-[#F5EFE3]/10">
+                    {securityEvents.map((ev) => {
+                      const isAlert = ev.severity === 'warning' || ev.severity === 'high' || ev.severity === 'critical';
+                      return (
+                        <div key={ev.id} className="py-3 flex items-start justify-between gap-3">
+                          <div className="flex items-start gap-2.5 min-w-0">
+                            <div
+                              className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 mt-0.5 ${
+                                isAlert
+                                  ? 'bg-[#F6E2E6] dark:bg-[#4A2532] text-[#C4718E] dark:text-[#E5A4BA]'
+                                  : 'bg-[#E8DDCC]/75 dark:bg-[#2A2722] text-[#171613] dark:text-[#F5EFE3]'
+                              }`}
+                            >
+                              {isAlert ? <ShieldAlert className="w-4 h-4" /> : <ShieldCheck className="w-4 h-4" />}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="font-semibold text-[#171613] dark:text-[#F5EFE3]">
+                                  {ev.summary}
+                                </span>
+                                {ev.details?.label && (
+                                  <span className="px-1.5 py-0.5 rounded-md text-[10px] font-mono bg-[#E8DDCC]/75 dark:bg-white/10 text-[#171613] dark:text-[#F5EFE3]">
+                                    {String(ev.details.label)}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[11px] text-[#82796F] dark:text-[#A89F95] font-mono mt-0.5 truncate">
+                                {new Date(ev.createdAt).toLocaleString()}
+                                {ev.deviceName ? ` · ${ev.deviceName}` : ''}
+                                {ev.ipAddress ? ` · ${ev.ipAddress}` : ''}
+                              </div>
+                            </div>
+                          </div>
+                          <span
+                            className={`px-2 py-0.5 rounded-md text-[10px] font-mono uppercase shrink-0 ${
+                              isAlert
+                                ? 'bg-[#F6E2E6] dark:bg-[#4A2532] text-[#171613] dark:text-[#F5EFE3]'
+                                : 'glass-subtle text-[#82796F] dark:text-[#A89F95]'
+                            }`}
+                          >
+                            {isAlert ? 'Review' : 'OK'}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </GlassCard>
@@ -1652,7 +1835,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               {profile?.userId ? `Authenticated Session: ${profile.handle}` : 'Guest Preview Mode'}
             </span>
             <span className="text-[11px] text-[#82796F] dark:text-[#A89F95]">
-              {profile?.email ? `${profile.email} · ` : ''}100% Free Independent Social Network
+              100% Free Independent Social Network
             </span>
           </div>
 

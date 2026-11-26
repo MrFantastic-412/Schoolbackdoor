@@ -206,9 +206,8 @@ export const adminAdsPaymentsService = {
     const whereSql = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
 
     const payments = db.prepare(`
-      SELECT p.*, pr.name as user_name, pr.handle as user_handle, u.email as user_email
+      SELECT p.*, pr.name as user_name, pr.handle as user_handle
       FROM payments p
-      LEFT JOIN users u ON u.id = p.user_id
       LEFT JOIN user_profiles pr ON pr.user_id = p.user_id
       ${whereSql}
       ORDER BY p.created_at DESC

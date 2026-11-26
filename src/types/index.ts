@@ -384,6 +384,18 @@ export interface RecoveryCodeStatus {
   remainingCount: number;
   totalCount: number;
   generatedAt: string | null;
+  needsInitialSetup?: boolean;
+}
+
+export interface UserSecurityEvent {
+  id: string;
+  eventType: string;
+  severity: 'info' | 'warning' | 'high' | 'critical' | string;
+  summary: string;
+  deviceName: string | null;
+  ipAddress: string | null;
+  details: Record<string, string | number | boolean>;
+  createdAt: string;
 }
 
 export interface PasskeySummary {
@@ -586,7 +598,7 @@ export interface AdminUserRecord {
   id: string;
   matricNumber: string;
   email?: string | null;
-  phoneNumber: string;
+  phoneNumber?: string | null;
   role: 'admin' | 'moderator' | 'staff' | 'student';
   status: 'active' | 'suspended';
   isVerified: boolean;

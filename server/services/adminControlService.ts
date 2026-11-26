@@ -429,6 +429,7 @@ export const adminControlService = {
       const stmt = db.prepare(`
         UPDATE website_settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?
       `);
+      const appliedUpdates: Record<string, string> = {};
       for (const [k, v] of Object.entries(updates)) {
         if (!allowedKeys.has(k)) continue;
         const strVal = String(v ?? '').trim().slice(0, 500);
@@ -436,8 +437,9 @@ export const adminControlService = {
           throw new Error(`Invalid boolean value for setting "${k}".`);
         }
         stmt.run(strVal, k);
+        appliedUpdates[k] = strVal;
       }
-      adminSecurityService.logAdminAction(adminId, 'UPDATE_WEBSITE_SETTINGS', 'system', 'website_settings', updates);
+      adminSecurityService.logAdminAction(adminId, 'UPDATE_WEBSITE_SETTINGS', 'system', 'website_settings', appliedUpdates);
     });
 
     cache.invalidatePrefix('platform:config');
@@ -475,7 +477,7 @@ export const adminControlService = {
 
     const rows = db.prepare(`
       SELECT
-        u.id, u.matric_number, u.email, u.phone_number, u.role, u.status,
+        u.id, u.matric_number, u.role, u.status,
         u.is_verified, u.mfa_enabled, u.created_at, u.last_active_at, u.suspension_reason,
         u.account_restricted_until, u.restriction_reason, COALESCE(u.warnings_count, 0) as warnings_count,
         pr.name, pr.handle, pr.department, pr.school, pr.level, pr.hall_of_residence, pr.campus, pr.bio, pr.verified,
@@ -495,8 +497,6 @@ export const adminControlService = {
     return rows.map((r) => ({
       id: r.id,
       matricNumber: r.matric_number,
-      email: r.email,
-      phoneNumber: r.phone_number || '',
       role: r.role,
       status: r.status,
       isVerified: Boolean(r.is_verified || r.verified),
@@ -1273,7 +1273,7 @@ export const adminControlService = {
       sessionMaxLifetimeDays: SESSION_POLICY.sessionMaxLifetimeDays,
       maxActiveDevices: SESSION_POLICY.maxActiveDevices,
       rateLimitRule: 'Escalating cooldowns starting at 5 failures / 15m (15m -> 30m -> 60m -> 180m)',
-      passwordHashing: 'crypto.scrypt (N=32768, r=8, p=1, keylen=32)',
+      passwordHashing: 'Argon2id (m=19456, t=2, p=1) with transparent legacy scrypt upgrade',
       recentFailedLogins: recentFailedLogins.map((r) => ({
         identifier: r.identifier,
         ipAddress: r.ip_address || 'unknown',
@@ -1347,7 +1347,14 @@ export const adminControlService = {
       identifier: r.identifier || null,
       ipAddress: r.ip_address || 'unknown',
       deviceName: r.device_name || null,
-      details: r.details_json ? JSON.parse(r.details_json) : null,
+      details: (() => {
+        if (!r.details_json) return null;
+        try {
+          return JSON.parse(r.details_json);
+        } catch {
+          return null;
+        }
+      })(),
       resolved: Boolean(r.resolved),
       createdAt: r.created_at,
     }));
@@ -1383,6 +1390,10 @@ export const adminControlService = {
   },
 
   revokeUserSessionsByAdmin(adminId: string, targetUserId: string, reason = 'admin_account_session_wipe') {
+    const targetUser = db.prepare('SELECT id FROM users WHERE id = ?').get(targetUserId);
+    if (!targetUser) {
+      throw new Error('User not found.');
+    }
     const res = db.prepare(`
       UPDATE sessions
       SET revoked_at = CURRENT_TIMESTAMP,
