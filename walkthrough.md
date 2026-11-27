@@ -1,11 +1,12 @@
 # Security Summary
 
-**Reviewed Files**: 25
-**Issues Resolved**: 10
+**Reviewed Files**: 26
+**Issues Resolved**: 11
 
 ### Issues Resolved
 | Area | File | Line | What Was Happening | Impact | Status | How It Was Fixed |
 |---|---|---|---|---|---|---|
+| Unauthenticated Dev Auto-Login | `server/middleware/auth.ts` | 171 | Unauthenticated HTTP callers in non-production environments were automatically signed in as seeded student `@ayodele_ao` when no token or cookie was provided. | High | Fixed | Removed the implicit `u-ayodele` fallback so all environments strictly enforce `401 Unauthorized` on protected routes unless valid session credentials are presented. |
 | Hardcoded Privileged Credentials | `server/db/database.ts` | 1043 | Fresh databases seeded fallback default passwords for `@THEBACKDOOR` and `@campus_mod` when environment variables were unset. | High | Fixed | Removed hardcoded password fallbacks, assigned an unloginable sentinel (`!UNCLAIMED_SETUP_REQUIRED`), added `npm run provision:staff`, and added a single-use first-run Admin setup flow (`/api/auth/setup-admin`) that locks permanently after use. |
 | Session Token in Query String | `server/routes/api.ts` | 1290 | `/api/realtime/stream` accepted raw bearer session tokens via `?token=` query parameters, risking exposure in server logs and browser history. | High | Fixed | Removed `?token=` authentication from `/api/realtime/stream`, enforced short-lived signed/cache-backed `?ticket=` tokens from `POST /api/realtime/ticket`, and replaced the predictable realtime secret fallback with a random per-process fallback when unset. |
 | Missing Step-Up Re-Authentication | `server/routes/api.ts` | 2065 | High-risk Admin routes (role promotion, permanent user deletion, backup restore, session revocation, global settings, moderator assignment/revocation, orphan file purge) accepted stale sessions without recent credential confirmation. | High | Fixed | Added `requireRecentReauth` middleware (`server/middleware/auth.ts`) requiring verification within 15 minutes (or inline `currentPassword` / passkey re-auth), returning `403 REAUTH_REQUIRED` when stale, with an Admin UI re-auth prompt. |
@@ -140,14 +141,37 @@ Checked `canReviewReports` before including `adminReports` in `/api/realtime/pol
 | Test Scenario | Public `GET /api/uploads/<filename>` on an image attached only to a hidden post (`is_hidden = 1`), and inspection of `/api/me`, `/api/users/:id/profile`, `/api/admin/users`, `/api/admin/moderators`, `/api/admin/staff`, and `/api/admin/appeals`. |
 
 #### How It Was Fixed
-Updated `getFileServePolicy` queries to exclude hidden posts/comments (`COALESCE(is_hidden, 0) = 0`), and stripped legacy `email`, `phoneNumber`, and credential metadata from API payloads.
+Updated `getFileServePolicy` queries to exclude hidden posts/comments (`COALESCE(is_hidden, 0) = 0`) and explicitly block hidden/expired-only references before the 30-minute unattached compose fallback, and stripped legacy `email`, `phoneNumber`, and credential metadata from API payloads.
 
 #### Step-by-Step Trace
 | Step | What Happens in the Code | Outcome |
 |---|---|---|
-| 1 | `GET /api/uploads/<hidden_file>` invokes `fileService.getFileServePolicy` | SQL requires `COALESCE(is_hidden, 0) = 0` |
-| 2 | No visible post or avatar references the file | Returns **Handled Safely (`404 Not Found`)** |
+| 1 | `GET /api/uploads/<hidden_file>` invokes `fileService.getFileServePolicy` | Step 2 requires `COALESCE(is_hidden, 0) = 0` |
+| 2 | Step 4 matches `COALESCE(is_hidden, 0) = 1` before the 30-minute unattached compose window | Returns **Handled Safely (`404 Not Found`)** |
 | 3 | Profile and Admin serializers construct JSON payloads | Legacy `email`, `phoneNumber`, and secret hashes are omitted |
 
 #### Conclusion
-**Fix Verified** — Moderated media is inaccessible via direct URL and API responses follow strict data minimization.
+**Fix Verified** — Moderated media is inaccessible via direct URL (even within 30 minutes of upload) and API responses follow strict data minimization.
+
+---
+
+### 6. Unauthenticated Dev-Mode Auto-Login Fallback Removed
+#### Summary
+| Field | Value |
+|---|---|
+| Issue Type | Implicit Unauthenticated Student Session Fallback in Non-Production |
+| Impact | High |
+| Affected File | `server/middleware/auth.ts:171` |
+| Test Scenario | Unauthenticated `GET /api/me`, `GET /api/me/security-events`, and `GET /api/auth/recovery-codes/status` requests with zero cookies or `Authorization` headers when `NODE_ENV !== 'production'`. |
+
+#### How It Was Fixed
+Removed the automatic `u-ayodele` session fallback from `authMiddleware` and bound `req.isAuthenticatedUser` strictly to verified token/cookie authentication in every runtime environment.
+
+#### Step-by-Step Trace
+| Step | What Happens in the Code | Outcome |
+|---|---|---|
+| 1 | Anonymous request without `Authorization` or `sb_session` cookie reaches `authMiddleware` | `resolvedUser` remains `undefined` |
+| 2 | Route guard `requireAuth` checks `if (!req.user)` | Returns **Handled Safely (`401 Unauthorized`)** |
+
+#### Conclusion
+**Fix Verified** — Anonymous callers can never inherit a seeded student identity in development or preview environments.

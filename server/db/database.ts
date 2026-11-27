@@ -314,14 +314,17 @@ export function initDatabase() {
     safeAddColumn('posts', 'is_featured INTEGER DEFAULT 0');
     safeAddColumn('posts', 'is_admin_post INTEGER DEFAULT 0');
     safeAddColumn('posts', "distribution_scope TEXT DEFAULT 'standard'");
+    safeAddColumn('posts', 'deleted_at DATETIME DEFAULT NULL');
 
     safeAddColumn('comments', 'parent_comment_id TEXT');
     safeAddColumn('comments', 'images_json TEXT');
     safeAddColumn('comments', 'updated_at DATETIME');
     safeAddColumn('comments', 'edited_at DATETIME');
+    safeAddColumn('comments', 'deleted_at DATETIME DEFAULT NULL');
 
     safeAddColumn('messages', 'edited_at DATETIME');
     safeAddColumn('messages', 'read_at DATETIME');
+    safeAddColumn('messages', 'deleted_at DATETIME DEFAULT NULL');
     db.exec('CREATE INDEX IF NOT EXISTS idx_messages_chat_read ON messages(chat_id, sender_id, read_at);');
 
     safeAddColumn('communities', 'creator_id TEXT');
@@ -876,6 +879,30 @@ export function initDatabase() {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       );
+
+      CREATE TABLE IF NOT EXISTS media_assets (
+        id TEXT PRIMARY KEY,
+        filename TEXT UNIQUE NOT NULL,
+        thumb_filename TEXT,
+        owner_id TEXT,
+        context_type TEXT NOT NULL DEFAULT 'upload' CHECK(context_type IN ('profile', 'post', 'comment', 'chat', 'upload')),
+        mime_type TEXT NOT NULL,
+        byte_size INTEGER NOT NULL DEFAULT 0,
+        original_byte_size INTEGER NOT NULL DEFAULT 0,
+        width INTEGER,
+        height INTEGER,
+        exif_stripped INTEGER NOT NULL DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        deleted_at DATETIME DEFAULT NULL,
+        FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE SET NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS job_locks (
+        job_name TEXT PRIMARY KEY,
+        locked_by TEXT NOT NULL,
+        locked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at DATETIME NOT NULL
+      );
     `);
 
     safeAddColumn('webauthn_challenges', "purpose TEXT NOT NULL DEFAULT 'login'");
@@ -951,6 +978,31 @@ export function initDatabase() {
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users(LOWER(email)) WHERE email IS NOT NULL;',
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username)) WHERE username IS NOT NULL;',
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_handle_lower ON user_profiles(LOWER(handle));',
+      'CREATE INDEX IF NOT EXISTS idx_posts_deleted_at ON posts(deleted_at);',
+      'CREATE INDEX IF NOT EXISTS idx_posts_active_feed ON posts(deleted_at, is_hidden, is_announcement DESC, is_pinned DESC, created_at DESC);',
+      'CREATE INDEX IF NOT EXISTS idx_posts_community_active ON posts(community_id, deleted_at, is_hidden, created_at DESC);',
+      'CREATE INDEX IF NOT EXISTS idx_posts_author_active ON posts(author_id, deleted_at, created_at DESC);',
+      'CREATE INDEX IF NOT EXISTS idx_comments_deleted_at ON comments(deleted_at);',
+      'CREATE INDEX IF NOT EXISTS idx_comments_post_active ON comments(post_id, deleted_at, created_at ASC);',
+      'CREATE INDEX IF NOT EXISTS idx_comments_parent_active ON comments(parent_comment_id, deleted_at);',
+      'CREATE INDEX IF NOT EXISTS idx_comments_author_active ON comments(author_id, deleted_at);',
+      'CREATE INDEX IF NOT EXISTS idx_messages_deleted_at ON messages(deleted_at);',
+      'CREATE INDEX IF NOT EXISTS idx_messages_chat_active ON messages(chat_id, deleted_at, created_at DESC);',
+      'CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);',
+      'CREATE INDEX IF NOT EXISTS idx_media_assets_owner ON media_assets(owner_id, deleted_at);',
+      'CREATE INDEX IF NOT EXISTS idx_media_assets_deleted ON media_assets(deleted_at);',
+      'CREATE INDEX IF NOT EXISTS idx_media_assets_context_created ON media_assets(context_type, created_at);',
+      'CREATE INDEX IF NOT EXISTS idx_media_assets_thumb ON media_assets(thumb_filename);',
+      'CREATE INDEX IF NOT EXISTS idx_job_locks_expires ON job_locks(expires_at);',
+      'CREATE INDEX IF NOT EXISTS idx_reports_reporter ON reports(reporter_id);',
+      'CREATE INDEX IF NOT EXISTS idx_reports_target ON reports(target_type, target_id);',
+      'CREATE INDEX IF NOT EXISTS idx_reports_assigned ON reports(assigned_to, status);',
+      'CREATE INDEX IF NOT EXISTS idx_communities_creator ON communities(creator_id);',
+      'CREATE INDEX IF NOT EXISTS idx_communities_chat ON communities(chat_id);',
+      'CREATE INDEX IF NOT EXISTS idx_deletion_requests_user ON user_deletion_requests(user_id, status);',
+      'CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_logs(created_at DESC);',
+      'CREATE INDEX IF NOT EXISTS idx_admin_audit_target ON admin_audit_logs(target_type, target_id);',
+      'CREATE INDEX IF NOT EXISTS idx_appeals_user_status ON appeals(user_id, status);',
     ];
 
     for (const sql of indexes) {

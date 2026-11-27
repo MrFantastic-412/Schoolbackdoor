@@ -168,32 +168,6 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
       }
     }
 
-    // Seeded demo fallback is strictly disabled in production builds and whenever any auth/refresh cookie is supplied
-    const hasRefreshCookie = Boolean(parseCookieValue(req.headers.cookie, 'sb_refresh'));
-    if (!resolvedUser && !rawToken && !hasRefreshCookie && process.env.NODE_ENV !== 'production') {
-      const defaultUser = db.prepare(`
-        SELECT id, matric_number, username, role, status, account_restricted_until, restriction_reason,
-               accepted_terms_version, last_reauthenticated_at
-        FROM users
-        WHERE id = 'u-ayodele'
-      `).get() as any;
-
-      if (defaultUser) {
-        const restriction = resolveActiveRestriction(defaultUser);
-        resolvedUser = {
-          id: defaultUser.id,
-          matric_number: defaultUser.matric_number,
-          username: defaultUser.username || undefined,
-          role: defaultUser.role as UserRole,
-          status: defaultUser.status,
-          restricted_until: restriction.restricted_until,
-          restriction_reason: restriction.restriction_reason,
-          acceptedTermsVersion: defaultUser.accepted_terms_version || null,
-          lastReauthenticatedAt: defaultUser.last_reauthenticated_at || null,
-        };
-      }
-    }
-
     if (resolvedUser) {
       if (resolvedUser.status === 'suspended') {
         res.status(403).json({
@@ -205,7 +179,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction) 
       req.user = resolvedUser;
       req.sessionId = resolvedSessionId;
       req.sessionTokenHash = resolvedTokenHash;
-      req.isAuthenticatedUser = isExplicitAuth || (process.env.NODE_ENV !== 'production' && resolvedUser.id === 'u-ayodele');
+      req.isAuthenticatedUser = isExplicitAuth;
       if (isExplicitAuth) {
         touchUserActivityThrottled(resolvedUser.id, resolvedTokenHash);
       }

@@ -1340,6 +1340,9 @@ async function runTests() {
   );
 
   // 21h: Admin RFC-6238 TOTP MFA setup, verification & login enforcement
+  const prevAdminHash = (
+    db.prepare('SELECT password_hash FROM users WHERE id = ?').get(adminActor.id) as { password_hash: string } | undefined
+  )?.password_hash;
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword('AdminPass123!'), adminActor.id);
   const mfaSetup = adminControlService.initiateAdminMfaSetup(adminActor.id, '@THEBACKDOOR');
   const validCode = computeTotpCode(mfaSetup.secret);
@@ -1358,6 +1361,9 @@ async function runTests() {
   assert(Boolean(loginWithMfa.token), 'Admin login succeeds when valid 6-digit TOTP code supplied');
 
   adminControlService.disableAdminMfa(adminActor.id, 'AdminPass123!');
+  if (prevAdminHash) {
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(prevAdminHash, adminActor.id);
+  }
 
   // --- Step 22: Strict 10GB Storage Budget, 72h Expiry, Deduplication, Encrypted Backups & Redacted Logs ---
   console.log('\n--- 22. Testing 10GB Storage Protection, Strict 72h Expiry, Encrypted Backups & Deduplication ---');
@@ -5446,7 +5452,7 @@ async function runTests() {
     // 37c: Permission boundaries & unauthenticated rejection
     const unauthEventsRes = await fetch(`${baseUrl}/api/me/security-events`);
     const unauthRcRes = await fetch(`${baseUrl}/api/auth/recovery-codes/status`);
-    const studentAdminSecRes = await fetch(`${baseUrl}/api/admin/security/overview`, {
+    const studentAdminSecRes = await fetch(`${baseUrl}/api/admin/security`, {
       headers: { Authorization: `Bearer ${legacyToken}` },
     });
     const crossSessionRevokeRes = await fetch(`${baseUrl}/api/me/sessions/${encodeURIComponent(legacyLoginBody.sessionId)}`, {
@@ -5516,6 +5522,7 @@ async function runTests() {
     );
 
     // 38b: Raw session tokens in query params (?token=) no longer authenticate SSE stream; signed ?ticket= does
+    const { sseManager } = await import('../realtime/sseManager.js');
     const sseAnonController = new AbortController();
     const sseRawTokenRes = await fetch(
       `${baseUrl}/api/realtime/stream?token=${encodeURIComponent(adminToken)}&clientId=stage4-raw-token`,
@@ -5523,6 +5530,18 @@ async function runTests() {
     );
     const readerRaw = sseRawTokenRes.body!.getReader();
     const firstChunkRaw = new TextDecoder().decode((await readerRaw.read()).value || new Uint8Array());
+    // Trigger private event for adminRow.id; raw ?token= stream must remain __anon__ and NOT receive it
+    sseManager.sendToUser(adminRow.id, 'stage4:probe', { secret: 'token-rejected' });
+    const rawStreamGotPrivateEvent = await Promise.race<boolean>([
+      readerRaw.read().then((chunk) => {
+        const text = new TextDecoder().decode(chunk.value || new Uint8Array());
+        return text.includes('token-rejected');
+      }),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 120)),
+    ]);
+    const rawPresenceRow = db
+      .prepare('SELECT user_id FROM user_presence_clients WHERE client_id = ?')
+      .get('stage4-raw-token') as { user_id: string } | undefined;
     sseAnonController.abort();
 
     const ticketRes = await fetch(`${baseUrl}/api/realtime/ticket`, {
@@ -5537,14 +5556,28 @@ async function runTests() {
     );
     const readerTicket = sseTicketRes.body!.getReader();
     const firstChunkTicket = new TextDecoder().decode((await readerTicket.read()).value || new Uint8Array());
+    sseManager.sendToUser(adminRow.id, 'stage4:probe', { ok: true, channel: 'ticket-verified' });
+    let ticketBuffer = '';
+    for (let i = 0; i < 4; i++) {
+      const nextChunk = await Promise.race<string | null>([
+        readerTicket.read().then((c) => (c.done ? null : new TextDecoder().decode(c.value || new Uint8Array()))),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 200)),
+      ]);
+      if (!nextChunk) break;
+      ticketBuffer += nextChunk;
+      if (ticketBuffer.includes('ticket-verified')) break;
+    }
     sseTicketController.abort();
 
     assert(
       sseRawTokenRes.status === 200 &&
-        !firstChunkRaw.includes(adminRow.id) &&
+        firstChunkRaw.includes('presence:count') &&
+        !rawStreamGotPrivateEvent &&
+        !rawPresenceRow &&
         ticketRes.status === 200 &&
         Boolean(ticketBody.ticket) &&
-        firstChunkTicket.includes(adminRow.id),
+        firstChunkTicket.includes('presence:count') &&
+        ticketBuffer.includes('ticket-verified'),
       'SSE rejects ?token= query-string authentication (subscribes as anonymous) and accepts short-lived ?ticket='
     );
 
@@ -5670,8 +5703,8 @@ async function runTests() {
       method: 'POST',
       headers: { Authorization: `Bearer ${studentToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        targetType: 'post',
-        targetId: anonPost.id,
+        target_type: 'post',
+        target_id: anonPost.id,
         reason: 'Needs moderator review while preserving anonymity',
       }),
     });
@@ -5690,8 +5723,8 @@ async function runTests() {
         modInvalidTypeRes.status === 400 &&
         anonReportRes.status === 201 &&
         Boolean(anonReportEntry) &&
-        anonReportEntry.authorHandle === '@anonymous' &&
-        anonReportEntry.targetUserId === null,
+        anonReportEntry.targetPreview?.authorHandle === '@anonymous' &&
+        anonReportEntry.targetPreview?.targetUserId === undefined,
       'Moderator controls enforce canReviewReports in /realtime/poll, block peer-mod tampering (403), validate type (400), and mask anonymous authors'
     );
 
